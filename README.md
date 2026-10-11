@@ -2,17 +2,17 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="test_check_action.py"><img src="https://img.shields.io/badge/tests-64%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="test_check_action.py"><img src="https://img.shields.io/badge/tests-68%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="skill_benchmark/charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-26.5ms-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="skill_benchmark/charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="skill_benchmark/charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
-  <img src="https://img.shields.io/badge/platforms-Claude%20Code%20%7C%20Codex%20%7C%20ChatGPT-orange?style=for-the-badge&logo=anthropic&logoColor=white" alt="Platforms" />
+  <img src="https://img.shields.io/badge/platforms-Claude%20%7C%20Codex%20%7C%20Antigravity%20%7C%20Cursor%20%7C%20Grok-orange?style=for-the-badge&logo=anthropic&logoColor=white" alt="Platforms" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-informational?style=for-the-badge" alt="License" /></a>
 </p>
 
 ---
 
-> **An ultra-low-latency, zero-cost, deterministic & neural safety guardrail for autonomous AI coding agents ([Claude Code](https://claude.ai/code) and [OpenAI Codex](https://openai.com) / ChatGPT).**  
+> **An ultra-low-latency, zero-cost, deterministic & neural safety guardrail for autonomous AI coding agents ([Claude Code](https://claude.ai/code), [OpenAI Codex](https://openai.com) / ChatGPT, [Google Antigravity](https://deepmind.google), [Cursor](https://cursor.com), and [Grok Build](https://x.ai)).**  
 > Intercepts shell commands, script executions, file deletions, git operations, and sensitive directory mutations **before** execution — eliminating destructive hallucinations, prompt injections, and secret leaks with zero developer friction.
 
 ---
@@ -39,6 +39,9 @@
   - [Startup Terminal Commands](#launching-local-servers)
 - [Claude Code Integration](#-claude-code-integration)
 - [OpenAI Codex & ChatGPT Integration](#-openai-codex--chatgpt-integration)
+- [Google Antigravity Integration](#-google-antigravity-integration)
+- [Cursor Integration](#-cursor-integration)
+- [Grok Build Integration](#-grok-build-integration)
 - [Configuration & Options (policy.yaml)](#-configuration--options-policyyaml)
   - [Policy Structure](#policy-structure)
   - [Environment Variables](#environment-variables-reference)
@@ -234,23 +237,34 @@ cd agent-guardrail
 # 2. Install dependencies (standard library + PyYAML)
 pip install -r requirements.txt
 
-# 3. Configure current workspace (.claude/, .codex/, .agents/):
+# 3. Configure current workspace for ALL 5 platforms automatically:
 python install.py
 ```
 
-#### Advanced Installer Options:
+#### Choose Specific Coding Agents:
 ```bash
-# Install globally across all user projects (~/.claude, ~/.codex, ~/.agents, ~/.guardrail):
+# Configure only specific agent(s) in workspace:
+python install.py --cursor          # Cursor only (.cursor/rules/)
+python install.py --claude          # Claude Code only (.claude/)
+python install.py --antigravity     # Google Antigravity only (.agents/)
+python install.py --codex           # OpenAI Codex / ChatGPT only (.codex/)
+python install.py --grok            # Grok Build only (.grok/skills/)
+
+# Combine flags as needed:
+python install.py --cursor --claude
+
+# Install globally across user home directories (~/.cursor, ~/.claude, ~/.gemini, ~/.codex, ~/.grok):
 python install.py --global
 
-# Run system and connectivity diagnostics:
+# Run health checks and multi-agent hook simulations:
 python install.py --check
 ```
 
 The installer:
-- Configures lifecycle hooks (`PreToolUse` and `UserPromptSubmit`) in `.claude/settings.json` and `.codex/hooks.json`.
-- Registers the `/guardrail` slash command prompt.
-- Installs the `$guardrail` skill specification.
+- Configures native lifecycle hooks (`PreToolUse`, `UserPromptSubmit`) in `.claude/settings.json`, `.codex/hooks.json`, and `.agents/hooks.json`.
+- Configures Cursor Rules (`.cursor/rules/guardrail.mdc` and `.cursorrules`).
+- Deploys Grok Build skills (`.grok/skills/`) and universal standard (`AGENTS.md`).
+- Registers `/guardrail` slash command prompts across all supported agents.
 - Runs self-tests verifying that safe actions pass silently and destructive actions are blocked.
 
 ---
@@ -442,6 +456,79 @@ Add the tool definition from [`openai.yaml`](openai.yaml) to your Custom GPT or 
 
 ---
 
+## 🪐 Google Antigravity Integration
+
+Google Antigravity integrates directly through its **native lifecycle hook system** defined in [`.agents/hooks.json`](.agents/hooks.json) and skills in [`.agents/skills/guardrail/SKILL.md`](.agents/skills/guardrail/SKILL.md):
+
+```json
+{
+  "agent-guardrail": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command|write_to_file|replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python guardrail_hook.py hook --host antigravity",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### Lifecycle Behavior:
+- **`proceed`**: Returns `{"decision": "allow"}`. Antigravity executes `run_command` or file modifications without interruption.
+- **`ask_user`**: Returns `{"decision": "ask", "reason": "..."}`. Triggers Antigravity's interactive human-in-the-loop permission prompt.
+- **`block`**: Returns `{"decision": "deny", "reason": "..."}`. Antigravity stops the tool execution and logs the safety rationale.
+
+---
+
+## ⚡ Cursor Integration
+
+Cursor (Composer and Agent Mode) integrates via **Cursor Rules** in [`.cursor/rules/guardrail.mdc`](.cursor/rules/guardrail.mdc) and fallback [`.cursorrules`](.cursorrules):
+
+```markdown
+---
+description: Universal Safety Guardrail for AI Agents
+globs: *
+alwaysApply: true
+---
+
+# Agent Safety Guardrail (Cursor Enforcement)
+You are operating under the policy defined in `policy.yaml`.
+- PROHIBITED: rm -rf, git push -f, DROP TABLE, deleting .env or secrets.
+- CONFIRMATION: Ask before modifying docker-compose, configs, or infrastructure.
+- PROCEED: Safe read-only commands (ls, git status, pytest, ruff) proceed silently.
+Verify uncertain commands via: `python check_action.py "<command>"`
+```
+
+#### Agent Behavior:
+- **Automatic Enforcement**: With `alwaysApply: true`, the rule is unconditionally injected into every Cursor Composer and Agent chat session.
+- **Pre-execution Refusal**: Destructive actions are immediately flagged and rejected by the model.
+- **Interactive Approval**: When modifying `.env` or configurations, Cursor prompts the user in chat before applying diffs.
+
+---
+
+## 🧠 Grok Build Integration
+
+xAI's Grok Build terminal agent integrates via the native skill discovery system in [`.grok/skills/guardrail/SKILL.md`](.grok/skills/guardrail/SKILL.md) and project standard [`AGENTS.md`](AGENTS.md):
+
+```bash
+# Grok automatically detects skills in:
+.grok/skills/guardrail/SKILL.md
+~/.grok/skills/guardrail/SKILL.md
+```
+
+#### Agent Behavior:
+- **Slash Command**: Type `/guardrail` in the Grok Build terminal to turn on active monitoring.
+- **Universal Policy**: Grok Build automatically parses [`AGENTS.md`](AGENTS.md) at the repository root, ensuring that all spawned parallel subagents adhere to the same zero-tolerance boundaries.
+
+---
+
 ## 🛠️ Configuration & Options (`policy.yaml`)
 
 All safety thresholds, regex whitelists, blocklists, and protected directories are centrally configured in [`policy.yaml`](policy.yaml) **without editing Python code**.
@@ -493,7 +580,7 @@ path_rules:
     path: "/etc"
     decision: "block"
     all_commands: false
-    commands: ["rm", "mv", "chmod", "chown", "tee", "sed", "nano", "vim", "write", "modify", "edit", "cancella", "delete"]
+    commands: ["rm", "mv", "chmod", "chown", "tee", "sed", "nano", "vim", "write", "modify", "edit", "delete", "remove"]
 
   # Zero-access directory: block ALL operations
   - name: "protect secrets & credentials"
