@@ -1,0 +1,2 @@
+# Core dependencies for policy configuration
+pyyaml>=6.0

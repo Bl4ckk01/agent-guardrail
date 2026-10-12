@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CODEX_PROJECT_DIR}/guardrail_hook.py\" hook --host codex"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CODEX_PROJECT_DIR}/guardrail_hook.py\" hook --host codex"
+          }
+        ]
+      }
+    ]
+  }
+}

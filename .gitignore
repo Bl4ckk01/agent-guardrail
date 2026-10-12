@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Guardrail runtime daemon state and logs
+.guardrail/
+*.log
+
+# Environment variables & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Local model weights
+*.gguf
+*.bin

@@ -1,0 +1,12 @@
+# Metadata for OpenAI Codex app and ChatGPT Agents
+display_name: "Agent Guardrail"
+name: "agent-guardrail"
+command: "/guardrail"
+summary: "Safety guardrail for Claude Code and OpenAI Codex / ChatGPT, activated via /guardrail"
+invocation:
+  mode: "automatic"   # Activated via /guardrail or automatic discovery
+dependencies:
+  tools:
+    - python
+  env:
+    - CLM_SERVER_URL

@@ -1,0 +1,24 @@
+# 🛡️ Agent Safety Guardrail (.cursorrules)
+# Policy specification loaded automatically by Cursor Agent & Composer
+
+You must strictly adhere to the safety guardrail defined in policy.yaml:
+
+1. BLOCK (Refuse immediately):
+   - Never run recursive file deletions (rm -rf, rmdir /s, Remove-Item -Recurse -Force).
+   - Never force-push or delete branches on remote git repositories (git push -f, git push --force).
+   - Never execute SQL drops/truncations (DROP TABLE, TRUNCATE, DELETE without WHERE).
+   - Never print, export, or commit secrets (.env, API keys, private keys, certificates).
+   - Never run disk formatting or kernel-level mutations (mkfs, format, dd to raw devices).
+
+2. ASK USER (Request human confirmation before running):
+   - Modifications to .env, docker-compose.yml, Dockerfile, or production configs.
+   - Container executions: docker run, docker exec, docker compose up/down.
+   - Kubernetes / Cloud mutations: kubectl apply/delete, terraform apply.
+   - Global package installations (npm i -g, pip install --user).
+
+3. PROCEED (Execute silently):
+   - Read-only commands: ls, dir, cat, grep, git status, git diff, git log.
+   - Test suites and linters: pytest, npm test, cargo test, ruff, eslint, mypy.
+   - Routine code edits within the workspace.
+
+Verify any uncertain command via: python check_action.py "<command>"

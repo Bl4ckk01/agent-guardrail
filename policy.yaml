@@ -1,0 +1,156 @@
+# ==============================================================================
+# AGENT GUARDRAIL - POLICY & RULE CONFIGURATION (Claude Code & Codex)
+# ==============================================================================
+# Configure commands and paths to:
+# 1. BLOCK: immediately reject dangerous actions (< 0.1ms)
+# 2. ASK_USER: require explicit human confirmation
+# 3. PROCEED: safe routine whitelist
+# ==============================================================================
+
+# --- 1. CUSTOM COMMAND BLOCK RULES ---
+custom_block_rules:
+  - name: "terraform destroy"
+    pattern: '\bterraform\s+destroy\b'
+  - name: "pulumi destroy"
+    pattern: '\bpulumi\s+destroy\b'
+  - name: "aws s3 bucket deletion"
+    pattern: '\baws\s+s3\s+rb\b.*--force'
+  - name: "cloud infrastructure deletion"
+    pattern: '\b(?:destroy|nuke|delete|erase|terminate)\b.{0,30}?\b(?:cluster|k8s|kubernetes|vps|server|ec2\s+instance)\b'
+  - name: "production database stop"
+    pattern: '\b(?:systemctl|service)\s+(?:stop|kill)\s+(?:postgresql|mysql|mongod|redis)\b'
+
+# --- 2. CUSTOM COMMAND ASK RULES (CONFIRMATION REQUIRED) ---
+custom_ask_rules:
+  - name: "docker run/exec/compose"
+    pattern: '\bdocker\s+(?:run|exec|compose)\b'
+  - name: "kubectl apply/delete/patch"
+    pattern: '\bkubectl\s+(?:apply|delete|patch|replace|scale)\b'
+  - name: "export environment variable"
+    pattern: '\b(?:export\s+[A-Za-z0-9_]+=|\$env:[A-Za-z0-9_]+\s*=|set\s+[A-Za-z0-9_]+=)'
+  - name: "global package installation"
+    pattern: '\b(?:npm\s+i\s+-g|pip\s+install\s+--user|cargo\s+install)\b'
+  - name: "network/firewall config change"
+    pattern: '\b(?:ufw\s+(?:enable|disable|allow|deny|delete|route|default)|iptables\s+(?:-[ADIRPF]|--append|--delete|--insert|--replace|--policy|--flush)|firewall-cmd\s+--(?:add|remove|set)|netsh\s+advfirewall\s+set)\b'
+
+# --- 3. CUSTOM COMMAND PROCEED RULES (WHITELIST) ---
+custom_proceed_rules:
+  - name: "firewall read-only"
+    pattern: '\b(?:iptables\s+(?:-[LS]|--list|--list-rules)|ufw\s+status|firewall-cmd\s+--(?:state|list))\b'
+  - name: "docker read-only"
+    pattern: '\bdocker\s+(?:ps|images|logs|inspect|version)\b'
+  - name: "kubectl read-only"
+    pattern: '\bkubectl\s+(?:get|describe|logs|cluster-info)\b'
+  - name: "cargo check/test"
+    pattern: '\bcargo\s+(?:check|test|clippy|fmt)\b'
+  - name: "npm audit/outdated"
+    pattern: '\bnpm\s+(?:audit|outdated|list)\b'
+  - name: "pip list/show"
+    pattern: '\bpip3?\s+(?:list|show|check)\b'
+  - name: "terraform plan/validate"
+    pattern: '\bterraform\s+(?:plan|validate|fmt)\b'
+
+# --- 4. PROTECTED PATH & DIRECTORY RULES ---
+# Path-specific rules:
+# - path: target directory/file (string or regex, e.g. "/etc", "C:\Windows", "production/", "secrets/")
+# - decision: "block" | "ask_user" | "proceed"
+# - all_commands: true (all operations) | false (only commands listed in 'commands')
+# - commands: list of commands/patterns (required if all_commands is false)
+path_rules:
+  - name: "protect system /etc"
+    path: "/etc"
+    decision: "block"
+    all_commands: false
+    commands: ["rm", "mv", "chmod", "chown", "tee", "sed", "nano", "vim", "write", "modify", "edit", "delete", "remove"]
+
+  - name: "protect secrets & credentials"
+    path: "secrets/"
+    decision: "block"
+    all_commands: true
+
+  - name: "protect production environment"
+    path: "production/"
+    decision: "ask_user"
+    all_commands: true
+
+  - name: "staging critical changes"
+    path: "staging/"
+    decision: "ask_user"
+    all_commands: false
+    commands: ["rm", "delete", "remove", "drop", "truncate"]
+
+  - name: "public documentation whitelist"
+    path: "docs/"
+    decision: "proceed"
+    all_commands: true
+
+# ==============================================================================
+# 5. GLOBAL SETTINGS - BACKEND SELECTOR
+# ==============================================================================
+# Choose which decision engine to use:
+#
+#   1. "d1"    -> Liquid AI d1-3B Decision Model (Single-pass fast evaluation).
+#                 Runs standalone (use_qwen: false) OR with Qwen 3.8B escalation.
+#   2. "clm"   -> Contrastive Language Model (Requires Qwen 3.8B on 8090 + clm-serve on 8700).
+#   3. "jev"   -> Cloud API by Typesafe AI (Zero local VRAM, requires JEV_API_KEY).
+#   4. "rules" -> Deterministic regex rules only (< 0.1ms latency, zero models required).
+# ==============================================================================
+settings:
+  backend: "rules"              # 'rules' (instant zero-setup) | 'd1' | 'clm' | 'jev'
+  timeout_secs: 5.0             # max request timeout in seconds
+  debug: false                  # stderr debug logging
+
+  # --- Qwen 3.8B System 2 Settings ---
+  # NOTE: Mandatory for 'clm' (provides embeddings & reasoning).
+  # Optional for 'd1' and 'jev' (set to false for zero local VRAM / background process).
+  # Ignored by 'rules'.
+  use_qwen: true
+  qwen_base_url: "http://127.0.0.1:8090/v1"
+  qwen_timeout_secs: 2.0
+
+  # --- Liquid AI d1-3B Settings (when backend is 'd1') ---
+  liquid_endpoint: "http://127.0.0.1:8800/v1"   # llama-server, LM Studio, or Cloud endpoint
+  liquid_model: "d1-3b"
+  liquid_min_confidence: 0.50                   # Confidence threshold to accept d1 decision
+  liquid_proceed_min_prob: 0.50                 # Minimum probability required for 'proceed'
+  # --- CLM Settings (when backend is 'clm') ---
+  clm_base_url: "http://127.0.0.1:8700"
+  clm_min_confidence: 0.50
+  clm_proceed_min_prob: 0.50
+  clm_block_alert_prob: 0.20
+
+  # ==============================================================================
+  # 6. DAEMON AUTO-START & MODEL MANAGEMENT (/guardrail start)
+  # ==============================================================================
+  # Choose whether to start local model servers manually or automatically:
+  #   manual_start: true   -> You manage and launch servers manually in terminals (see README.md).
+  #   manual_start: false  -> The guardrail automatically launches the required daemons
+  #                           in the background when you run '/guardrail start' (or check_action.py --start).
+  #
+  # ------------------------------------------------------------------------------
+  # ⚠️ IMPORTANT BACKEND NOTICE:
+  #   - 'jev'   : NO LOCAL MODEL OR DAEMON NEEDED!
+  #               Jev is a 100% Cloud API (TypeSafe AI) authenticated via JEV_API_KEY.
+  #               No GGUF download or local background process is required on your machine.
+  #   - 'rules' : NO LOCAL MODEL OR DAEMON NEEDED!
+  #               Runs 100% offline using deterministic regex & path policies (<0.3ms).
+  #   - 'd1'    : Requires d1_model_path (starts llama-server on port 8800).
+  #   - 'clm'   : Requires qwen_model_path (starts llama-server on port 8090) AND
+  #               starts clm-serve on port 8700 connected to Qwen.
+  # ------------------------------------------------------------------------------
+  manual_start: false           # Set to true if you prefer starting servers manually
+
+  # Absolute paths to local GGUF model files (replace with your local paths if using 'd1' or 'clm'):
+  # Examples:
+  #   Linux/macOS: '/home/username/models/d1-3B-F16.gguf'
+  #   Windows:     'C:\Users\Username\models\d1-3B-F16.gguf'
+  d1_model_path: '/path/to/d1-3B-F16.gguf'
+  qwen_model_path: '/path/to/Qwen3-8B-Q4_K_M.gguf'
+
+  # Hardware offload parameters for daemon startup:
+  d1_gpu_layers: 20             # -ngl layers offloaded to GPU VRAM for D1 (20 optimal for RTX 3060 12GB)
+  qwen_gpu_layers: 0            # -ngl layers offloaded to GPU for Qwen embeddings (0 for CPU or 20-30 for GPU)
+  d1_port: 8800                 # HTTP port for Liquid AI D1
+  qwen_port: 8090               # HTTP port for Qwen embeddings
+  clm_port: 8700                # HTTP port for clm-serve
+
