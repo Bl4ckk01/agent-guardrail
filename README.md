@@ -155,8 +155,8 @@ flowchart TD
 
     style AGENT fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000
     style HOOK fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000
-    style TIER1 fill:#ffffff,stroke:#000000,stroke-width:2px,color:#e6edf3
-    style TIER2 fill:fill:#ffffff,stroke:#000000,stroke-width:2px,color:#e6edf3
+    style TIER1 fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000
+    style TIER2 fill:fill:#ffffff,stroke:#000000,stroke-width:2px,color:#000000
     style TIER3 fill:fill:#ffffff,stroke:#000000,stroke-width:2px,color:#bc8cff
     style PROCEED fill:#ffffff,stroke:#000000,stroke-width:2px,color:#3fb950
     style ASK fill:#ffffff,stroke:#000000,stroke-width:2px,color:#e3b341
