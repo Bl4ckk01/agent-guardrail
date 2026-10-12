@@ -161,14 +161,14 @@ flowchart TD
     TIER2 -->|"Side Effects / Ambiguous"| ASK
     TIER2 -->|"Hazard Detected"| BLOCK
 
-    style AGENT fill:#162032,stroke:#58a6ff,stroke-width:2px,color:#e6edf3
-    style HOOK fill:#1f1733,stroke:#bc8cff,stroke-width:2px,color:#e6edf3
-    style TIER1 fill:#122419,stroke:#3fb950,stroke-width:2px,color:#e6edf3
-    style TIER2 fill:#162238,stroke:#58a6ff,stroke-width:2px,color:#e6edf3
-    style TIER3 fill:#211833,stroke:#bc8cff,stroke-width:2px,color:#bc8cff
-    style PROCEED fill:#102316,stroke:#3fb950,stroke-width:2px,color:#3fb950
-    style ASK fill:#262013,stroke:#e3b341,stroke-width:2px,color:#e3b341
-    style BLOCK fill:#281417,stroke:#f85149,stroke-width:2px,color:#f85149
+    style AGENT fill:#ffffff,stroke:#000000,stroke-width:2px,color:#e6edf3
+    style HOOK fill:#ffffff,stroke:#000000,stroke-width:2px,color:#e6edf3
+    style TIER1 fill:#ffffff,stroke:#000000,stroke-width:2px,color:#e6edf3
+    style TIER2 fill:fill:#ffffff,stroke:#000000,stroke-width:2px,color:#e6edf3
+    style TIER3 fill:fill:#ffffff,stroke:#000000,stroke-width:2px,color:#bc8cff
+    style PROCEED fill:#ffffff,stroke:#000000,stroke-width:2px,color:#3fb950
+    style ASK fill:#ffffff,stroke:#000000,stroke-width:2px,color:#e3b341
+    style BLOCK fill:#ffffff,stroke:#000000,stroke-width:2px,color:#f85149
 ```
 
 <p align="center">
@@ -299,6 +299,8 @@ From that point forward:
 | `/guardrail` or `/guardrail on` | Enables guardrail protection for the current session |
 | `/guardrail off` | Temporarily disables the guardrail for manual maintenance |
 | `/guardrail status` | Displays active status, session ID, and current backend engine |
+| `/guardrail start` | Automatically launches background daemons for D1 or CLM |
+| `/guardrail stop` | Stops background daemons managed by the guardrail |
 
 ---
 
@@ -327,17 +329,38 @@ python check_action.py "DROP DATABASE production_users;" --backend rules
 
 ## 💻 Local Models & Startup Commands
 
-If you choose to use local neural models (`d1` or `clm`), use the commands below (also documented in [`start.txt`](start.txt)):
+If you choose to use local neural models (`d1` or `clm`), you can manage them automatically or launch them manually:
+
+### Automatic Background Daemon Management (`daemon_manager.py`)
+
+You can launch, stop, and inspect the status of your local background servers automatically:
+
+```bash
+# Check status and port readiness for all backends:
+python daemon_manager.py status
+
+# Automatically launch the configured background daemon (D1 or CLM):
+python daemon_manager.py start
+
+# Stop running background daemons:
+python daemon_manager.py stop
+```
+
+> [!TIP]
+> In chat, you can simply type `/guardrail start` or `/guardrail status`.
+> In `policy.yaml`, set `manual_start: false` to allow automatic background startup, or `manual_start: true` if you prefer launching servers in separate terminals yourself. Note that **JEV** (cloud API) and **Rules** (deterministic offline) require no background daemons at all!
 
 ### Backend Models Quick Reference
 
 | Service | Target Port | Backend Required For | Model Type |
 |---|:---:|---|---|
+| **Liquid AI d1-3B** | `8800` | Backend `backend: "d1"` | Liquid LFM GGUF |
 | **Qwen 3.8B** | `8090` | Embeddings for `clm`, System 2 for `clm` and `d1` | Llama-server GGUF |
 | **CLM Server** | `8700` | Backend `backend: "clm"` | Contrastive Classifier |
-| **Liquid AI d1-3B** | `8800` | Backend `backend: "d1"` | Liquid LFM GGUF |
 
-### Launching Local Servers
+### Manual Terminal Launching
+
+If `manual_start: true` is configured in `policy.yaml`, launch the daemons manually in your terminal (see [`start.txt`](start.txt)):
 
 #### Option A: Running Liquid AI d1-3B Backend (`backend: "d1"`)
 Liquid AI d1-3B runs as a single-pass neural model on port `8800`:
@@ -358,8 +381,10 @@ llama-server -m "path/to/Qwen3-8B-Q4_K_M.gguf" --embedding --pooling last -c 163
 clm-serve --emb-url http://127.0.0.1:8090/v1/embeddings --port 8700
 ```
 
-#### Option C: Pure Rules Backend (`backend: "rules"`)
-Requires **no local servers, no GPU, and no background processes**. Set `backend: "rules"` in `policy.yaml` or `export GUARDRAIL_BACKEND=rules`.
+#### Option C: Pure Rules Backend (`backend: "rules"`) & JEV Cloud (`backend: "jev"`)
+Requires **no local servers, no GPU, and no background processes**.
+- For Rules: Set `backend: "rules"` in `policy.yaml` (0ms offline).
+- For JEV: Set `backend: "jev"` and configure the `JEV_API_KEY` environment variable.
 
 ---
 
