@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Multi-tier safety guardrail for Claude Code and OpenAI Codex.
+"""Multi-tier safety guardrail for Claude Code, OpenAI Codex, Antigravity, Cursor, and Grok.
 
 Backends:
-  - CLM (default): local contrastive embedding model via clm-serve
+  - Rules (default): deterministic regex & path policies (< 0.1ms, zero models needed)
+  - D1: local Liquid AI d1-3B model via llama-server (port 8800)
+  - CLM: local contrastive embedding model via clm-serve (port 8700)
   - Jev: cloud decision API (TypeSafe AI)
-  - Rules: deterministic regex & path policies (< 0.1ms)
 
 Usage:
   python check_action.py "<action description or command>"
@@ -12,9 +13,11 @@ Usage:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import unicodedata
@@ -22,6 +25,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 # --- General Configuration ---
 DEFAULT_TIMEOUT = 5.0
@@ -47,7 +51,7 @@ _CUSTOM_BLOCK: list[tuple[str, re.Pattern]] = []
 _CUSTOM_ASK: list[tuple[str, re.Pattern]] = []
 _CUSTOM_PROCEED: list[tuple[str, re.Pattern]] = []
 _PATH_RULES: list[PathRule] = []
-_POLICY_SETTINGS: dict[str, any] = {}
+_POLICY_SETTINGS: dict[str, Any] = {}
 
 
 def _env_float(name: str, default: float) -> float:
@@ -138,10 +142,39 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
      r"|\b(?:company\s+policy|security\s+policy)\s+(?:forbids|prohibits)\b|\bprohibited\s+action\b"),
     ("flush firewall", r"\biptables\s+-[fF]\b"),
     ("zfs destroy", r"\bzfs\s+destroy\b"),
+    ("python script destructive", r"\bpython\d?\s+(?:-c\s+)?.*(?:\bos\.(?:system|remove|unlink|rmdir|popen)\b|\bsubprocess\.(?:run|call|Popen|check_call|check_output)\b|\bshutil\.(?:rmtree|move)\b)"),
+    ("node script destructive", r"\bnode\s+(?:-e|--eval)\s+.*(?:\bchild_process\b|\bfs\.(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\b)"),
+    ("perl script destructive", r"\bperl\s+-e\s+.*(?:\bsystem\b|\bunlink\b|\brmdir\b)"),
+    ("ruby script destructive", r"\bruby\s+-e\s+.*(?:\bsystem\b|FileUtils\.(?:rm|rm_rf|remove_dir)|File\.delete)"),
+    ("php script destructive", r"\bphp\s+-r\s+.*(?:\bsystem\b|\bexec\b|\bpassthru\b|\bshell_exec\b|\bunlink\b)"),
+    ("awk script destructive", r"\bawk\s+.*system\s*\("),
+    ("encoded base64 pipe to shell", r"\b(?:base64\s+(?:-d|--decode)|openssl\s+enc\s+-d\s+-base64)\s*\|\s*(?:sh|bash|zsh|python\d?|pwsh|powershell)\b"),
+    ("ripgrep command injection", r"\brg\b.*--(?:pre|pre-glob)\b"),
+    ("find exec injection", r"\bfind\b.*-(?:exec|execdir|ok|okdir)\b"),
+    ("fd exec injection", r"\b(?:fd|fdfind)\b.*-(?:x|X|-exec|-exec-batch)\b"),
+    ("git config command injection", r"\bgit\b.*-c\s+(?:core\.(?:fsmonitor|pager)|diff\.external|sequence\.editor)"),
+    ("git exec-path hijacking", r"\bgit\b.*--exec-path\b"),
+    ("git config ssh command injection", r"\bgit\b.*config\s+(?:core\.sshCommand|ssh\.variant)\b"),
+    ("tar to-command injection", r"\btar\b.*--(?:to-command|checkpoint-action=exec)\b"),
+    ("go test/run exec injection", r"\bgo\s+(?:test|run)\b.*-exec\b"),
+    ("rsync remote shell injection", r"\brsync\b.*(?:-e\s+|--rsh=)"),
+    ("zip test command injection", r"\bzip\b.*-T\s+-TT\b"),
+    ("env var execution hijack", r"(?:^|[\s;&|])(?:LD_PRELOAD|LD_LIBRARY_PATH|PYTHONPATH|NODE_OPTIONS|BASH_ENV|PERL5OPT|RUBYOPT|DYLD_INSERT_LIBRARIES)\s*="),
+    ("reverse shell dev tcp udp", r"/dev/(?:tcp|udp)/\S+"),
+    ("reverse shell netcat socat", r"\b(?:nc|ncat|netcat)\b.*(?:-[ec]\b|--exec\b)|\bsocat\b.*(?:exec|system):"),
+    ("reverse shell named pipe", r"\bmkfifo\b.*\|\s*(?:sh|bash|zsh|nc|ncat)\b"),
+    ("powershell socket reverse shell", r"\b(?:System\.Net\.Sockets\.TcpClient|Net\.WebClient|DownloadString)\b.*(?:\bInvoke-Expression\b|\biex\b)"),
+    ("secret exfiltration curl wget", r"\b(?:curl|wget)\b.*(?:-d|--data(?:-binary)?|-F|--post-file)\s*@(?:/etc/|\.env|\$env:|\S*id_rsa|\S*id_ed25519)"),
+    ("shell startup file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*~?/?(?:\.bashrc|\.bash_profile|\.zshrc|\.profile|/etc/profile|/etc/environment|\$profile)\b"),
+    ("crontab file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*/etc/cron"),
+    ("guardrail self tampering file", r"\b(?:rm|del|erase|unlink|remove-item|drop|truncate|format)\b.*(?:\bpolicy\.ya?ml\b|\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\binstall\.py\b|\.guardrail\b|\.claude/settings\.json\b|\.codex/hooks\.json\b|\.agents/hooks\.json\b|\.cursorrules\b)"),
+    ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
+    ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
 )
 
 # Confirmation required rules
 ASK_RULES: tuple[tuple[str, str], ...] = (
+    ("encoded shell command", r"\b(?:powershell|pwsh)\b.*-(?:e|ec|enc|encodedcommand)\b|\b(?:certutil\s+-decode\w*|xxd\s+-r\b)"),
     ("confirmation requested",
      r"\bask\s+(?:for\s+)?(?:confirmation|permission|approval)|before\s+(?:executing|running|applying)\b"),
     ("vague instruction",
@@ -231,12 +264,346 @@ _COMPILED_ASK = tuple((name, re.compile(rx, re.IGNORECASE)) for name, rx in ASK_
 _COMPILED_PROCEED = tuple((name, re.compile(rx, re.IGNORECASE)) for name, rx in PROCEED_RULES)
 
 
+# Zero-width & invisible characters to strip unconditionally
+_ZERO_WIDTH_CHARS = re.compile(r"[\u200B\u200C\u200D\uFEFF\u200E\u200F\u00A0\u2060\u180E\u00AD]")
+
+# Unicode homoglyphs and confusables (Cyrillic, Greek, Fullwidth, Special slashes) to canonical ASCII
+_CONFUSABLES_MAP = {
+    # Cyrillic lookalikes (visual UTS #39 confusables)
+    "а": "a", "б": "b", "в": "b", "г": "r", "д": "d", "е": "e", "ж": "zh", "з": "3",
+    "и": "u", "й": "u", "к": "k", "л": "l", "м": "m", "н": "h", "о": "o", "п": "n",
+    "р": "p", "с": "c", "т": "t", "у": "y", "ф": "f", "х": "x", "ц": "u", "ч": "h",
+    "ш": "w", "щ": "w", "ъ": "b", "ы": "bl", "ь": "b", "э": "e", "ю": "o", "я": "r",
+    "і": "i", "ї": "i", "є": "e", "ґ": "r", "ԁ": "d", "ԛ": "q", "ԝ": "w",
+    # Greek lookalikes
+    "α": "a", "β": "b", "γ": "y", "δ": "d", "ε": "e", "ζ": "z", "η": "n", "θ": "0",
+    "ι": "i", "κ": "k", "λ": "l", "μ": "u", "ν": "v", "ξ": "x", "ο": "o", "π": "n",
+    "ρ": "p", "σ": "o", "τ": "t", "υ": "u", "φ": "o", "χ": "x", "ψ": "u", "ω": "w",
+    # Slashes and delimiters
+    "\u2215": "/", "\uff0f": "/", "\u2044": "/", "\u29f8": "/", "\ufe68": "\\", "\uff3c": "\\",
+}
+_CONFUSABLES_TRANS = str.maketrans(_CONFUSABLES_MAP)
+
+
 def normalize(text: str) -> str:
-    """Normalize text: lowercase, unaccented, unified quotes, compacted spaces."""
+    """Normalize text: strip invisible chars, resolve homoglyphs, lowercase, unaccented, unified quotes, compacted spaces."""
+    if not text:
+        return ""
+    # 1. Strip zero-width & invisible characters
+    text = _ZERO_WIDTH_CHARS.sub("", text)
+    # 2. Compatibility decomposition & recomposition (e.g. fullwidth ａ -> a)
+    text = unicodedata.normalize("NFKC", text)
+    # 3. Map cross-script confusables & homoglyphs
+    text = text.lower().translate(_CONFUSABLES_TRANS)
+    # 4. Strip combining accents (e.g. e + accent -> e)
     text = unicodedata.normalize("NFKD", text)
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    # 5. Unify quotes and dashes
     text = text.replace("\u2019", "'").replace("\u2018", "'").replace("\u201c", '"').replace("\u201d", '"')
-    return re.sub(r"\s+", " ", text).strip().lower()
+    text = text.replace("`", "'").replace("\u2014", "--").replace("\u2013", "-")
+    # 6. Compact spaces
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _canonicalize_path_string(text: str) -> str:
+    """Canonicalize slashes, collapse ./ and ../ relative sequences in text."""
+    if not text:
+        return ""
+    t = text.replace("\\", "/")
+    t = re.sub(r"/+", "/", t)
+    t = re.sub(r"(?:^|(?<=[\s\'\"=]))\./+", "", t)
+    prev = None
+    while prev != t:
+        prev = t
+        t = re.sub(r"[a-zA-Z0-9_.-]+/+\.\./+", "", t)
+    return t
+
+
+def deobfuscate_shell_syntax(text: str) -> str:
+    """Strip shell obfuscation: quote-splicing, backslash escapes, $IFS, hex/octal escapes, reversed text."""
+    if not text:
+        return ""
+    s = text
+
+    # 1. Expand $IFS and ${IFS} (case-insensitive) to space
+    s = re.sub(r"(?i)\$(?:ifs|\{ifs\})", " ", s)
+
+    # 2. Decode ANSI-C hex and octal escapes: $'\x72\x6d' or \x72\x6d or $'\162\155'
+    def _decode_hex(m: re.Match) -> str:
+        try:
+            return chr(int(m.group(1), 16))
+        except ValueError:
+            return m.group(0)
+
+    s = re.sub(r"(?:\$')?\\x([0-9a-fA-F]{2})'?", _decode_hex, s)
+
+    def _decode_octal(m: re.Match) -> str:
+        try:
+            return chr(int(m.group(1), 8))
+        except ValueError:
+            return m.group(0)
+
+    s = re.sub(r"(?:\$')?\\([0-3][0-7]{2})'?", _decode_octal, s)
+
+    # 3. Remove escaping backslashes from all characters (including spaces): \r\m\ \-\r\f -> rm -rf
+    s = re.sub(r"\\(.)", r"\1", s)
+
+    # 4. Collapse quote splicing: remove quotes within word tokens
+    # E.g. r""m -> rm, 'r''m' -> rm, "r""m" -> rm, 'r'm -> rm, r'm' -> rm
+    s = re.sub(r'""|\'\'', '', s)
+    s = re.sub(r"(?<=[a-zA-Z0-9_./-])['\"]+|['\"]+(?=[a-zA-Z0-9_./-])", "", s)
+    s = re.sub(r"(^|[\s;&|])['\"]([a-zA-Z0-9_./-]+)['\"](?=[\s;&|]|$)", r"\1\2", s)
+
+    # 5. Simple brace expansion: {rm,-rf,/} -> rm -rf /
+    def _expand_braces(m: re.Match) -> str:
+        parts = [p.strip() for p in m.group(1).split(",") if p.strip()]
+        return " ".join(parts)
+
+    s = re.sub(r"\{([^{}]+,[^{}]+)\}", _expand_braces, s)
+
+    # 6. Inline subshell expansions: $(rev <<< '...'), $(echo '...'), `echo '...'`
+    def _expand_rev_subshell(m: re.Match) -> str:
+        return m.group(1)[::-1]
+
+    s = re.sub(r"\$\(\s*rev\s*<<<\s*['\"]?([^'\"\)\n]+?)['\"]?\s*\)", _expand_rev_subshell, s)
+    s = re.sub(r"\$\(\s*(?:echo|printf)\s+['\"]?([^'\"\)\n]+)['\"]?\s*\)", r"\1", s)
+    s = re.sub(r"`\s*(?:echo|printf)\s+['\"]?([^'\"`\n]+)['\"]?\s*`", r"\1", s)
+
+    m_rev = re.search(r"rev\s*<<<\s*['\"]?([^'\"\)\n]+?)['\"]?", s)
+    if m_rev:
+        s += " " + m_rev.group(1).strip()[::-1]
+    m_rev_pipe = re.search(r"(?:echo|printf)\s+['\"]?([^'\"\|\n]+)['\"]?\s*\|\s*rev", s)
+    if m_rev_pipe:
+        s += " " + m_rev_pipe.group(1).strip()[::-1]
+
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def decode_encoded_payloads(text: str) -> list[str]:
+    """Extract and decode Base64 and hex payloads from PowerShell and Unix pipelines."""
+    decoded_payloads: list[str] = []
+    if not text:
+        return decoded_payloads
+
+    # 1. PowerShell -EncodedCommand / -enc / -ec / -e
+    ps_enc_matches = re.finditer(
+        r"(?:-|/)(?:encodedcommand|enc|ec|e)\s+[\"']?([A-Za-z0-9+/=]{8,})[\"']?",
+        text,
+        re.IGNORECASE,
+    )
+    for m in ps_enc_matches:
+        raw_b64 = m.group(1)
+        pad = (4 - len(raw_b64) % 4) % 4
+        padded = raw_b64 + ("=" * pad)
+        try:
+            b = base64.b64decode(padded)
+            decoded_utf16 = b.decode("utf-16le", errors="ignore").strip()
+            if decoded_utf16:
+                decoded_payloads.append(decoded_utf16)
+            decoded_utf8 = b.decode("utf-8", errors="ignore").strip()
+            if decoded_utf8 and decoded_utf8 != decoded_utf16:
+                decoded_payloads.append(decoded_utf8)
+        except Exception:
+            pass
+
+    # 2. Unix base64 decode pipelines: echo "<b64>" | base64 -d
+    b64_pipe_matches = re.finditer(
+        r"(?:echo|printf)\s+[\"']?([A-Za-z0-9+/=]{8,})[\"']?\s*\|\s*(?:base64\s+-(?:d|-decode)|openssl\s+enc\s+-d\s+-base64)",
+        text,
+        re.IGNORECASE,
+    )
+    for m in b64_pipe_matches:
+        raw_b64 = m.group(1)
+        pad = (4 - len(raw_b64) % 4) % 4
+        padded = raw_b64 + ("=" * pad)
+        try:
+            b = base64.b64decode(padded)
+            decoded_str = b.decode("utf-8", errors="ignore").strip()
+            if decoded_str:
+                decoded_payloads.append(decoded_str)
+        except Exception:
+            pass
+
+    # 3. Certutil -decode blocks
+    certutil_matches = re.finditer(
+        r"certutil\s+-decode\w*\s+[\"']?([A-Za-z0-9+/=]{8,})[\"']?",
+        text,
+        re.IGNORECASE,
+    )
+    for m in certutil_matches:
+        raw_b64 = m.group(1)
+        pad = (4 - len(raw_b64) % 4) % 4
+        padded = raw_b64 + ("=" * pad)
+        try:
+            b = base64.b64decode(padded)
+            decoded_str = b.decode("utf-8", errors="ignore").strip()
+            if decoded_str:
+                decoded_payloads.append(decoded_str)
+        except Exception:
+            pass
+
+    return decoded_payloads
+
+
+_SHELL_NAMES = {"bash", "sh", "zsh", "dash", "ksh", "busybox", "csh", "tcsh"}
+_PRIV_WRAPPERS = {"sudo", "doas", "runuser", "chroot", "nsenter"}
+_UTIL_WRAPPERS = {"nohup", "timeout", "time", "nice", "ionice", "stdbuf", "xargs"}
+_LANG_RUNNERS = {"python", "python3", "python2", "py", "node", "perl", "ruby", "php"}
+
+
+def _split_tokens(cmd: str) -> list[str]:
+    try:
+        return shlex.split(cmd, posix=(os.name != "nt"))
+    except ValueError:
+        return [t.strip("\"'") for t in cmd.split() if t.strip()]
+
+
+def unwrap_command_wrappers(text: str, max_depth: int = 5) -> list[str]:
+    """Recursively peel wrapper commands (bash -c, eval, sudo, env, xargs, etc.) to extract all inner commands."""
+    discovered: list[str] = [text]
+    seen: set[str] = {text}
+
+    def _add(cand: str, depth: int) -> None:
+        cand = cand.strip()
+        if not cand or cand in seen or depth > max_depth:
+            return
+        seen.add(cand)
+        discovered.append(cand)
+        _recurse(cand, depth + 1)
+
+    def _recurse(curr: str, depth: int) -> None:
+        if depth > max_depth:
+            return
+
+        # 1. Extract subshell contents: $(...) and `...`
+        for sub in re.findall(r"\$\(([^()]+)\)", curr):
+            _add(sub, depth)
+        for sub in re.findall(r"`([^`]+)`", curr):
+            _add(sub, depth)
+
+        # 2. Extract process substitution: <(...) and >(...)
+        for sub in re.findall(r"[<>]\(([^()]+)\)", curr):
+            _add(sub, depth)
+
+        # 3. Extract here-strings: bash <<< "..."
+        for hs in re.findall(r"<<<\s*['\"]?([^'\"\n]+)['\"]?", curr):
+            _add(hs, depth)
+
+        # 4. Token-based unwrapping
+        tokens = _split_tokens(curr)
+        if not tokens:
+            return
+
+        # Skip leading environment variable assignments: e.g. FOO=bar BAZ=1 cmd ...
+        idx = 0
+        while idx < len(tokens) and re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*=.*$", tokens[idx]):
+            idx += 1
+        if idx > 0 and idx < len(tokens):
+            _add(" ".join(tokens[idx:]), depth)
+            tokens = tokens[idx:]
+
+        if not tokens:
+            return
+
+        prog = os.path.basename(tokens[0]).lower()
+        if prog.endswith(".exe"):
+            prog = prog[:-4]
+
+        # A. env command: env [-i] [VAR=VAL...] cmd
+        if prog == "env" and len(tokens) > 1:
+            sub_tokens = tokens[1:]
+            while sub_tokens and (sub_tokens[0].startswith("-") or "=" in sub_tokens[0]):
+                sub_tokens = sub_tokens[1:]
+            if sub_tokens:
+                _add(" ".join(sub_tokens), depth)
+
+        # B. sudo / doas / privilege wrappers
+        elif prog in _PRIV_WRAPPERS and len(tokens) > 1:
+            sub_tokens = tokens[1:]
+            i = 0
+            while i < len(sub_tokens) and sub_tokens[i].startswith("-"):
+                if sub_tokens[i] in ("-u", "-g", "--user", "--group") and i + 1 < len(sub_tokens):
+                    i += 2
+                else:
+                    i += 1
+            if i < len(sub_tokens):
+                _add(" ".join(sub_tokens[i:]), depth)
+
+        # C. Utility wrappers: nohup, timeout 10s, nice -n 19, time, etc.
+        elif prog in _UTIL_WRAPPERS and len(tokens) > 1:
+            sub_tokens = tokens[1:]
+            i = 0
+            while i < len(sub_tokens) and sub_tokens[i].startswith("-"):
+                if sub_tokens[i] in ("-n", "-s", "-k", "-I", "-i", "-o", "-e", "-t") and i + 1 < len(sub_tokens):
+                    i += 2
+                else:
+                    i += 1
+            if prog == "timeout" and i < len(sub_tokens) and re.match(r"^\d+[smhd]?$", sub_tokens[i]):
+                i += 1
+            if i < len(sub_tokens):
+                _add(" ".join(sub_tokens[i:]), depth)
+
+        # D. Shell -c: bash -c "...", sh -c '...'
+        elif prog in _SHELL_NAMES and len(tokens) >= 2:
+            if "-c" in tokens:
+                c_idx = tokens.index("-c")
+                if c_idx + 1 < len(tokens):
+                    _add(tokens[c_idx + 1], depth)
+            elif len(tokens) >= 2 and not tokens[1].startswith("-"):
+                _add(" ".join(tokens[1:]), depth)
+
+        # E. PowerShell wrappers: powershell -c "...", pwsh -command "..."
+        elif prog in ("powershell", "pwsh") and len(tokens) >= 2:
+            for flag in ("-c", "-command", "/c", "/command"):
+                for t_i, t in enumerate(tokens):
+                    if t.lower() == flag and t_i + 1 < len(tokens):
+                        _add(tokens[t_i + 1], depth)
+                        break
+
+        # F. CMD wrappers: cmd /c "...", cmd.exe /c "..."
+        elif prog == "cmd" and len(tokens) >= 2:
+            for flag in ("/c", "/k", "-c"):
+                for t_i, t in enumerate(tokens):
+                    if t.lower() == flag and t_i + 1 < len(tokens):
+                        _add(" ".join(tokens[t_i + 1:]), depth)
+                        break
+
+        # G. eval and exec
+        elif prog in ("eval", "exec") and len(tokens) > 1:
+            _add(" ".join(tokens[1:]), depth)
+
+        # H. Script interpreters: python -c "...", node -e "...", etc.
+        elif prog in _LANG_RUNNERS and len(tokens) >= 2:
+            for flag in ("-c", "-e", "-r", "--eval"):
+                for t_i, t in enumerate(tokens):
+                    if t.lower() == flag and t_i + 1 < len(tokens):
+                        _add(tokens[t_i + 1], depth)
+                        break
+
+        # I. Chained / piped commands: split on &&, ||, ;, |
+        if any(sep in curr for sep in ("&&", "||", ";", "|", "\n")):
+            for seg in re.split(r"&&|\|\||;|\||\n", curr):
+                seg = seg.strip()
+                if seg and seg != curr:
+                    _add(seg, depth)
+
+        # J. Script file execution peeking (e.g. bash script.sh, sh ./test.sh, python run.py, ./script.sh)
+        for cand in tokens:
+            clean_sc = cand.strip("'\"`")
+            if clean_sc and not clean_sc.startswith("-") and ("." in clean_sc or "/" in clean_sc or "\\" in clean_sc):
+                try:
+                    sc_path = Path(clean_sc)
+                    if sc_path.is_file() and sc_path.stat().st_size <= 65536:
+                        content = sc_path.read_text(encoding="utf-8", errors="ignore")
+                        for line in content.splitlines():
+                            line_s = line.strip()
+                            if line_s and not line_s.startswith(("#", "//", ";", "rem", "::")):
+                                _add(line_s, depth)
+                except Exception:
+                    pass
+
+    _recurse(text, 1)
+    return discovered
 
 
 @dataclass
@@ -283,11 +650,26 @@ class PathRule:
                     self.command_regexes.append(re.compile(rx, re.IGNORECASE))
 
     def matches(self, text: str) -> bool:
-        if not self.path_regex.search(text):
+        norm_text = _canonicalize_path_string(text)
+        matched_path = bool(self.path_regex.search(text) or self.path_regex.search(norm_text))
+        if not matched_path:
+            for token in text.split():
+                clean_tok = token.strip("'\"`")
+                if ("/" in clean_tok or "\\" in clean_tok or "." in clean_tok) and not clean_tok.startswith("-"):
+                    try:
+                        p_obj = Path(clean_tok)
+                        if p_obj.exists():
+                            resolved = str(p_obj.resolve()).replace("\\", "/")
+                            if self.path_regex.search(resolved):
+                                matched_path = True
+                                break
+                    except Exception:
+                        pass
+        if not matched_path:
             return False
         if self.all_commands:
             return True
-        return any(rx.search(text) for rx in self.command_regexes) if self.command_regexes else False
+        return any(rx.search(text) or rx.search(norm_text) for rx in self.command_regexes) if self.command_regexes else False
 
 
 # --- External Policy Configuration (policy.yaml) ---
@@ -353,41 +735,96 @@ def load_policy(file_path: str | Path | None = None) -> dict:
 
 
 def evaluate_rules(description: str) -> RuleResult:
-    """Evaluate deterministic rules, path rules, and policy.yaml."""
+    """Evaluate deterministic rules, path rules, and policy.yaml with recursive unwrapping."""
     if not _POLICY_LOADED:
         load_policy()
 
-    text = normalize(description)
+    # 1. Base normalization (homoglyphs, invisible chars, quotes, lower)
+    base_text = normalize(description)
+    if not base_text:
+        return RuleResult("proceed", [])
 
-    # 1. Command block rules (Highest priority)
+    # 2. De-obfuscate shell syntax (quote splicing, backslashes, IFS, hex/octal)
+    deobf_text = deobfuscate_shell_syntax(base_text)
+
+    # 3. Extract decoded payloads (PowerShell Base64 UTF-16LE, Unix base64 pipes)
+    decoded_payloads = decode_encoded_payloads(description) + decode_encoded_payloads(base_text)
+
+    # 4. Recursively unwrap all command wrappers
+    unwrapped_layers: list[str] = []
+    candidates = [description, base_text, deobf_text] + decoded_payloads
+    for cand in candidates:
+        if not cand:
+            continue
+        for unwrapped in unwrap_command_wrappers(cand):
+            unwrapped_norm = normalize(unwrapped)
+            unwrapped_deobf = deobfuscate_shell_syntax(unwrapped_norm)
+            for item in (unwrapped, unwrapped_norm, unwrapped_deobf):
+                if item and item not in unwrapped_layers:
+                    unwrapped_layers.append(item)
+
+    if not unwrapped_layers:
+        unwrapped_layers = [base_text]
+
+    # 5. Evaluate all layers: most severe takes absolute priority
+    # Check block rules first across ALL layers
     all_blocks = list(_COMPILED_BLOCK) + _CUSTOM_BLOCK
-    blocked = [name for name, rx in all_blocks if (rx.search(description) if name == "git branch force delete" else rx.search(text))]
-    if blocked:
-        return RuleResult("block", [f"block:{n}" for n in blocked])
+    blocked_matches: list[str] = []
+    for layer in unwrapped_layers:
+        for name, rx in all_blocks:
+            match_found = rx.search(description) if name == "git branch force delete" else rx.search(layer)
+            if match_found:
+                tag = f"block:{name}"
+                if tag not in blocked_matches:
+                    blocked_matches.append(tag)
 
-    # 1b. Path block rules
-    path_blocks = [r.name for r in _PATH_RULES if r.decision == "block" and r.matches(text)]
+    if blocked_matches:
+        return RuleResult("block", blocked_matches)
+
+    # Check path block rules across ALL layers
+    path_blocks: list[str] = []
+    for layer in unwrapped_layers:
+        for r in _PATH_RULES:
+            if r.decision == "block" and r.matches(layer):
+                tag = f"block:path:{r.name}"
+                if tag not in path_blocks:
+                    path_blocks.append(tag)
+
     if path_blocks:
-        return RuleResult("block", [f"block:path:{n}" for n in path_blocks])
+        return RuleResult("block", path_blocks)
 
-    # 2. Path ask rules (Protected paths take precedence over command whitelists)
-    path_asks = [r.name for r in _PATH_RULES if r.decision == "ask_user" and r.matches(text)]
+    # Check path ask rules across ALL layers
+    path_asks: list[str] = []
+    for layer in unwrapped_layers:
+        for r in _PATH_RULES:
+            if r.decision == "ask_user" and r.matches(layer):
+                tag = f"ask_user:path:{r.name}"
+                if tag not in path_asks:
+                    path_asks.append(tag)
+
     if path_asks:
-        return RuleResult("ask_user", [f"ask_user:path:{n}" for n in path_asks])
+        return RuleResult("ask_user", path_asks)
 
-    # 3. Whitelist (proceed rules + custom proceed + path rules)
+    # Check whitelist (proceed rules) across outer text
     all_proceed_rules = list(_COMPILED_PROCEED) + _CUSTOM_PROCEED
-    whitelist_matches = [name for name, rx in all_proceed_rules if rx.search(text)]
-    path_proceeds = [r.name for r in _PATH_RULES if r.decision == "proceed" and r.matches(text)]
+    whitelist_matches = [name for name, rx in all_proceed_rules if rx.search(base_text) or rx.search(deobf_text)]
+    path_proceeds = [r.name for r in _PATH_RULES if r.decision == "proceed" and (r.matches(base_text) or r.matches(deobf_text))]
     all_proceeds = [f"proceed:whitelist:{n}" for n in whitelist_matches] + [f"proceed:path:{n}" for n in path_proceeds]
     if all_proceeds:
         return RuleResult("proceed", all_proceeds)
 
-    # 4. Command ask rules
+    # Check command ask rules across ALL layers
     all_asks = list(_COMPILED_ASK) + _CUSTOM_ASK
-    asked = [name for name, rx in all_asks if rx.search(text)]
-    if asked:
-        return RuleResult("ask_user", [f"ask_user:{n}" for n in asked])
+    asked_matches: list[str] = []
+    for layer in unwrapped_layers:
+        for name, rx in all_asks:
+            if rx.search(layer):
+                tag = f"ask_user:{name}"
+                if tag not in asked_matches:
+                    asked_matches.append(tag)
+
+    if asked_matches:
+        return RuleResult("ask_user", asked_matches)
 
     return RuleResult("proceed", [])
 
@@ -561,14 +998,15 @@ def _is_qwen_enabled() -> bool:
 def ask_qwen_explain(description: str) -> str | None:
     """Query Qwen 3.8B System 2 to explain unknown or esoteric CLI commands."""
     global _QWEN_SERVER_AVAILABLE, _QWEN_LAST_CHECK_TIME
-    if not _is_qwen_enabled():
-        return None
 
     # Check offline esoteric knowledge first for instant (< 0.1ms) resolution
     lower_desc = description.lower()
     for k, expl in OFFLINE_ESOTERIC_KNOWLEDGE.items():
         if k in lower_desc:
             return expl
+
+    if not _is_qwen_enabled():
+        return None
 
     now = time.monotonic()
     if _QWEN_SERVER_AVAILABLE is False:

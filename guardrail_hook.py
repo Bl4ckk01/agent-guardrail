@@ -231,7 +231,22 @@ _SAFE_PREFIXES = (
 
 def is_safe_readonly(command: str) -> bool:
     cmd = command.strip()
-    if not cmd or re.search(r"(?<![0-9&])>|\$\(|`|<\(", cmd):
+    if not cmd or re.search(r"(?<![0-9&])>|\$\(|`|<\(|>\(|<<<|<<", cmd):
+        return False
+    # Reject commands containing encoded payloads
+    if re.search(r"(?:-|/)(?:encodedcommand|enc|ec|e)\b|\b(?:base64\s+-(?:d|-decode)|certutil\s+-decode)\b", cmd, re.IGNORECASE):
+        return False
+    # Reject inline script execution wrappers
+    if re.search(r"\b(?:python\d?|node|perl|ruby|php)\b\s+-(?:c|e|r|-eval)\b", cmd, re.IGNORECASE):
+        return False
+    # Reject execution sinks
+    if re.search(r"\b(?:eval|exec|xargs)\b", cmd, re.IGNORECASE):
+        return False
+    # Reject environment variable execution hijacking
+    if re.search(r"(?:^|[\s;&|])(?:LD_PRELOAD|LD_LIBRARY_PATH|PYTHONPATH|NODE_OPTIONS|BASH_ENV|PERL5OPT|RUBYOPT|DYLD_INSERT_LIBRARIES)\s*=", cmd, re.IGNORECASE):
+        return False
+    # Reject reverse shells & network pseudo-devices
+    if re.search(r"/dev/(?:tcp|udp)/\S+|\b(?:nc|ncat|netcat)\b.*-(?:e|c|--exec)\b|\bsocat\b", cmd, re.IGNORECASE):
         return False
     for seg in re.split(r"&&|\|\||;|\||\n", cmd):
         seg = seg.strip()
@@ -239,6 +254,9 @@ def is_safe_readonly(command: str) -> bool:
             continue
         low = " ".join(seg.lower().split())
         if any(low == p or low.startswith(p + " ") for p in _SAFE_PREFIXES):
+            # Even for safe prefixes (like git log/diff/show), reject argument injections
+            if re.search(r"(?:--output|-c\s+core|--exec-path)\b", low):
+                return False
             continue
         try:
             first = shlex.split(seg, posix=True)[0].lower()
@@ -249,7 +267,14 @@ def is_safe_readonly(command: str) -> bool:
             first = first[:-4]
         if first not in _SAFE_CMDS:
             return False
-        if first == "find" and re.search(r"-(delete|exec|execdir|ok)\b", low):
+        # GTFOBins & argument injection checks on allowed commands
+        if first == "find" and re.search(r"-(?:delete|exec|execdir|ok|okdir)\b", low):
+            return False
+        if first in ("rg", "ripgrep") and re.search(r"--(?:pre|pre-glob|rure)\b", low):
+            return False
+        if first in ("fd", "fdfind") and re.search(r"-(?:x|X|-exec|-exec-batch)\b", low):
+            return False
+        if first in ("awk", "gawk", "mawk", "nawk") and re.search(r"(?:\bsystem\s*\(|\bgetline\b|-f\b|-e\b|>)", low):
             return False
     return True
 
@@ -273,6 +298,18 @@ def _patch_actions(patch: str) -> list[str]:
     for m in re.finditer(r"^\*\*\* Move to: (.+)$", patch or "", re.MULTILINE):
         out.append(f"move file to {m.group(1).strip()}")
     return out
+
+
+_GUARDRAIL_CONTROL_FILES = (
+    "policy.yaml", "policy.yml", "check_action.py", "guardrail_hook.py",
+    "daemon_manager.py", "install.py", ".guardrail", ".claude/settings.json",
+    ".codex/hooks.json", ".agents/hooks.json", ".cursorrules",
+)
+
+
+def _is_guardrail_file(path: str) -> bool:
+    p_canon = path.replace("\\", "/").lower()
+    return any(gf in p_canon or p_canon.endswith(gf.lstrip("/")) for gf in _GUARDRAIL_CONTROL_FILES)
 
 
 def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
@@ -303,15 +340,37 @@ def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
         patch = str(inp.get("command") or inp.get("patch") or inp.get("input") or "")
         actions = _patch_actions(patch)
         paths = [a.split(" ", 3)[-1] for a in actions]
-        return ("; ".join(actions) or "apply patch to files"), False, paths
+        for p in paths:
+            if _is_guardrail_file(p):
+                return f"tamper guardrail control plane: apply patch to {p}", False, paths
+        desc = ("; ".join(actions) or "apply patch to files")
+        if patch:
+            desc += f"\n[patch-content]:\n{patch[:2000]}"
+        return desc, False, paths
 
     if low in DELETE_TOOLS:
         path = str(inp.get("file_path") or inp.get("path") or inp.get("TargetFile") or "")
+        if _is_guardrail_file(path):
+            return f"tamper guardrail control plane: delete file {path}", False, [path]
         return f"delete file {path}", False, [path]
 
     if low in EDIT_TOOLS:
         path = str(inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or inp.get("TargetFile") or "")
         verb = "write file" if low in ("write", "writefile", "write_to_file") else "modify file"
+        if _is_guardrail_file(path):
+            return f"tamper guardrail control plane: {verb} {path}", False, [path]
+        content = (
+            inp.get("CodeContent")
+            or inp.get("content")
+            or inp.get("ReplacementContent")
+            or inp.get("new_string")
+            or inp.get("new_str")
+            or inp.get("text")
+            or ""
+        )
+        if isinstance(content, str) and content.strip():
+            content_snippet = content[:2000].replace("\r", "")
+            return f"{verb} {path}\n[content]:\n{content_snippet}", False, [path]
         return f"{verb} {path}", False, [path]
 
     if low == "webfetch":

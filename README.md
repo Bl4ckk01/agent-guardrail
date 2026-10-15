@@ -200,6 +200,64 @@ flowchart TD
 
 ---
 
+### 🛡️ Anti-Evasion, Prompt-to-RCE & Threat Remediation Engine
+
+A common vulnerability in naive command guardrails is **evasion and bypass attacks**: malicious commands hidden inside shell wrappers, living-off-the-land utility flags, staged file writes, or control-plane tampering. Agent Guardrail solves this with a comprehensive, multi-stage recursive de-obfuscation and inspection engine executed **before** rule matching:
+
+1. **Recursive Wrapper Unwrapping (up to 5 levels deep)**:
+   - Walks and peels subshells and wrappers: `bash -c`, `sh -c`, `zsh -c`, `powershell -c`, `pwsh -c`, `cmd.exe /c`.
+   - Execution sinks: `eval`, `exec`, `source`.
+   - Privilege & process wrappers: `sudo`, `doas`, `env`, leading `VAR=val`, `nohup`, `timeout`, `nice`, `xargs`.
+   - Subshell & process substitutions: `$(...)`, `` `...` ``, `<(...)`.
+   - Evaluates **all** discovered layers simultaneously; if **any** layer contains a prohibited action, the entire command is unconditionally blocked.
+
+2. **GTFOBins & CLI Argument Injection Defense (Trail of Bits Advisory)**:
+   - **Ripgrep (`rg`)**: Blocks arbitrary preprocessor execution via `rg --pre <command>` and `--pre-glob` (preventing indirect prompt-injection RCE chains).
+   - **Find / FD**: Blocks arbitrary execution flags `find -exec`, `-ok`, `-execdir` and `fd -x`, `-X`, `--exec`, `--exec-batch`.
+   - **Git Execution Hooks & Config**: Blocks command injection via `git -c core.fsmonitor=<cmd>`, `-c core.pager=<cmd>`, `-c diff.external=<cmd>`, `--exec-path=<path>`, and `core.sshCommand`.
+   - **Archive & Build Utilities**: Blocks arbitrary execution in `tar --to-command`, `tar --checkpoint-action=exec`, `go test -exec`, `rsync -e / --rsh`, and `zip -T -TT`.
+
+3. **Environment Variable Execution Hijacking**:
+   - Detects and blocks dynamic library and runtime preloading prefixes even before read-only commands: `LD_PRELOAD=`, `LD_LIBRARY_PATH=`, `NODE_OPTIONS=`, `PYTHONPATH=`, `BASH_ENV=`, `PERL5OPT=`, `RUBYOPT=`, and `DYLD_INSERT_LIBRARIES=`.
+
+4. **Staged Payload & File Write Content Inspection**:
+   - Intercepts IDE file-write tools (`write_to_file`, `replace_file_content`, `edit`, `multiedit`) and inspects the actual `CodeContent` / `content` being written.
+   - If an agent is tricked into writing a reverse shell or destructive payload into a script file, the file creation is blocked **before** it touches the disk.
+
+5. **Local Script Peeking**:
+   - When a command executes a local script (`bash script.sh`, `sh ./run.sh`, `python test.py`, `./script.sh`), the unwrapper automatically peeks into the script file on disk (up to 64KB) and extracts its executable lines for safety evaluation.
+
+6. **Guardrail Control-Plane Self-Tampering Defense**:
+   - Strictly prohibits deleting, overwriting, or modifying guardrail files: `policy.yaml`, `check_action.py`, `guardrail_hook.py`, `daemon_manager.py`, `install.py`, `~/.guardrail/*`, `.claude/settings.json`, `.codex/hooks.json`, `.agents/hooks.json`, and `.cursorrules`.
+   - Rejects agent attempts to disable the guardrail via tool calls (`guardrail_hook.py off`, `[[guardrail:off]]`).
+
+7. **Reverse Shells, Raw Sockets & Data Exfiltration**:
+   - Blocks bash socket pseudo-devices (`/dev/tcp/`, `/dev/udp/`).
+   - Blocks Netcat and Socat execution shells (`nc -e`, `ncat --exec`, `socat exec:`).
+   - Blocks named pipe reverse shells (`mkfifo` + `nc` / `sh`) and raw PowerShell TCP socket shells (`System.Net.Sockets.TcpClient`).
+   - Blocks direct credential and secret exfiltration via `curl -d @.env`, `curl -d @/etc/passwd`, and `wget --post-file=id_rsa`.
+
+8. **Shell Startup File Poisoning (Persistence Attacks)**:
+   - Blocks attempts to append backdoors or destructive triggers to shell profiles: `~/.bashrc`, `~/.bash_profile`, `~/.zshrc`, `~/.profile`, `/etc/profile`, `/etc/environment`, Windows `$PROFILE`, and `/etc/cron*`.
+
+9. **Automated Payload Decoding & Shell Syntactic De-obfuscation**:
+   - **PowerShell Base64 UTF-16LE**: Intercepts `-EncodedCommand` / `-enc` parameters, decodes UTF-16LE payloads into plaintext, and validates inner commands.
+   - **Unix Base64 Pipelines**: Detects `echo <b64> | base64 -d | sh` and `certutil -decode` pipelines.
+   - **Quote Splicing**: Strips fragmented quotes (`r""m -r""f /` -> `rm -rf /`).
+   - **Backslash Character Escapes**: Normalizes escapes (`\r\m\ \-\r\f\ /` -> `rm -rf /`).
+   - **$IFS Expansion**: Expands `$IFS` and `${IFS}` environment separators to whitespace.
+   - **ANSI-C Hex & Octal Escapes**: Translates `$'\x72\x6d'` and `\162\155` into plaintext tokens.
+   - **Reversed Commands**: Expands `$(rev <<< 'fr- mr')` back to `rm -rf`.
+
+10. **UTS #39 Visual Homoglyphs & Zero-Width Sanitization**:
+    - Strips zero-width and invisible characters (`\u200B`, `\u200C`, `\uFEFF`, `\u00A0`).
+    - Maps Unicode confusables and cross-script lookalikes (Cyrillic `р, о, с, е` -> `p, o, c, e`, fullwidth characters, division slashes `∕`) to canonical ASCII.
+
+11. **Canonical Path & Symlink Resolution**:
+    - Resolves relative directory traversals (`./secrets/`, `foo/../secrets/`, redundant slashes `//`) and physical symlinks (`Path.resolve()`), preventing path restriction evasion.
+
+---
+
 ### Supported Backend Engines
 
 Configure the active backend with a single setting in [`policy.yaml`](policy.yaml) (`settings.backend`) or via the `GUARDRAIL_BACKEND` environment variable:
@@ -814,6 +872,23 @@ Detailed breakdown across 150 diverse test cases:
 - **0% Destructive Leaks**: Zero destructive actions classified as `proceed`.
 - **High Sensitivity**: Granular separation between ambiguous operations and catastrophic operations.
 - **Accurate Category Handling**: 100% precision on Git destructive operations, Database mutations, and Secrets access.
+
+---
+
+### 10. Interception Overhead & Approval Fatigue Benchmark (Real-World Evaluation)
+![Interception Overhead and Approval Fatigue](charts/9_approval_clicks_and_latency_benchmark.png)
+
+Empirical evaluation measured across 500 actions and a 100-action coding session:
+- **Interception Overhead**:
+  - **Tier 1 Pure Rules Mode**: **0.07 ms** (mean: `69.93 µs`, median: `62.60 µs`). Over **107,000× faster** than human approval wait time.
+  - **Liquid AI d1-3B**: **14.2 ms** (528× faster than human review).
+  - **Contrastive CLM**: **38.0 ms** (197× faster).
+  - **TypeSafe AI Jev**: **60.0 ms** (125× faster).
+- **Approval Fatigue (Clicks Saved per 100 Actions)**:
+  - **Codex Native `--ask always`**: Interrupts the developer on **100 out of 100 actions** (100% fatigue).
+  - **Traditional Cloud LLM**: **35 prompts** (24.5% false positives on safe actions like tests/linters).
+  - **Agent Guardrail**: Only **11 prompts** (strictly restricted to genuine config or dependency changes; safe actions pass silently, destructive operations are hard-blocked without requiring clicks).
+  - **Net Reduction**: **89 approval clicks saved per session** (**89% reduction in prompt fatigue**).
 
 ---
 
