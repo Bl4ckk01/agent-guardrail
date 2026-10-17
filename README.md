@@ -25,9 +25,11 @@
   - [The Agent Guardrail Solution](#the-agent-guardrail-solution)
   - [Comparative Overview](#comparative-overview)
 - [Architecture & How It Works](#-architecture--how-it-works)
+  - [Interactive Flowchart (Mermaid)](#interactive-flowchart-mermaid)
   - [System Architecture Diagram](#system-architecture-diagram)
-  - [Interactive Flowchart (Mermaid)](#interactive-flowchart)
   - [The 3-Tier Hybrid Defense](#the-3-tier-hybrid-defense)
+  - [Anti-Evasion & Threat Remediation Engine](#-anti-evasion-prompt-to-rce--threat-remediation-engine)
+  - [Context-Aware Risk Scoring & Audit Log](#-context-aware-risk-scoring-scoped-memory-boundaries--tamper-evident-audit-log)
   - [Supported Backend Engines (d1, clm, jev, rules)](#supported-backend-engines)
   - [Asymmetric Decision Protocol](#asymmetric-decision-protocol)
 - [Quickstart & Installation](#-quickstart--installation)
@@ -39,16 +41,18 @@
 - [Local Models & Startup Commands](#-local-models--startup-commands)
   - [Automatic Background Daemon Management (daemon_manager.py)](#automatic-background-daemon-management-daemon_managerpy)
   - [Backend Models Quick Reference](#backend-models-quick-reference)
-  - [Startup Terminal Commands](#launching-local-servers)
+  - [Manual Terminal Launching](#manual-terminal-launching)
 - [Claude Code Integration](#-claude-code-integration)
 - [OpenAI Codex & ChatGPT Integration](#-openai-codex--chatgpt-integration)
 - [Google Antigravity Integration](#-google-antigravity-integration)
 - [Cursor Integration](#-cursor-integration)
 - [Grok Build Integration](#-grok-build-integration)
 - [Model Context Protocol (MCP) Server Integration](#-model-context-protocol-mcp-server-integration)
-- [Configuration & Options (policy.yaml)](#-configuration--options-policyyaml)
-  - [Policy Structure](#policy-structure)
-  - [Environment Variables](#environment-variables-reference)
+- [Configuration Guide (policy.yaml & Environment Variables)](#-configuration-guide-policyyaml--environment-variables)
+  - [Policy Discovery Order](#policy-discovery-order)
+  - [Complete Annotated policy.yaml Reference](#complete-annotated-policyyaml-reference)
+  - [Dynamic Live Reloading (Zero-Downtime)](#dynamic-live-reloading-zero-downtime)
+  - [Environment Variables Reference](#environment-variables-reference)
 - [Benchmark & Visual Analytics](#-benchmark--visual-analytics)
   - [1. 5-Axis Overall Benchmark Radar](#1-5-axis-overall-benchmark-radar)
   - [2. Multi-Run Neural Evaluation Across 500 Tests](#2-5x100-multi-run-evaluation-neural-models-head-to-head-500-tests)
@@ -59,6 +63,7 @@
   - [7. Liquid AI D1 vs CLM Direct Head-to-Head](#7-liquid-ai-d1-vs-clm-direct-head-to-head)
   - [8. Esoteric CLI Disambiguation (Qwen System 2)](#8-esoteric-cli-disambiguation-qwen-system-2)
   - [9. Operational Category Breakdown](#9-operational-category-breakdown)
+  - [10. Interception Overhead & Approval Fatigue Benchmark](#10-interception-overhead--approval-fatigue-benchmark-real-world-evaluation)
 - [Limitations & Security Boundaries](#-limitations--security-boundaries)
 - [Requirements](#-requirements)
 - [Development & Testing](#-development--testing)
@@ -139,7 +144,7 @@ Developers today are forced to choose between two broken extremes:
 
 ## 🏛️ Architecture & How It Works
 
-### System Flowchart
+### Interactive Flowchart (Mermaid)
 
 ```mermaid
 flowchart TD
@@ -176,6 +181,8 @@ flowchart TD
     style ASK fill:#ffffff,stroke:#000000,stroke-width:2px,color:#e3b341
     style BLOCK fill:#ffffff,stroke:#000000,stroke-width:2px,color:#f85149
 ```
+
+### System Architecture Diagram
 
 <p align="center">
   <img src="charts/architecture_diagram.png" alt="Agent Guardrail Complete Architecture" width="100%" />
@@ -295,14 +302,13 @@ Evaluating a command string in isolation is insufficient because real-world inte
 
 ### Supported Backend Engines
 
-Configure the active backend with a single setting in [`policy.yaml`](policy.yaml) (`settings.backend`) or via the `GUARDRAIL_BACKEND` environment variable:
+Configure the active decision engine in [`policy.yaml`](policy.yaml) (`settings.backend`) or via the `GUARDRAIL_BACKEND` environment variable. Agent Guardrail supports 4 interchangeable backends:
+- **`rules`** *(Default)*: Deterministic regex and path shield (`< 0.1 ms`, zero hardware, 100% offline).
+- **`d1`** *(New!)*: Liquid AI d1-3B LFM (`~14.2 ms`, single daemon on port `8800`, ~3–4 GB VRAM).
+- **`clm`**: Contrastive Language Model (`~38.0 ms`, geometric classifier on ports `8700` / `8090`).
+- **`jev`**: TypeSafe AI Cloud API (`~60.0 ms`, zero local compute, cloud-managed).
 
-| Backend | Engine / Technology | Port / Mode | Local VRAM | Best For |
-|---|---|:---:|:---:|---|
-| **`d1`** *(New!)* | **Liquid AI d1-3B (LFM)** | Port `8800` | ~3–4 GB | Fast single-pass neural evaluations, lightweight local deployment. |
-| **`clm`** | **Contrastive Language Model** | Port `8700` (via 8090) | ~4–6 GB | Precise geometric embeddings with contrastive probability calibration. |
-| **`jev`** | **TypeSafe AI Cloud API** | Cloud HTTPS | 0 GB | Zero local hardware usage, cloud-managed intelligence (requires `JEV_API_KEY`). |
-| **`rules`** | **Pure Deterministic Engine** | In-process | 0 GB | `< 0.1 ms` execution, zero models, CI/CD pipelines, lightweight containers. |
+👉 *See [Pick Your Security Mode](#-pick-your-security-mode) for full comparative hardware, VRAM, and latency specifications.*
 
 ---
 
@@ -325,7 +331,7 @@ Safety guardrails must be **asymmetric**: an accidental block is merely a minor 
 
 ### 📱 Platform Compatibility Matrix
 
-Agent Guardrail natively protects **5 major AI coding platforms** with zero configuration required:
+Agent Guardrail natively protects **5 major AI coding platforms and all MCP clients** with zero configuration required:
 
 | Platform | Supported Environments | Interception Method | Quick Setup Command | Safety Interception UX |
 |:---|:---:|:---|:---:|:---|
@@ -334,7 +340,8 @@ Agent Guardrail natively protects **5 major AI coding platforms** with zero conf
 | **Google Antigravity** | AGY IDE & CLI 2.0 | Native Hook Interceptors (`hooks.json`) & Workspace Rules | `python install.py --antigravity` | Native IDE approval dialog (`{"decision": "ask"}`) |
 | **Cursor** | Composer & Agent Mode | Cursor Rules (`.cursor/rules/guardrail.mdc` & `.cursorrules`) | `python install.py --cursor` | System prompt pre-execution block & user inquiry |
 | **Grok Build** (xAI) | Grok CLI & Agent | Native Skill Discovery (`.grok/skills/`) & Root `AGENTS.md` | `python install.py --grok` | Subagent boundary enforcement & terminal refusal |
-| **All 5 Platforms at Once** | Workspace & Global | Configures all 5 platforms simultaneously | `python install.py` (or `--global`) | Complete unified defense suite across all agents |
+| **MCP Clients** (Claude Desktop, Cursor, Zed, VS Code) | Native JSON-RPC 2.0 (`stdio`) | Protocol Server (`mcp_server.py`) | `python install.py --mcp` | Dynamic client tools (`check_action`, `reload_policy`) |
+| **All Platforms & MCP at Once** | Workspace & Global | Configures all 5 platforms + MCP simultaneously | `python install.py` (or `--global`) | Complete unified defense suite across all agents |
 
 > [!TIP]
 > - **Workspace Install (`python install.py`)**: Automatically configures the guardrail for your current repository. You can commit the generated rules and hooks directly to Git.
@@ -346,12 +353,12 @@ Agent Guardrail natively protects **5 major AI coding platforms** with zero conf
 
 You do not need to download models or configure GPUs to get started! Choose what fits your workflow in [`policy.yaml`](policy.yaml):
 
-| Mode / Engine | Setup Required | Hardware Needed | Latency | Best For |
-|:---|:---:|:---|:---:|:---|
-| **`backend: "rules"`** *(Default zero-setup)* | **None (Zero Setup)** | Any CPU (0 GB VRAM) | **< 0.1 ms** | **Instant start**, CI/CD pipelines, servers, laptops. 100% offline. |
-| **`backend: "d1"`** *(Liquid AI D1-3B)* | Download GGUF & `/guardrail start` | 3–4 GB VRAM (Port 8800) | **~14.2 ms** | High-speed local neural evaluations, lightweight LFM model. |
-| **`backend: "clm"`** *(Contrastive CLM)* | Download GGUF & `/guardrail start` | 4–6 GB VRAM (Ports 8090/8700) | **~38.0 ms** | Deep contrastive geometric reasoning with calibrated probabilities. |
-| **`backend: "jev"`** *(TypeSafe AI Cloud)* | `export JEV_API_KEY="..."` | 0 GB VRAM (Cloud HTTPS) | **~60.0 ms** | Cloud-managed non-autoregressive decision API. |
+| Mode / Engine | Technology | Port / Mode | Hardware Needed | Latency | Best For |
+|:---|---|:---:|:---:|:---:|:---|
+| **`backend: "rules"`** *(Default zero-setup)* | **Pure Deterministic Engine** | In-process | Any CPU (0 GB VRAM) | **< 0.1 ms** | **Instant start**, CI/CD pipelines, servers, laptops. 100% offline. |
+| **`backend: "d1"`** *(Liquid AI D1-3B)* | **Liquid AI d1-3B (LFM)** | Port `8800` | 3–4 GB VRAM | **~14.2 ms** | High-speed local neural evaluations, lightweight LFM model. |
+| **`backend: "clm"`** *(Contrastive CLM)* | **Contrastive Language Model** | Ports `8700` & `8090` | 4–6 GB VRAM | **~38.0 ms** | Deep contrastive geometric reasoning with calibrated probabilities. |
+| **`backend: "jev"`** *(TypeSafe AI Cloud)* | **TypeSafe AI Cloud API** | Cloud HTTPS | 0 GB VRAM | **~60.0 ms** | Cloud-managed non-autoregressive decision API (requires `JEV_API_KEY`). |
 
 ---
 
@@ -431,6 +438,7 @@ From that point forward:
 | `/guardrail status` | Displays active status, session ID, and current backend engine |
 | `/guardrail start` | Automatically launches background daemons for D1 or CLM |
 | `/guardrail stop` | Stops background daemons managed by the guardrail |
+| `/guardrail reload` | Dynamically reloads `policy.yaml` configuration without restarting the session |
 
 ---
 
@@ -453,6 +461,9 @@ python check_action.py "docker run -d -p 80:80 nginx" --backend clm --explain
 
 # Pure deterministic regex test (zero models required):
 python check_action.py "DROP DATABASE production_users;" --backend rules
+
+# Launch native Model Context Protocol (MCP) JSON-RPC 2.0 server:
+python check_action.py --mcp
 ```
 
 ---
@@ -510,11 +521,6 @@ llama-server -m "path/to/Qwen3-8B-Q4_K_M.gguf" --embedding --pooling last -c 163
 # Terminal 2: CLM classification service
 clm-serve --emb-url http://127.0.0.1:8090/v1/embeddings --port 8700
 ```
-
-#### Option C: Pure Rules Backend (`backend: "rules"`) & JEV Cloud (`backend: "jev"`)
-Requires **no local servers, no GPU, and no background processes**.
-- For Rules: Set `backend: "rules"` in `policy.yaml` (0ms offline).
-- For JEV: Set `backend: "jev"` and configure the `JEV_API_KEY` environment variable.
 
 ---
 
@@ -1180,20 +1186,20 @@ We believe in complete transparency regarding security boundaries:
 
 ## 💻 Development & Testing
 
-Contributions are warmly welcome! The codebase includes **126 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, and protocol handlers:
+Contributions are warmly welcome! The codebase includes **135 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, and protocol handlers:
 
 ```bash
-# 1. Run engine & risk-scoring tests (67 tests: rules, unwrapping, GTFOBins, context, dry-run, risk score):
+# 1. Run engine & risk-scoring tests (70 tests: rules, unwrapping, GTFOBins, context, dry-run, risk score):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook & replay tests (38 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain):
+# 2. Run lifecycle hook & replay tests (44 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain):
 python tests/test_guardrail_hook.py
 
 # 3. Run MCP server protocol tests (21 tests):
 python tests/test_mcp_server.py
 
-# 4. Run all 126 tests via unittest:
-python -m unittest discover tests -v
+# 4. Run all 135 tests via unittest:
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ---

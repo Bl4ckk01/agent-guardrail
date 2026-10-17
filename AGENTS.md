@@ -59,6 +59,7 @@ In chat with any supported agent, users can manage the guardrail using:
 - `/guardrail off`: Temporarily disable monitoring for administrative maintenance.
 - `/guardrail stop`: Stop background daemons managed by the guardrail.
 - `/guardrail status`: View active status and live daemon connectivity.
+- `/guardrail reload`: Reload `policy.yaml` configuration dynamically without restart.
 
 ---
 
