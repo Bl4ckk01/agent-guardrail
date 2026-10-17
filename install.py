@@ -320,6 +320,14 @@ def install_cursor(workspace: bool, is_global: bool) -> None:
             )
         print("  ✔ .cursorrules configured in workspace root")
 
+        # 3. Native MCP Server in .cursor/mcp.json
+        try:
+            import mcp_server
+            mcp_server.install_cursor_config(HERE)
+            print("  ✔ .cursor/mcp.json configured (native MCP tool provider)")
+        except Exception as exc:
+            print(f"  ⚠️ Could not configure .cursor/mcp.json: {exc}")
+
     if is_global:
         global_cursor_dir = HOME / ".cursor" / "rules"
         global_cursor_dir.mkdir(parents=True, exist_ok=True)
@@ -411,6 +419,7 @@ def main() -> int:
     parser.add_argument("--antigravity", "--agy", dest="antigravity", action="store_true", help="Configure Google Antigravity (.agents/)")
     parser.add_argument("--cursor", action="store_true", help="Configure Cursor (.cursor/rules/ and .cursorrules)")
     parser.add_argument("--grok", action="store_true", help="Configure Grok Build (.grok/skills/)")
+    parser.add_argument("--mcp", action="store_true", help="Configure MCP Server for Cursor, Claude Desktop, and Antigravity")
     parser.add_argument("--global", dest="is_global", action="store_true", help="Also install globally into user home directories (~/)")
     parser.add_argument("--check", action="store_true", help="Run health and connectivity diagnostics only")
     args = parser.parse_args()
@@ -420,6 +429,16 @@ def main() -> int:
     if args.check:
         run_checks()
         return 0
+
+    if args.mcp:
+        import mcp_server
+        ok, msg = mcp_server.install_cursor_config(HERE)
+        print(f"  ✔ {msg}")
+        print("\n📋 MCP Client configuration snippets for Claude Desktop, Cursor, and Antigravity:")
+        snippets = mcp_server.get_config_snippets()
+        print(json.dumps(snippets, indent=2, ensure_ascii=False))
+        if not any([args.all, args.claude, args.codex, args.antigravity, args.cursor, args.grok]):
+            return 0
 
     # Determine targeted platforms
     specific_chosen = any([args.claude, args.codex, args.antigravity, args.cursor, args.grok])

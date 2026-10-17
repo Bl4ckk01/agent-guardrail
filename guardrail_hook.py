@@ -4,11 +4,12 @@ Lifecycle guardrail hook for Claude Code and OpenAI Codex / ChatGPT.
 
 Automatically intercepts prompts and tool calls in the background:
     guardrail_hook.py hook --host claude|codex
-    guardrail_hook.py on|off|status [--session ID]
+    guardrail_hook.py on|off|status|reload [--session ID] [--policy FILE]
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,9 @@ LOG_PATH = GUARDRAIL_HOME / "guardrail.log"
 BREAKER_SECS = 30
 CONFIRM_WINDOW_SECS = 600
 SESSION_TTL_SECS = 7 * 24 * 3600
+ACTION_HISTORY_TTL_SECS = 1800
+MAX_ACTION_HISTORY = 20
+_GENESIS_HASH = "0" * 64
 
 ICON = "\U0001F6E1\uFE0F"
 
@@ -94,6 +98,54 @@ class State:
         s["ts"] = time.time()
         self.dirty = True
 
+    def record_action(self, sid: str, summary: str, capabilities: list[str]) -> None:
+        """Record a bounded, time-expiring action entry in session memory for trajectory analysis."""
+        import check_action as ca
+        mem_cfg = ca.get_memory_config()
+        ttl = float(mem_cfg.get("action_history_ttl_secs", ACTION_HISTORY_TTL_SECS))
+        max_hist = int(mem_cfg.get("max_action_history", MAX_ACTION_HISTORY))
+        now = time.time()
+        s = self.session(sid)
+        history: list[dict] = [
+            h for h in (s.get("action_history") or [])
+            if isinstance(h, dict) and now - float(h.get("ts", 0)) < ttl
+        ]
+        history.append({
+            "summary": summary[:160],
+            "capabilities": list(capabilities),
+            "ts": now,
+        })
+        s["action_history"] = history[-max_hist:]
+        s["ts"] = now
+        self.dirty = True
+
+    def recent_capabilities(self, sid: str) -> list[str]:
+        """Return deduplicated capabilities executed within the active session history window."""
+        import check_action as ca
+        mem_cfg = ca.get_memory_config()
+        ttl = float(mem_cfg.get("action_history_ttl_secs", ACTION_HISTORY_TTL_SECS))
+        now = time.time()
+        s = self.session(sid)
+        caps: list[str] = []
+        for h in (s.get("action_history") or []):
+            if isinstance(h, dict) and now - float(h.get("ts", 0)) < ttl:
+                for c in (h.get("capabilities") or []):
+                    if c not in caps:
+                        caps.append(c)
+        return caps
+
+    def recent_actions(self, sid: str) -> list[str]:
+        import check_action as ca
+        mem_cfg = ca.get_memory_config()
+        ttl = float(mem_cfg.get("action_history_ttl_secs", ACTION_HISTORY_TTL_SECS))
+        now = time.time()
+        s = self.session(sid)
+        return [
+            str(h.get("summary", ""))
+            for h in (s.get("action_history") or [])
+            if isinstance(h, dict) and now - float(h.get("ts", 0)) < ttl
+        ]
+
     def breaker_open(self) -> bool:
         return time.time() - float(self.data.get("backend_failed_at", 0)) < BREAKER_SECS
 
@@ -104,6 +156,20 @@ class State:
     def save(self) -> None:
         if self.dirty:
             _save_state(self.path, self.data)
+
+
+def compute_action_fingerprint(description: str, tool_name: str = "", cwd: str = "") -> str:
+    """Compute a deterministic SHA-256 scope fingerprint binding command, tool, and working directory."""
+    first_line = " ".join((description or "").strip().splitlines()[0].lower().split()) if (description or "").strip() else ""
+    norm_tool = (tool_name or "").strip().lower()
+    norm_cwd = ""
+    if cwd:
+        try:
+            norm_cwd = os.path.normcase(os.path.abspath(cwd)).replace("\\", "/")
+        except Exception:
+            norm_cwd = cwd.strip().lower().replace("\\", "/")
+    payload = f"{norm_tool}|{norm_cwd}|{first_line}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def is_active(state: State, sid: str, host: str) -> bool:
@@ -120,20 +186,106 @@ def is_active(state: State, sid: str, host: str) -> bool:
     return False
 
 
-def log(entry: dict) -> None:
+def _compute_entry_hash(record_without_hash: dict) -> str:
+    canonical = json.dumps(record_without_hash, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def log(entry: dict, log_path: Path | None = None) -> dict | None:
+    """Append a tamper-evident, SHA-256 hash-chained JSONL entry to the audit log."""
+    import check_action as ca
+    audit_cfg = ca.get_audit_config()
+    if not audit_cfg.get("enabled", True):
+        return None
+    custom_log = audit_cfg.get("log_file")
+    target = log_path or (Path(custom_log) if custom_log else LOG_PATH)
+    use_chaining = audit_cfg.get("hash_chaining", True)
     try:
-        GUARDRAIL_HOME.mkdir(parents=True, exist_ok=True)
-        entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), **entry}
-        with LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        prev_seq = 0
+        prev_hash = _GENESIS_HASH
+        if target.is_file() and use_chaining:
+            try:
+                with target.open("r", encoding="utf-8", errors="replace") as rfh:
+                    last_line = ""
+                    for line in rfh:
+                        if line.strip():
+                            last_line = line.strip()
+                    if last_line:
+                        last_obj = json.loads(last_line)
+                        prev_seq = int(last_obj.get("seq", 0))
+                        prev_hash = str(last_obj.get("entry_hash") or _GENESIS_HASH)
+            except Exception:
+                pass
+
+        record = {
+            "seq": prev_seq + 1,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "prev_hash": prev_hash if use_chaining else "",
+            **entry,
+        }
+        if use_chaining:
+            record.pop("entry_hash", None)
+            record["entry_hash"] = _compute_entry_hash(record)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
     except OSError:
-        pass
+        return None
+
+
+def verify_audit_log(log_path: Path | None = None) -> tuple[bool, str, int]:
+    """
+    Verify the cryptographic hash chain and sequence integrity of the append-only audit log.
+    Returns (is_valid, message, entries_checked_or_failed_line).
+    """
+    target = log_path or LOG_PATH
+    if not target.is_file():
+        return True, "Audit log is empty (no entries yet)", 0
+
+    expected_seq = 1
+    expected_prev_hash = _GENESIS_HASH
+    count = 0
+
+    try:
+        with target.open("r", encoding="utf-8") as fh:
+            for line_no, raw_line in enumerate(fh, 1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError as exc:
+                    return False, f"Malformed JSON at line {line_no}: {exc}", line_no
+
+                seq = obj.get("seq")
+                prev_hash = obj.get("prev_hash")
+                claimed_hash = obj.get("entry_hash")
+
+                if seq != expected_seq:
+                    return False, f"Sequence gap/reorder at line {line_no}: expected seq={expected_seq}, got seq={seq}", line_no
+                if prev_hash != expected_prev_hash:
+                    return False, f"Broken hash chain at line {line_no} (seq={seq}): prev_hash mismatch", line_no
+
+                check_copy = dict(obj)
+                check_copy.pop("entry_hash", None)
+                actual_hash = _compute_entry_hash(check_copy)
+                if claimed_hash != actual_hash:
+                    return False, f"Entry payload tampered at line {line_no} (seq={seq}): entry_hash mismatch", line_no
+
+                expected_seq += 1
+                expected_prev_hash = actual_hash
+                count += 1
+    except OSError as exc:
+        return False, f"Failed to read audit log: {exc}", 0
+
+    return True, f"Audit log verified ({count} entries intact)", count
 
 
 # --- Commands & Prompts ---
 
 _EXPLICIT_CMD_RE = re.compile(
-    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?",
+    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?",
     re.IGNORECASE,
 )
 _PLAIN_CMD_RE = re.compile(
@@ -146,6 +298,7 @@ _ARG_MAP = {
     "off": "off", "disable": "off",
     "stop": "stop",
     "status": "status", "info": "status",
+    "reload": "reload", "r": "reload",
 }
 _CONFIRM_RE = re.compile(
     r"\b(?:yes|y|ok|okay|confirm|confirmed|approve|approved|proceed|go|continue|done)\b",
@@ -389,6 +542,10 @@ def _reason(decision) -> str:
         parts.append("rules: " + ", ".join(m.split(":", 1)[1] for m in decision.rules.matched))
     if decision.model is not None:
         parts.append(f"model: {decision.model.decision}")
+    if getattr(decision, "risk_factors", None):
+        ctx_factors = [f for f in decision.risk_factors if f.startswith("context:")]
+        if ctx_factors:
+            parts.append("context: " + ", ".join(ctx_factors))
     if decision.error:
         parts.append("backend unavailable")
     return "; ".join(parts) or decision.decision
@@ -410,14 +567,25 @@ def pre_tool_output(host: str, decision: str, reason: str, context: str | None =
 # --- Evaluation Engine ---
 
 
-def evaluate(description: str, state: State):
+def evaluate(description: str, state: State, context=None):
     import check_action as ca
 
     if state.breaker_open():
         rules = ca.evaluate_rules(description)
-        return ca.Decision(ca.fallback_decision(description), os.environ.get("GUARDRAIL_BACKEND", "clm"),
-                           rules, error="backend cooling down after recent error")
-    result = ca.decide(description)
+        caps = ca.classify_capabilities(description)
+        score, factors = ca.compute_risk_score(description, rules, caps, None, context)
+        preview = ca.generate_dry_run_preview(description, cwd=(context.cwd if context else ""), capabilities=caps)
+        return ca.Decision(
+            ca.fallback_decision(description),
+            os.environ.get("GUARDRAIL_BACKEND", "clm"),
+            rules,
+            error="backend cooling down after recent error",
+            capabilities=caps,
+            risk_score=score,
+            risk_factors=factors,
+            dry_run_preview=preview,
+        )
+    result = ca.decide(description, context=context)
     if result.error and result.rules.decision != "block":
         state.trip_breaker()
     return result
@@ -441,8 +609,8 @@ def on_prompt_submit(event: dict, host: str, state: State):
                     _, daemon_msg = daemon_manager.start_daemon()
                 except Exception as exc:
                     daemon_msg = f"Daemon starter note: {exc}"
-            state.update(sid, active=True, pending=None, approved_turn=None)
-            state.update("_default", active=True, pending=None, approved_turn=None)
+            state.update(sid, active=True, pending=None, approved_turn=None, approval_grant=None)
+            state.update("_default", active=True, pending=None, approved_turn=None, approval_grant=None)
         elif cmd in ("off", "stop"):
             if cmd == "stop":
                 try:
@@ -450,10 +618,23 @@ def on_prompt_submit(event: dict, host: str, state: State):
                     _, daemon_msg = daemon_manager.stop_daemon()
                 except Exception as exc:
                     daemon_msg = f"Daemon stop note: {exc}"
-            state.update(sid, active=False, pending=None, approved_turn=None)
-            state.update("_default", active=False, pending=None, approved_turn=None)
+            state.update(sid, active=False, pending=None, approved_turn=None, approval_grant=None)
+            state.update("_default", active=False, pending=None, approved_turn=None, approval_grant=None)
+        elif cmd == "reload":
+            import check_action as ca
+            reload_info = ca.reload_policy()
+            loaded_path = ca.get_loaded_policy_path() or "policy.yaml"
+            daemon_msg = (
+                f"{ICON} Agent Guardrail policy reloaded from {loaded_path}:\n"
+                f"  • Custom rules: {reload_info.get('custom_block_rules', 0)} block, "
+                f"{reload_info.get('custom_ask_rules', 0)} ask, "
+                f"{reload_info.get('custom_proceed_rules', 0)} proceed, "
+                f"{reload_info.get('path_rules', 0)} path rules\n"
+                f"  • Protected branches: {reload_info.get('protected_branches', 0)}\n"
+                f"  • Dry-run preview: {'enabled' if reload_info.get('dry_run_enabled') else 'disabled'}"
+            )
 
-        active = is_active(state, sid, host) if cmd == "status" else (cmd in ("on", "start"))
+        active = is_active(state, sid, host) if cmd in ("status", "reload") else (cmd in ("on", "start"))
         log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
 
         status_rep = ""
@@ -481,6 +662,13 @@ def on_prompt_submit(event: dict, host: str, state: State):
                         "additionalContext": f"{status_text(active)}{status_rep}",
                     }
                 }, 0
+            if cmd == "reload":
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": daemon_msg,
+                    }
+                }, 0
             # cmd in ("on", "start"): inject context
             return {
                 "hookSpecificOutput": {
@@ -500,6 +688,13 @@ def on_prompt_submit(event: dict, host: str, state: State):
                 "continue": False,
                 "stopReason": f"{status_text(active)}{status_rep}",
                 "reason": f"{status_text(active)}{status_rep}",
+            }, 0
+        if cmd == "reload":
+            return {
+                "decision": "block",
+                "continue": False,
+                "stopReason": daemon_msg,
+                "reason": daemon_msg,
             }, 0
         if cmd in ("off", "stop"):
             return {
@@ -522,20 +717,51 @@ def on_prompt_submit(event: dict, host: str, state: State):
         return None, 0
 
     s = state.session(sid)
-    if host == "codex" and s.get("pending") and is_confirmation(prompt):
-        state.update(sid, approved_turn=turn or f"t{time.time():.0f}", approved_at=time.time(), pending=None)
-        log({"host": host, "event": "confirm", "session": sid})
+    pending = s.get("pending")
+    if host == "codex" and isinstance(pending, dict) and is_confirmation(prompt):
+        import check_action as ca
+        mem_cfg = ca.get_memory_config()
+        confirm_window = float(mem_cfg.get("confirm_window_secs", CONFIRM_WINDOW_SECS))
+        now = time.time()
+        grant_turn = turn or f"t{now:.0f}"
+        grant = {
+            "fingerprint": str(pending.get("fingerprint") or ""),
+            "text": str(pending.get("text") or ""),
+            "tool": str(pending.get("tool") or ""),
+            "cwd": str(pending.get("cwd") or ""),
+            "turn_id": grant_turn,
+            "approved_at": now,
+            "expires_at": now + confirm_window,
+            "consumed": False,
+        }
+        state.update(
+            sid,
+            approved_turn=grant_turn,
+            approved_at=now,
+            approval_grant=grant,
+            pending=None,
+        )
+        log({
+            "host": host,
+            "event": "confirm",
+            "session": sid,
+            "approved_fingerprint": grant["fingerprint"],
+            "approved_text": grant["text"],
+        })
         return {"hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": (
-                f"{ICON} GUARDRAIL: user confirmed. You may execute the requested action this turn "
-                "('block' actions remain strictly prohibited)."
+                f"{ICON} GUARDRAIL: user confirmed. You may execute the exact approved action once this turn "
+                "('block' actions and unapproved command modifications remain strictly prohibited)."
             ),
         }}, 0
 
     result = evaluate(prompt, state)
-    log({"host": host, "event": "prompt", "session": sid, "text": prompt[:300],
-         "decision": result.decision, "why": result.explain()})
+    log({
+        "host": host, "event": "prompt", "session": sid, "text": prompt[:300],
+        "decision": result.decision, "risk_score": result.risk_score,
+        "capabilities": result.capabilities, "why": result.explain(),
+    })
 
     if result.decision == "block":
         msg = (
@@ -551,7 +777,7 @@ def on_prompt_submit(event: dict, host: str, state: State):
 
     if result.decision == "ask_user":
         if host == "codex":
-            state.update(sid, pending={"text": prompt[:300], "at": time.time()})
+            state.update(sid, pending={"text": prompt[:300], "fingerprint": "", "at": time.time()})
         return {
             "systemMessage": f"{ICON} Guardrail: confirmation required ({_reason(result)})",
             "hookSpecificOutput": {
@@ -569,18 +795,34 @@ def on_prompt_submit(event: dict, host: str, state: State):
 
 def on_prompt_expansion(event: dict, host: str, state: State):
     cmd_name = str(event.get("command_name") or "").split(":")[-1].lower()
+    if cmd_name.startswith("agent-") or cmd_name.startswith("agent_"):
+        cmd_name = cmd_name[6:]
     if cmd_name != "guardrail":
         return None, 0
     sid = str(event.get("session_id") or "")
     arg = str(event.get("command_args") or "").strip().lower().split(" ")[0]
     cmd = _ARG_MAP.get(arg, "on")
     if cmd in ("on", "off"):
-        state.update(sid, active=(cmd == "on"), pending=None, approved_turn=None)
-        state.update("_default", active=(cmd == "on"), pending=None, approved_turn=None)
-    active = is_active(state, sid, host) if cmd == "status" else (cmd == "on")
+        state.update(sid, active=(cmd == "on"), pending=None, approved_turn=None, approval_grant=None)
+        state.update("_default", active=(cmd == "on"), pending=None, approved_turn=None, approval_grant=None)
+    active = is_active(state, sid, host) if cmd in ("status", "reload") else (cmd == "on")
     log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
     if cmd in ("off", "status"):
         return {"decision": "block", "reason": status_text(active)}, 0
+    if cmd == "reload":
+        import check_action as ca
+        reload_info = ca.reload_policy()
+        loaded_path = ca.get_loaded_policy_path() or "policy.yaml"
+        msg = (
+            f"{ICON} Agent Guardrail policy reloaded from {loaded_path}:\n"
+            f"  • Custom rules: {reload_info.get('custom_block_rules', 0)} block, "
+            f"{reload_info.get('custom_ask_rules', 0)} ask, "
+            f"{reload_info.get('custom_proceed_rules', 0)} proceed, "
+            f"{reload_info.get('path_rules', 0)} path rules\n"
+            f"  • Protected branches: {reload_info.get('protected_branches', 0)}\n"
+            f"  • Dry-run preview: {'enabled' if reload_info.get('dry_run_enabled') else 'disabled'}"
+        )
+        return {"decision": "block", "reason": msg}, 0
     return {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptExpansion",
@@ -592,6 +834,17 @@ def on_prompt_expansion(event: dict, host: str, state: State):
     }, 0
 
 
+def _extract_read_target(event: dict) -> str:
+    """Extract target file path from read/inspection tools for trajectory tracking."""
+    if "toolCall" in event and isinstance(event["toolCall"], dict):
+        inp = event["toolCall"].get("args") or {}
+    else:
+        inp = event.get("tool_input") or {}
+    if not isinstance(inp, dict):
+        return ""
+    return str(inp.get("file_path") or inp.get("path") or inp.get("AbsolutePath") or inp.get("TargetFile") or "")
+
+
 def on_pre_tool(event: dict, host: str, state: State):
     sid = str(event.get("session_id") or event.get("conversationId") or "_default")
     if not is_active(state, sid, host):
@@ -599,58 +852,147 @@ def on_pre_tool(event: dict, host: str, state: State):
             return {"decision": "allow"}, 0
         return None, 0
 
+    import check_action as ca
+
     desc, safe_shell, paths = describe_tool(event)
     if desc is None:
+        # Even for skipped read tools, track if the session accessed a secret file (e.g., .env, id_rsa)
+        read_target = _extract_read_target(event)
+        if read_target:
+            read_caps = ca.classify_capabilities(read_target)
+            if "cap:secret_access" in read_caps:
+                state.record_action(sid, f"read {read_target}", read_caps)
+                log({
+                    "host": host, "event": "secret_read_tracked", "session": sid,
+                    "text": f"read {read_target}"[:300], "capabilities": read_caps,
+                })
         if host in ("antigravity", "agy", "gemini"):
             return {"decision": "allow"}, 0
         return None, 0
-
-    import check_action as ca
 
     rules = ca.evaluate_rules(desc)
     cwd = str(event.get("cwd") or (event.get("workspacePaths", [""])[0] if event.get("workspacePaths") else ""))
     outside = [p for p in paths if _outside(p, cwd)]
-
     tool_ident = event.get("tool_name") or (event.get("toolCall", {}).get("name") if isinstance(event.get("toolCall"), dict) else "")
 
-    if rules.decision == "proceed" and safe_shell:
-        log({"host": host, "event": "tool", "session": sid, "tool": tool_ident,
-             "text": desc[:300], "decision": "proceed", "why": "safe read-only command"})
-        if host in ("antigravity", "agy", "gemini"):
-            return {"decision": "allow"}, 0
-        return None, 0
+    ctx = ca.inspect_execution_context(
+        cwd=cwd,
+        outside_cwd=bool(outside),
+        prior_capabilities=state.recent_capabilities(sid),
+        prior_actions=state.recent_actions(sid),
+    )
 
-    result = evaluate(desc, state)
+    if rules.decision == "proceed" and safe_shell:
+        caps = ca.classify_capabilities(desc)
+        # Ensure safe_shell does not bypass chained secret exfiltration or secret access
+        if "cap:secret_access" not in caps and not ("cap:secret_access" in ctx.prior_capabilities and "cap:net_outbound" in caps):
+            state.record_action(sid, desc[:160], caps)
+            log({
+                "host": host, "event": "tool", "session": sid, "tool": tool_ident,
+                "text": desc[:300], "decision": "proceed", "risk_score": 0.05,
+                "capabilities": caps, "why": "safe read-only command",
+            })
+            if host in ("antigravity", "agy", "gemini"):
+                return {"decision": "allow"}, 0
+            return None, 0
+
+    result = evaluate(desc, state, context=ctx)
     final = result.decision
     reason = _reason(result)
     if outside and final == "proceed":
         final, reason = "ask_user", "file outside project directory: " + ", ".join(outside)
 
-    log({"host": host, "event": "tool", "session": sid, "tool": tool_ident,
-         "text": desc[:300], "decision": final, "why": result.explain()})
+    preview = result.dry_run_preview or ca.generate_dry_run_preview(
+        desc, cwd=cwd, paths=paths, capabilities=result.capabilities,
+    )
+
+    log({
+        "host": host, "event": "tool", "session": sid, "tool": tool_ident,
+        "text": desc[:300], "decision": final, "risk_score": result.risk_score,
+        "capabilities": result.capabilities, "dry_run": preview, "why": result.explain(),
+    })
 
     short = desc.splitlines()[0][:160]
     if final == "block":
-        return pre_tool_output(host, "deny",
-                               f"{ICON} GUARDRAIL: action BLOCKED ({reason}): {short}. "
-                               "Do not retry or attempt bypasses: explain why it was blocked."), 0
+        return pre_tool_output(
+            host, "deny",
+            f"{ICON} GUARDRAIL: action BLOCKED ({reason}; risk={result.risk_score:.2f}): {short}. "
+            "Do not retry or attempt bypasses: explain why it was blocked.",
+        ), 0
 
     if final == "ask_user":
+        preview_suffix = f" [Dry-Run Preview: {preview}]" if preview else ""
         if host == "claude":
-            return pre_tool_output(host, "ask", f"{ICON} Guardrail: confirmation required ({reason}): {short}"), 0
+            return pre_tool_output(
+                host, "ask",
+                f"{ICON} Guardrail: confirmation required ({reason}; risk={result.risk_score:.2f}): {short}{preview_suffix}",
+            ), 0
         if host in ("antigravity", "agy", "gemini"):
-            return pre_tool_output(host, "ask", f"{ICON} Guardrail: confirmation required ({reason}): {short}"), 0
+            return pre_tool_output(
+                host, "ask",
+                f"{ICON} Guardrail: confirmation required ({reason}; risk={result.risk_score:.2f}): {short}{preview_suffix}",
+            ), 0
+
         s = state.session(sid)
         turn = event.get("turn_id")
-        approved = s.get("approved_turn")
-        if approved and ((turn and approved == turn) or
-                         (not turn and time.time() - float(s.get("approved_at", 0)) < CONFIRM_WINDOW_SECS)):
-            return None, 0
-        state.update(sid, pending={"text": short, "at": time.time()})
-        return pre_tool_output(host, "deny",
-                               f"{ICON} GUARDRAIL (ask_user): action paused, user confirmation required ({reason}): {short}. "
-                               "Ask the user if they wish to proceed explaining the risk. If they confirm, retry the action."), 0
+        now = time.time()
+        curr_fp = compute_action_fingerprint(short, str(tool_ident), cwd)
+        grant = s.get("approval_grant")
+        mem_cfg = ca.get_memory_config()
+        confirm_window = float(mem_cfg.get("confirm_window_secs", CONFIRM_WINDOW_SECS))
+        strict_fp = bool(mem_cfg.get("strict_fingerprint", True))
 
+        if isinstance(grant, dict) and not grant.get("consumed", False):
+            approved_at = float(grant.get("approved_at", 0))
+            expires_at = float(grant.get("expires_at", approved_at + confirm_window))
+            grant_turn = grant.get("turn_id")
+            turn_ok = bool(
+                (turn and grant_turn == turn)
+                or (not turn and now <= expires_at)
+                or (turn and str(grant_turn or "").startswith("t") and now <= expires_at)
+            )
+            grant_fp = str(grant.get("fingerprint") or "")
+            if strict_fp:
+                fp_ok = (grant_fp == curr_fp) if grant_fp else (not grant.get("cwd") or grant.get("cwd") == cwd)
+            else:
+                fp_ok = (grant_fp == curr_fp) or (not grant.get("cwd") or grant.get("cwd") == cwd)
+
+            if turn_ok and now <= expires_at and fp_ok:
+                # Consume single-use approval grant immediately so it never becomes standing authorization
+                state.update(sid, approval_grant=None, approved_turn=None, approved_at=None, pending=None)
+                state.record_action(sid, short, result.capabilities)
+                log({
+                    "host": host, "event": "approval_consumed", "session": sid,
+                    "tool": tool_ident, "fingerprint": curr_fp, "text": short,
+                })
+                return None, 0
+
+            # Mismatched action or expired grant -> revoke stale permission immediately
+            state.update(sid, approval_grant=None, approved_turn=None, approved_at=None)
+            log({
+                "host": host, "event": "approval_mismatch", "session": sid,
+                "tool": tool_ident, "expected_fp": grant_fp, "actual_fp": curr_fp, "text": short,
+            })
+
+        state.update(
+            sid,
+            pending={
+                "text": short,
+                "fingerprint": curr_fp,
+                "tool": str(tool_ident),
+                "cwd": cwd,
+                "risk_score": result.risk_score,
+                "dry_run": preview,
+                "at": now,
+            },
+        )
+        return pre_tool_output(
+            host, "deny",
+            f"{ICON} GUARDRAIL (ask_user): action paused, user confirmation required ({reason}; risk={result.risk_score:.2f}): {short}{preview_suffix}. "
+            "Ask the user if they wish to proceed explaining the risk and dry-run impact. If they confirm, retry the exact same action.",
+        ), 0
+
+    state.record_action(sid, short, result.capabilities)
     if host in ("antigravity", "agy", "gemini"):
         return {"decision": "allow"}, 0
     return None, 0
@@ -725,6 +1067,14 @@ def main(argv: list[str]) -> int:
             st.update(sid, active=(argv[0] == "on"))
             st.save()
         print(status_text(is_active(st, sid, "codex")))
+        return 0
+
+    if argv[0] == "reload":
+        import check_action as ca
+        policy_arg = argv[argv.index("--policy") + 1] if "--policy" in argv else None
+        res = ca.reload_policy(policy_arg)
+        loaded = ca.get_loaded_policy_path() or "policy.yaml"
+        print(f"{ICON} Policy reloaded from {loaded}: {res}")
         return 0
 
     print(__doc__, file=sys.stderr)

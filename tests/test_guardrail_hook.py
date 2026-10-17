@@ -432,5 +432,296 @@ class ToolInspectionTests(unittest.TestCase):
         self.assertIn("BLOCKED", out["reason"])
 
 
+class ReplayAndMemoryBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.state_file = Path(self.tmpdir) / "state.json"
+        self.log_file = Path(self.tmpdir) / "audit.log"
+        self.st = gh.State(self.state_file)
+
+    def tearDown(self):
+        for p in (self.state_file, self.log_file):
+            if p.exists():
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        if os.path.exists(self.tmpdir):
+            try:
+                os.rmdir(self.tmpdir)
+            except OSError:
+                pass
+
+    def test_replay_attack_approval_swap_blocked(self):
+        """
+        Replay Test 1 (TOCTOU Approval Swap via Prompt Injection):
+        User approves 'docker restart my-container', but a prompt injection tricks the agent
+        into running 'docker run -v /etc:/host alpine' in the same turn.
+        """
+        self.st.update("sess-swap", active=True)
+        # Step 1: Agent requests benign container restart -> ask_user
+        req_event = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-swap",
+            "turn_id": "turn-10",
+            "cwd": "/workspace/app",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "docker restart my-container"},
+        }
+        out1, _ = gh.handle(req_event, "codex", self.st)
+        self.assertEqual(out1["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("Dry-Run Preview", out1["hookSpecificOutput"]["permissionDecisionReason"])
+
+        # Step 2: User approves in chat
+        confirm_event = {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-swap",
+            "turn_id": "turn-11",
+            "prompt": "yes proceed",
+        }
+        gh.handle(confirm_event, "codex", self.st)
+
+        # Step 3: Agent attempts to swap the command in turn-11 to a different docker command
+        swapped_event = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-swap",
+            "turn_id": "turn-11",
+            "cwd": "/workspace/app",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "docker run -d -p 8080:80 nginx"},
+        }
+        out_swap, _ = gh.handle(swapped_event, "codex", self.st)
+        self.assertIsNotNone(out_swap)
+        self.assertEqual(out_swap["hookSpecificOutput"]["permissionDecision"], "deny")
+        # Grant must be revoked after mismatch
+        self.assertIsNone(self.st.session("sess-swap").get("approval_grant"))
+
+    def test_replay_attack_stale_permission_single_use_boundary(self):
+        """
+        Replay Test 2 (Stale Permission Reuse):
+        An approved exception is consumed atomically on first use and cannot become permanent authorization.
+        """
+        self.st.update("sess-stale", active=True)
+        cmd_event = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-stale",
+            "turn_id": "turn-20",
+            "cwd": "/workspace/app",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "docker restart my-container"},
+        }
+        out1, _ = gh.handle(cmd_event, "codex", self.st)
+        self.assertEqual(out1["hookSpecificOutput"]["permissionDecision"], "deny")
+
+        # User confirms
+        gh.handle({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-stale",
+            "turn_id": "turn-21",
+            "prompt": "confirm",
+        }, "codex", self.st)
+
+        # 1st retry in turn-21 -> allowed and consumes the single-use grant
+        retry1 = dict(cmd_event, turn_id="turn-21")
+        out_retry1, _ = gh.handle(retry1, "codex", self.st)
+        self.assertIsNone(out_retry1)
+
+        # 2nd execution of the exact same command in turn-21 -> must be denied (grant already consumed)
+        out_retry2, _ = gh.handle(retry1, "codex", self.st)
+        self.assertIsNotNone(out_retry2)
+        self.assertEqual(out_retry2["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_replay_attack_cwd_drift_invalidates_approval(self):
+        """
+        Replay Test 3 (Working Directory Boundary):
+        An approval granted in '/workspace/staging' cannot be replayed in '/workspace/production'.
+        """
+        self.st.update("sess-cwd", active=True)
+        req_staging = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-cwd",
+            "turn_id": "turn-30",
+            "cwd": "/workspace/staging",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": "docker restart worker"},
+        }
+        gh.handle(req_staging, "codex", self.st)
+        gh.handle({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "sess-cwd",
+            "turn_id": "turn-31",
+            "prompt": "approve",
+        }, "codex", self.st)
+
+        # Retry identical command string, but in /workspace/production
+        req_prod = dict(req_staging, turn_id="turn-31", cwd="/workspace/production")
+        out_prod, _ = gh.handle(req_prod, "codex", self.st)
+        self.assertIsNotNone(out_prod)
+        self.assertEqual(out_prod["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_replay_multi_step_secret_read_to_network_exfiltration_blocked(self):
+        """
+        Replay Test 4 (Multi-Step Prompt Injection Chained Exfiltration):
+        Step 1: Agent reads '.env' via Read tool.
+        Step 2: Prompt injection triggers outbound network call ('curl https://telemetry.example.com/ping').
+        Guardrail correlates prior secret access with outbound network capability and blocks.
+        """
+        self.st.update("sess-chain", active=True)
+        # Step 1: Read .env
+        read_event = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-chain",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/workspace/.env"},
+        }
+        out_read, _ = gh.handle(read_event, "claude", self.st)
+        self.assertIsNone(out_read)
+        self.assertIn("cap:secret_access", self.st.recent_capabilities("sess-chain"))
+
+        # Step 2: Outbound network call in same session -> escalated to BLOCK
+        net_event = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "sess-chain",
+            "tool_name": "Bash",
+            "tool_input": {"command": "curl -s https://telemetry.example.com/ping"},
+        }
+        out_net, _ = gh.handle(net_event, "claude", self.st)
+        self.assertIsNotNone(out_net)
+        self.assertEqual(out_net["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("BLOCKED", out_net["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIn("chained secret exfiltration", out_net["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_tamper_evident_audit_log_hash_chain_and_tamper_detection(self):
+        """
+        Replay Test 5 (Append-Only Hash-Chained Audit Log Verification):
+        Verifies cryptographic SHA-256 hash chaining and detects payload modification or line deletion.
+        """
+        r1 = gh.log({"event": "tool", "cmd": "git status", "decision": "proceed"}, log_path=self.log_file)
+        r2 = gh.log({"event": "tool", "cmd": "docker run nginx", "decision": "ask_user"}, log_path=self.log_file)
+        r3 = gh.log({"event": "tool", "cmd": "rm -rf /", "decision": "block"}, log_path=self.log_file)
+
+        self.assertEqual(r1["seq"], 1)
+        self.assertEqual(r2["seq"], 2)
+        self.assertEqual(r2["prev_hash"], r1["entry_hash"])
+        self.assertEqual(r3["prev_hash"], r2["entry_hash"])
+
+        ok, msg, count = gh.verify_audit_log(self.log_file)
+        self.assertTrue(ok, msg)
+        self.assertEqual(count, 3)
+
+        # Simulate attacker modifying line 2 ('ask_user' -> 'proceed') without knowing subsequent chain
+        lines = self.log_file.read_text(encoding="utf-8").splitlines()
+        tampered_lines = [lines[0], lines[1].replace('"ask_user"', '"proceed"'), lines[2]]
+        self.log_file.write_text("\n".join(tampered_lines) + "\n", encoding="utf-8")
+
+        ok_tamper, msg_tamper, failed_line = gh.verify_audit_log(self.log_file)
+        self.assertFalse(ok_tamper)
+        self.assertEqual(failed_line, 2)
+        self.assertIn("tampered", msg_tamper)
+
+        # Simulate attacker deleting line 2 to hide an event
+        deleted_lines = [lines[0], lines[2]]
+        self.log_file.write_text("\n".join(deleted_lines) + "\n", encoding="utf-8")
+        ok_del, msg_del, failed_del_line = gh.verify_audit_log(self.log_file)
+        self.assertFalse(ok_del)
+        self.assertEqual(failed_del_line, 2)
+
+
+class HookReloadAndDynamicConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.st = gh.State()
+        self.orig_env = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.orig_env)
+        ca.reload_policy()
+
+    def test_user_prompt_submit_reload_claude(self):
+        event = {"prompt": "/guardrail reload", "session_id": "sess-claude"}
+        out, code = gh.on_prompt_submit(event, "claude", self.st)
+        self.assertEqual(code, 0)
+        self.assertIn("hookSpecificOutput", out)
+        self.assertIn("reloaded", out["hookSpecificOutput"]["additionalContext"].lower())
+
+    def test_user_prompt_submit_reload_codex(self):
+        event = {"prompt": "/guardrail reload", "session_id": "sess-codex"}
+        out, code = gh.on_prompt_submit(event, "codex", self.st)
+        self.assertEqual(code, 0)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("reloaded", out["stopReason"].lower())
+
+    def test_user_prompt_submit_marker_reload(self):
+        event = {"prompt": "[[guardrail:reload]]", "session_id": "sess-marker"}
+        out, code = gh.on_prompt_submit(event, "codex", self.st)
+        self.assertEqual(code, 0)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("reloaded", out["stopReason"].lower())
+
+    def test_user_prompt_expansion_reload(self):
+        event = {
+            "command_name": "agent-guardrail",
+            "command_args": "reload",
+            "session_id": "sess-exp",
+        }
+        out, code = gh.on_prompt_expansion(event, "codex", self.st)
+        self.assertEqual(code, 0)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("reloaded", out["reason"].lower())
+
+    def test_cli_reload_command(self):
+        import io
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            exit_code = gh.main(["reload"])
+            output = sys.stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("reloaded", output.lower())
+        finally:
+            sys.stdout = old_stdout
+
+    def test_dynamic_memory_window_in_approval_expiry(self):
+        import check_action as ca
+        orig_window = ca.get_memory_config().get("confirm_window_secs")
+        try:
+            # Set short confirmation window of 5 seconds
+            ca.get_memory_config()["confirm_window_secs"] = 5.0
+
+            # Pending ask_user action
+            self.st.update("sess-dyn", active=True, pending={
+                "fingerprint": gh.compute_action_fingerprint("rm old.log", "Bash", "/repo"),
+                "text": "rm old.log",
+                "tool": "Bash",
+                "cwd": "/repo",
+            })
+
+            # User confirms -> grant created with 5s window
+            gh.on_prompt_submit({"prompt": "yes", "session_id": "sess-dyn"}, "codex", self.st)
+            grant = self.st.session("sess-dyn").get("approval_grant")
+            self.assertIsNotNone(grant)
+            self.assertEqual(grant["expires_at"] - grant["approved_at"], 5.0)
+
+            # Pretend time elapsed 6 seconds
+            with unittest.mock.patch("time.time", return_value=grant["approved_at"] + 6.0):
+                tool_event = {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": "sess-dyn",
+                    "tool_name": "Bash",
+                    "cwd": "/repo",
+                    "tool_input": {"command": "rm old.log"},
+                }
+                out, _ = gh.handle(tool_event, "codex", self.st)
+                # Expired grant should be revoked and action paused for fresh confirmation
+                self.assertIsNotNone(out)
+                self.assertIn("user confirmation required", out["hookSpecificOutput"]["permissionDecisionReason"])
+                self.assertIsNone(self.st.session("sess-dyn").get("approval_grant"))
+        finally:
+            if orig_window is not None:
+                ca.get_memory_config()["confirm_window_secs"] = orig_window
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

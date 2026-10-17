@@ -674,11 +674,122 @@ class PathRule:
 
 # --- External Policy Configuration (policy.yaml) ---
 
+_BRANCH_PROTECTION: dict = {
+    "protected_branches": ["main", "master", "prod*", "release/*", "staging"],
+    "require_confirmation": True,
+}
+
+_CREDENTIALS_PROTECTION: dict = {
+    "sensitive_env_keys": [
+        "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DATABASE_URL", "STRIPE_SECRET_KEY",
+        "PRIVATE_KEY", "NPM_TOKEN", "PYPI_API_TOKEN", "SLACK_BOT_TOKEN",
+    ],
+    "sensitive_files": [
+        ".env", ".env.*", "credentials.json", "secrets.yaml", "secrets.yml",
+        "id_rsa", "id_rsa*", "id_ed25519", "*.pem", "*.key",
+    ],
+}
+
+_RISK_CONFIG: dict = {
+    "weights": {
+        "cap:secret_access": 0.35,
+        "cap:fs_delete": 0.25,
+        "cap:sys_admin": 0.20,
+        "cap:net_outbound": 0.20,
+        "cap:git_mutation": 0.18,
+        "cap:code_exec": 0.15,
+        "cap:pkg_install": 0.15,
+        "cap:fs_write": 0.10,
+        "cap:read_only": 0.0,
+    },
+    "block_threshold": 0.85,
+    "ask_threshold": 0.45,
+    "chained_exfiltration": True,
+}
+
+_DRY_RUN_CONFIG: dict = {
+    "enabled": True,
+    "max_preview_items": 5,
+}
+
+_MEMORY_CONFIG: dict = {
+    "confirm_window_secs": 600,
+    "action_history_ttl_secs": 1800,
+    "max_action_history": 20,
+    "strict_fingerprint": True,
+}
+
+_AUDIT_CONFIG: dict = {
+    "enabled": True,
+    "log_file": "",
+    "hash_chaining": True,
+}
+
+
+def _find_policy_file(specified: str | Path | None = None) -> Path | None:
+    """Find policy.yaml using priority: specified arg -> GUARDRAIL_POLICY_FILE -> ./policy.yaml -> script dir -> ~/.guardrail."""
+    if specified:
+        p = Path(specified)
+        return p if p.is_file() else None
+    env_p = os.environ.get("GUARDRAIL_POLICY_FILE")
+    if env_p and Path(env_p).is_file():
+        return Path(env_p)
+    cwd_p = Path.cwd() / "policy.yaml"
+    if cwd_p.is_file():
+        return cwd_p
+    script_p = Path(__file__).resolve().parent / "policy.yaml"
+    if script_p.is_file():
+        return script_p
+    home_p = Path.home() / ".guardrail" / "policy.yaml"
+    if home_p.is_file():
+        return home_p
+    return None
+
+
+def get_branch_protection() -> dict:
+    return _BRANCH_PROTECTION
+
+
+def get_credentials_protection() -> dict:
+    return _CREDENTIALS_PROTECTION
+
+
+def get_risk_config() -> dict:
+    return _RISK_CONFIG
+
+
+def get_dry_run_config() -> dict:
+    return _DRY_RUN_CONFIG
+
+
+def get_memory_config() -> dict:
+    return _MEMORY_CONFIG
+
+
+def get_audit_config() -> dict:
+    return _AUDIT_CONFIG
+
+
+def get_policy_settings() -> dict:
+    return _POLICY_SETTINGS
+
+
+_LOADED_POLICY_PATH: Path | None = None
+
+
+def get_loaded_policy_path() -> Path | None:
+    return _LOADED_POLICY_PATH
+
+
 def load_policy(file_path: str | Path | None = None) -> dict:
-    """Load customized rules and settings from policy.yaml."""
-    global _POLICY_LOADED, _CUSTOM_BLOCK, _CUSTOM_ASK, _CUSTOM_PROCEED, _PATH_RULES, _POLICY_SETTINGS
-    p = Path(file_path or os.environ.get("GUARDRAIL_POLICY_FILE", Path(__file__).resolve().parent / "policy.yaml"))
-    if not p.is_file():
+    """Load customized rules, branches, credentials, risk weights, and settings from policy.yaml."""
+    global _POLICY_LOADED, _LOADED_POLICY_PATH, _CUSTOM_BLOCK, _CUSTOM_ASK, _CUSTOM_PROCEED, _PATH_RULES, _POLICY_SETTINGS
+    global _BRANCH_PROTECTION, _CREDENTIALS_PROTECTION, _RISK_CONFIG, _DRY_RUN_CONFIG, _MEMORY_CONFIG, _AUDIT_CONFIG
+
+    p = _find_policy_file(file_path)
+    _LOADED_POLICY_PATH = p
+    if not p or not p.is_file():
         _POLICY_LOADED = True
         return {}
 
@@ -729,9 +840,62 @@ def load_policy(file_path: str | Path | None = None) -> dict:
             if _debug_enabled():
                 _log(f"[guardrail:policy] Error compiling path rule '{p_name}': {exc}")
 
+    if "branch_protection" in data and isinstance(data["branch_protection"], dict):
+        _BRANCH_PROTECTION.update(data["branch_protection"])
+    if "credentials_protection" in data and isinstance(data["credentials_protection"], dict):
+        _CREDENTIALS_PROTECTION.update(data["credentials_protection"])
+    if "risk_scoring" in data and isinstance(data["risk_scoring"], dict):
+        raw_risk = data["risk_scoring"]
+        if "weights" in raw_risk and isinstance(raw_risk["weights"], dict):
+            _RISK_CONFIG["weights"].update(raw_risk["weights"])
+        for k in ("block_threshold", "ask_threshold", "chained_exfiltration"):
+            if k in raw_risk:
+                _RISK_CONFIG[k] = raw_risk[k]
+    if "dry_run" in data and isinstance(data["dry_run"], dict):
+        _DRY_RUN_CONFIG.update(data["dry_run"])
+    if "memory_boundaries" in data and isinstance(data["memory_boundaries"], dict):
+        _MEMORY_CONFIG.update(data["memory_boundaries"])
+    if "audit_logging" in data and isinstance(data["audit_logging"], dict):
+        _AUDIT_CONFIG.update(data["audit_logging"])
+
+    # Environment variable overrides
+    if "GUARDRAIL_CONFIRM_WINDOW_SECS" in os.environ:
+        try:
+            _MEMORY_CONFIG["confirm_window_secs"] = float(os.environ["GUARDRAIL_CONFIRM_WINDOW_SECS"])
+        except ValueError:
+            pass
+    if "GUARDRAIL_ACTION_HISTORY_TTL_SECS" in os.environ:
+        try:
+            _MEMORY_CONFIG["action_history_ttl_secs"] = float(os.environ["GUARDRAIL_ACTION_HISTORY_TTL_SECS"])
+        except ValueError:
+            pass
+    if "GUARDRAIL_LOG_FILE" in os.environ:
+        _AUDIT_CONFIG["log_file"] = os.environ["GUARDRAIL_LOG_FILE"]
+    if "GUARDRAIL_DRY_RUN" in os.environ:
+        _DRY_RUN_CONFIG["enabled"] = os.environ["GUARDRAIL_DRY_RUN"].lower() in ("1", "true", "yes", "on")
+    if "GUARDRAIL_CHAINED_EXFILTRATION" in os.environ:
+        _RISK_CONFIG["chained_exfiltration"] = os.environ["GUARDRAIL_CHAINED_EXFILTRATION"].lower() in ("1", "true", "yes", "on")
+
     _POLICY_SETTINGS = data.get("settings", {})
     _POLICY_LOADED = True
     return data
+
+
+def reload_policy(file_path: str | Path | None = None) -> dict:
+    """Dynamically reload policy from disk and return status summary."""
+    global _POLICY_LOADED
+    _POLICY_LOADED = False
+    data = load_policy(file_path)
+    return {
+        "reloaded": True,
+        "custom_block_rules": len(_CUSTOM_BLOCK),
+        "custom_ask_rules": len(_CUSTOM_ASK),
+        "custom_proceed_rules": len(_CUSTOM_PROCEED),
+        "path_rules": len(_PATH_RULES),
+        "backend": _POLICY_SETTINGS.get("backend", os.environ.get("GUARDRAIL_BACKEND", "rules")),
+        "protected_branches": len(_BRANCH_PROTECTION.get("protected_branches", [])),
+        "dry_run_enabled": _DRY_RUN_CONFIG.get("enabled", True),
+    }
 
 
 def evaluate_rules(description: str) -> RuleResult:
@@ -1397,16 +1561,401 @@ BACKENDS = {
 
 
 @dataclass
+class ExecutionContext:
+    """Contextual metadata beyond the raw command string (repo, cwd, credentials, prior actions)."""
+    cwd: str = ""
+    repo_branch: str = ""
+    outside_cwd: bool = False
+    has_credentials: bool = False
+    prior_capabilities: list[str] = field(default_factory=list)
+    prior_actions: list[str] = field(default_factory=list)
+
+
+def _is_protected_branch(branch: str) -> bool:
+    """Check if branch matches configured protected branch patterns."""
+    if not branch:
+        return False
+    b_low = branch.strip().lower()
+    patterns = _BRANCH_PROTECTION.get("protected_branches") or ["main", "master", "prod*", "release/*", "staging"]
+    for pat in patterns:
+        p_low = str(pat).strip().lower()
+        if p_low.endswith("*"):
+            if b_low.startswith(p_low[:-1]):
+                return True
+        elif "*" in p_low or "?" in p_low:
+            import fnmatch
+            if fnmatch.fnmatchcase(b_low, p_low):
+                return True
+        elif b_low == p_low or b_low.startswith(f"{p_low}/"):
+            return True
+    return False
+
+
+def _detect_git_branch(cwd: str) -> str:
+    """Fast, zero-subprocess git branch detection by reading .git/HEAD."""
+    try:
+        cur = Path(cwd).resolve() if cwd else Path.cwd().resolve()
+        for parent in [cur, *list(cur.parents)[:4]]:
+            head_file = parent / ".git" / "HEAD"
+            if head_file.is_file():
+                content = head_file.read_text(encoding="utf-8", errors="ignore").strip()
+                if content.startswith("ref: refs/heads/"):
+                    return content[len("ref: refs/heads/"):].strip()
+                return "HEAD"
+    except Exception:
+        pass
+    return ""
+
+
+def _detect_credentials_present(cwd: str) -> bool:
+    """Check whether sensitive credential files or environment variables are present (boolean only, never reads values)."""
+    import fnmatch
+    sens_keys = _CREDENTIALS_PROTECTION.get("sensitive_env_keys") or [
+        "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
+        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DATABASE_URL", "STRIPE_SECRET_KEY",
+        "PRIVATE_KEY", "NPM_TOKEN", "PYPI_API_TOKEN", "SLACK_BOT_TOKEN",
+    ]
+    for k in os.environ:
+        for pat in sens_keys:
+            if fnmatch.fnmatchcase(k.upper(), str(pat).upper()) or k == pat:
+                return True
+    if cwd:
+        try:
+            base = Path(cwd)
+            sens_files = _CREDENTIALS_PROTECTION.get("sensitive_files") or [
+                ".env", ".env.*", "credentials.json", "secrets.yaml", "secrets.yml",
+            ]
+            for pat in sens_files:
+                if "*" in pat or "?" in pat:
+                    if any(base.glob(pat)):
+                        return True
+                else:
+                    if (base / pat).is_file():
+                        return True
+        except Exception:
+            pass
+    return False
+
+
+def inspect_execution_context(
+    cwd: str = "",
+    outside_cwd: bool = False,
+    prior_capabilities: list[str] | None = None,
+    prior_actions: list[str] | None = None,
+    has_credentials: bool | None = None,
+    repo_branch: str | None = None,
+) -> ExecutionContext:
+    """Build an ExecutionContext from workspace state, environment, and session history."""
+    resolved_branch = repo_branch if repo_branch is not None else _detect_git_branch(cwd)
+    resolved_creds = has_credentials if has_credentials is not None else _detect_credentials_present(cwd)
+    return ExecutionContext(
+        cwd=cwd,
+        repo_branch=resolved_branch,
+        outside_cwd=outside_cwd,
+        has_credentials=resolved_creds,
+        prior_capabilities=list(prior_capabilities or []),
+        prior_actions=list(prior_actions or []),
+    )
+
+
+_CAPABILITY_PATTERNS: list[tuple[str, re.Pattern]] = [
+    (
+        "cap:secret_access",
+        re.compile(
+            r"(?:^|[\s/\\'\".])(?:\.env(?:\.\w+)?|id_rsa|id_ed25519|[\w.-]+\.(?:pem|key|p12|pfx)|"
+            r"credentials(?:\.json)?|\.aws[/\\]credentials|\.npmrc|\.pypirc|/etc/shadow|secrets[/\\])|"
+            r"\b(?:AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|PRIVATE_KEY)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "cap:net_outbound",
+        re.compile(
+            r"\b(?:curl|wget|invoke-webrequest|invoke-restmethod|iwr|irm|nc|ncat|netcat|socat|"
+            r"ssh|scp|sftp|rsync|ftp|telnet|nslookup|dig)\b|"
+            r"\b(?:urllib\.request|requests\.(?:get|post|put|request)|http\.client|socket\.connect|fetch\s*\()|"
+            r"/dev/(?:tcp|udp)/",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "cap:fs_delete",
+        re.compile(
+            r"\b(?:rm|del|erase|rmdir|rd|remove-item|unlink|shred|srm|wipefs|delete\s+file)\b|"
+            r"\bgit\s+clean\b|\b(?:os\.(?:remove|unlink|rmdir)|shutil\.rmtree|pathlib\.Path\([^)]*\)\.unlink)\b|"
+            r"\bfind\b.*-(?:delete|exec\s+rm)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "cap:fs_write",
+        re.compile(
+            r"\b(?:write\s+file|modify\s+file|create\s+file|apply\s+patch|touch|mkdir|md|mv|cp|"
+            r"move-item|copy-item|new-item|set-content|out-file|add-content|tee)\b|"
+            r"\bsed\s+-i\b|(?<![0-9&])>>?(?![>&])",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "cap:git_mutation",
+        re.compile(
+            r"\bgit\s+(?:push|reset|rebase|clean|checkout\s+(?:-f|--force)|branch\s+-[dD]|"
+            r"tag\s+-d|merge|commit|stash\s+(?:drop|clear)|filter-branch|cherry-pick)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "cap:pkg_install",
+        re.compile(
+            r"\b(?:pip\d?|pipx|uv\s+pip|poetry|pipenv|conda|npm|yarn|pnpm|bun|"
+            r"cargo|go|gem|composer|apt(?:-get)?|apk|yum|dnf|pacman|brew|choco|winget)\s+"
+            r"(?:install|i|add|get|require|upgrade|uninstall|remove)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "cap:sys_admin",
+        re.compile(
+            r"\b(?:sudo|su|runas|doas|chmod|chown|chgrp|icacls|takeown|docker|podman|kubectl|helm|"
+            r"terraform|ansible|systemctl|service|launchctl|sc(?:\.exe)?|kill|pkill|killall|taskkill|"
+            r"stop-process|iptables|ufw|firewall-cmd|crontab|schtasks|mount|umount|fdisk|mkfs)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "cap:code_exec",
+        re.compile(
+            r"\b(?:python\d?|node|perl|ruby|php|lua)\s+-(?:c|e|r|-eval)\b|"
+            r"\b(?:bash|sh|zsh|dash|ksh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh(?:\.exe)?)\s+(?:-c|/c|-command|-enc|-encodedcommand)\b|"
+            r"\b(?:eval|exec|xargs|source)\b",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+
+def classify_capabilities(description: str) -> list[str]:
+    """Classify an action into explicit capability tags across all unwrapped command layers."""
+    norm = normalize(description)
+    deobf = deobfuscate_shell_syntax(norm)
+    decoded = decode_encoded_payloads(description) + decode_encoded_payloads(norm)
+    layers = [description, norm, deobf, *decoded]
+    for cand in list(layers):
+        for u in unwrap_command_wrappers(cand):
+            if u not in layers:
+                layers.append(u)
+
+    caps: list[str] = []
+    for cap_name, rx in _CAPABILITY_PATTERNS:
+        if any(rx.search(layer) for layer in layers if layer):
+            if cap_name not in caps:
+                caps.append(cap_name)
+    if not caps:
+        caps.append("cap:read_only")
+    return caps
+
+
+_CAP_WEIGHTS: dict[str, float] = {
+    "cap:secret_access": 0.35,
+    "cap:fs_delete": 0.25,
+    "cap:sys_admin": 0.20,
+    "cap:net_outbound": 0.20,
+    "cap:git_mutation": 0.18,
+    "cap:code_exec": 0.15,
+    "cap:pkg_install": 0.15,
+    "cap:fs_write": 0.10,
+    "cap:read_only": 0.0,
+}
+
+
+def compute_risk_score(
+    description: str,
+    rules: RuleResult,
+    capabilities: list[str] | None = None,
+    model: ModelResult | None = None,
+    context: ExecutionContext | None = None,
+) -> tuple[float, list[str]]:
+    """
+    Compute a deterministic per-action risk score in [0.0, 1.0] and contributing risk factors,
+    combining rule severity, capability weights, neural probabilities, and execution context.
+    """
+    caps = capabilities if capabilities is not None else classify_capabilities(description)
+    factors: list[str] = []
+
+    if rules.decision == "block":
+        score = 0.95
+        factors.append("rule:block")
+    elif rules.decision == "ask_user":
+        score = 0.55
+        factors.append("rule:ask_user")
+    elif rules.decision == "proceed" and rules.matched:
+        score = 0.05
+        factors.append("rule:allowlisted")
+    else:
+        score = 0.15
+
+    is_allowlisted_safe = (
+        rules.decision == "proceed"
+        and bool(rules.matched)
+        and "cap:secret_access" not in caps
+    )
+
+    weights = _RISK_CONFIG.get("weights") or _CAP_WEIGHTS
+    if not is_allowlisted_safe:
+        for c in caps:
+            w = weights.get(c, 0.0)
+            if w > 0:
+                score += w * 0.55
+                factors.append(c)
+
+    # Direct secret + network combination in the same command
+    if "cap:secret_access" in caps and "cap:net_outbound" in caps:
+        score = max(score, 0.96)
+        factors.append("context:direct_secret_exfiltration")
+
+    # Contextual adjustments
+    if context is not None:
+        # Chained exfiltration: session previously accessed secrets, now attempting outbound network
+        if _RISK_CONFIG.get("chained_exfiltration", True) and "cap:secret_access" in context.prior_capabilities and "cap:net_outbound" in caps:
+            score = max(score, 0.95)
+            factors.append("context:chained_secret_exfiltration")
+
+        # Outside working directory
+        if context.outside_cwd:
+            score = max(score + 0.30, 0.60)
+            factors.append("context:outside_cwd")
+
+        # Protected git branch mutations or deletions
+        if _is_protected_branch(context.repo_branch):
+            if "cap:git_mutation" in caps or "cap:fs_delete" in caps:
+                score += 0.18
+                factors.append(f"context:protected_branch({context.repo_branch})")
+
+        # Active credentials in workspace/env + outbound network or dynamic code execution
+        if context.has_credentials and ("cap:net_outbound" in caps or "cap:code_exec" in caps):
+            if not is_allowlisted_safe:
+                score += 0.12
+                factors.append("context:credentials_present")
+
+    # Blend neural model probability if available
+    if model is not None and model.probabilities and not is_allowlisted_safe:
+        p_block = float(model.probabilities.get("block", 0.0))
+        p_ask = float(model.probabilities.get("ask_user", 0.0))
+        neural_risk = p_block * 0.95 + p_ask * 0.55
+        if neural_risk > score:
+            score = (score + neural_risk) / 2.0
+            factors.append(f"model:risk({neural_risk:.2f})")
+
+    score = round(min(max(score, 0.0), 1.0), 3)
+    return score, factors
+
+
+def generate_dry_run_preview(
+    description: str,
+    cwd: str = "",
+    paths: list[str] | None = None,
+    capabilities: list[str] | None = None,
+) -> str:
+    """
+    Generate a non-destructive dry-run preview summarizing the real-world impact
+    (affected files, sizes, git branch target, network hosts, or packages) before execution.
+    """
+    if not _DRY_RUN_CONFIG.get("enabled", True):
+        return ""
+
+    caps = capabilities if capabilities is not None else classify_capabilities(description)
+    base_dir = Path(cwd) if cwd else Path.cwd()
+    first_line = description.strip().splitlines()[0][:120] if description.strip() else ""
+    parts: list[str] = []
+    max_items = int(_DRY_RUN_CONFIG.get("max_preview_items", 5))
+
+    # Collect candidate paths from explicit paths list or command tokens
+    cand_paths: list[str] = list(paths or [])
+    if not cand_paths and first_line:
+        try:
+            tokens = shlex.split(first_line, posix=(os.name != "nt"))
+        except ValueError:
+            tokens = first_line.split()
+        for tok in tokens[1:]:
+            clean = tok.strip("'\"`")
+            if clean and not clean.startswith("-") and clean not in ("&&", "||", ";", "|", ">", ">>"):
+                if "/" in clean or "\\" in clean or "." in clean or "*" in clean:
+                    cand_paths.append(clean)
+
+    if "cap:fs_delete" in caps:
+        matched_files: list[str] = []
+        for cp in cand_paths[:max_items]:
+            try:
+                if "*" in cp or "?" in cp:
+                    for m in list(base_dir.glob(cp))[:max_items]:
+                        sz = f"{m.stat().st_size} B" if m.is_file() else "dir"
+                        matched_files.append(f"{m.name} ({sz})")
+                else:
+                    p_obj = Path(cp) if Path(cp).is_absolute() else (base_dir / cp)
+                    if p_obj.exists():
+                        sz = f"{p_obj.stat().st_size} B" if p_obj.is_file() else "dir"
+                        matched_files.append(f"{cp} ({sz})")
+                    else:
+                        matched_files.append(f"{cp} (not found)")
+            except Exception:
+                matched_files.append(cp)
+        target_summary = ", ".join(matched_files[:max_items]) if matched_files else (first_line or "unspecified targets")
+        parts.append(f"delete impact -> {target_summary}")
+
+    elif "cap:fs_write" in caps:
+        write_targets: list[str] = []
+        for cp in cand_paths[:max_items]:
+            try:
+                p_obj = Path(cp) if Path(cp).is_absolute() else (base_dir / cp)
+                if p_obj.exists() and p_obj.is_file():
+                    write_targets.append(f"overwrites '{cp}' ({p_obj.stat().st_size} B)")
+                else:
+                    write_targets.append(f"creates/modifies '{cp}'")
+            except Exception:
+                write_targets.append(f"modifies '{cp}'")
+        if write_targets:
+            parts.append("write impact -> " + ", ".join(write_targets))
+
+    if "cap:git_mutation" in caps:
+        branch = _detect_git_branch(cwd) or "current branch"
+        parts.append(f"git impact -> mutates repository on '{branch}' ({first_line})")
+
+    if "cap:pkg_install" in caps:
+        parts.append(f"dependency impact -> modifies environment packages ({first_line})")
+
+    if "cap:net_outbound" in caps:
+        urls = re.findall(r"https?://[^\s'\"`]+|[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?::\d+)?", first_line)
+        target_hosts = ", ".join(urls[:max_items]) if urls else first_line
+        parts.append(f"network impact -> outbound request to {target_hosts}")
+
+    if "cap:sys_admin" in caps and not parts:
+        parts.append(f"system/container impact -> executes privileged/service action ({first_line})")
+
+    if not parts:
+        parts.append(f"capabilities={','.join(caps)} | cmd='{first_line}'")
+
+    return "; ".join(parts)
+
+
+@dataclass
 class Decision:
     decision: str
     backend: str
     rules: RuleResult
     model: ModelResult | None = None
     error: str | None = None
+    capabilities: list[str] = field(default_factory=list)
+    risk_score: float = 0.0
+    risk_factors: list[str] = field(default_factory=list)
+    dry_run_preview: str = ""
 
     def explain(self) -> str:
-        parts = [f"final={self.decision}", f"backend={self.backend}"]
+        parts = [f"final={self.decision}", f"risk={self.risk_score:.2f}", f"backend={self.backend}"]
+        if self.capabilities:
+            parts.append(f"caps={self.capabilities}")
         parts.append(f"rules={self.rules.decision}" + (f" {self.rules.matched}" if self.rules.matched else ""))
+        if self.risk_factors:
+            parts.append(f"factors={self.risk_factors}")
         if self.model is not None:
             m = self.model
             probs = ", ".join(f"{k}={v:.3f}" for k, v in m.probabilities.items())
@@ -1414,6 +1963,8 @@ class Decision:
             parts.append(f"model={m.decision} (choice={m.raw_choice}, conf={conf}{', ' + probs if probs else ''}; {m.note})")
             if m.qwen_explanation:
                 parts.append(f'qwen_reasoning="{m.qwen_explanation}"')
+        if self.dry_run_preview:
+            parts.append(f'dry_run="{self.dry_run_preview}"')
         if self.error:
             parts.append(f"backend_error={self.error}")
         return " | ".join(parts)
@@ -1424,34 +1975,77 @@ def fallback_decision(description: str) -> str:
     return most_severe(evaluate_rules(description).decision, "ask_user")
 
 
-def decide(description: str, backend_name: str | None = None) -> Decision:
-    """Main decision function: rules -> backend -> most severe."""
+def decide(
+    description: str,
+    backend_name: str | None = None,
+    context: ExecutionContext | None = None,
+) -> Decision:
+    """Main decision function: rules -> context & capabilities -> backend -> most severe."""
     if not _POLICY_LOADED:
         load_policy()
     if backend_name is None:
         backend_name = os.environ.get("GUARDRAIL_BACKEND") or _POLICY_SETTINGS.get("backend", "clm")
     backend_name = backend_name.strip().lower()
     rules = evaluate_rules(description)
+    caps = classify_capabilities(description)
 
     if not description.strip():
-        return Decision("ask_user", backend_name, rules, error="empty description")
+        return Decision(
+            "ask_user", backend_name, rules, error="empty description",
+            capabilities=caps, risk_score=0.55, risk_factors=["empty_description"],
+        )
+
+    # Compute initial context-aware risk score before calling neural backend
+    pre_score, pre_factors = compute_risk_score(description, rules, caps, None, context)
+
+    # Chained or direct secret exfiltration detected via context -> immediate block
+    if "context:chained_secret_exfiltration" in pre_factors or "context:direct_secret_exfiltration" in pre_factors:
+        tag = "block:chained secret exfiltration"
+        if tag not in rules.matched:
+            rules = RuleResult("block", [*rules.matched, tag])
+        preview = generate_dry_run_preview(description, cwd=(context.cwd if context else ""), capabilities=caps)
+        return Decision(
+            "block", backend_name, rules,
+            capabilities=caps, risk_score=pre_score, risk_factors=pre_factors, dry_run_preview=preview,
+        )
 
     # Zero-tolerance: immediate block bypasses model
     if rules.decision == "block":
-        return Decision("block", backend_name, rules)
+        preview = generate_dry_run_preview(description, cwd=(context.cwd if context else ""), capabilities=caps)
+        return Decision(
+            "block", backend_name, rules,
+            capabilities=caps, risk_score=pre_score, risk_factors=pre_factors, dry_run_preview=preview,
+        )
 
     # Pure rules-only backend
     if backend_name == "rules":
-        return Decision(rules.decision, "rules", rules, model=ModelResult(rules.decision, note="rules only"))
+        final_dec = rules.decision
+        if context and context.outside_cwd and final_dec == "proceed":
+            final_dec = "ask_user"
+        preview = generate_dry_run_preview(description, cwd=(context.cwd if context else ""), capabilities=caps) if final_dec != "proceed" else ""
+        return Decision(
+            final_dec, "rules", rules, model=ModelResult(final_dec, note="rules only"),
+            capabilities=caps, risk_score=pre_score, risk_factors=pre_factors, dry_run_preview=preview,
+        )
 
     backend_fn = BACKENDS.get(backend_name)
     if backend_fn is None:
-        return Decision(fallback_decision(description), backend_name, rules, error=f"unknown backend '{backend_name}'")
+        fb = fallback_decision(description)
+        preview = generate_dry_run_preview(description, cwd=(context.cwd if context else ""), capabilities=caps)
+        return Decision(
+            fb, backend_name, rules, error=f"unknown backend '{backend_name}'",
+            capabilities=caps, risk_score=max(pre_score, 0.55), risk_factors=pre_factors, dry_run_preview=preview,
+        )
 
     try:
         model = backend_fn(description)
     except Exception as exc:  # noqa: BLE001
-        return Decision(fallback_decision(description), backend_name, rules, error=f"{type(exc).__name__}: {exc}")
+        fb = fallback_decision(description)
+        preview = generate_dry_run_preview(description, cwd=(context.cwd if context else ""), capabilities=caps)
+        return Decision(
+            fb, backend_name, rules, error=f"{type(exc).__name__}: {exc}",
+            capabilities=caps, risk_score=max(pre_score, 0.55), risk_factors=pre_factors, dry_run_preview=preview,
+        )
 
     if rules.decision == "proceed" and rules.matched:
         # Coreutils read CLI commands (wc, cat, ls, grep, etc.) and safe test/lint tools are inspection: prevent embedding hallucinations from blocking them
@@ -1472,16 +2066,25 @@ def decide(description: str, backend_name: str | None = None) -> Decision:
     else:
         final_decision = most_severe(rules.decision, model.decision)
 
-    return Decision(final_decision, backend_name, rules, model)
+    if context and context.outside_cwd and final_decision == "proceed":
+        final_decision = "ask_user"
+
+    final_score, final_factors = compute_risk_score(description, rules, caps, model, context)
+    preview = generate_dry_run_preview(description, cwd=(context.cwd if context else ""), capabilities=caps) if final_decision != "proceed" else ""
+
+    return Decision(
+        final_decision, backend_name, rules, model,
+        capabilities=caps, risk_score=final_score, risk_factors=final_factors, dry_run_preview=preview,
+    )
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
+def main(argv: list[str] | None = None) -> int:
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
+    if not raw_args:
         _log('Usage: check_action.py "<action description>" [--backend <clm|d1|jev|rules>] [--explain]')
-        _log('       check_action.py --start | --stop | --status')
+        _log('       check_action.py --start | --stop | --status | --mcp | --reload')
         return 2
 
-    raw_args = sys.argv[1:]
     first_arg = raw_args[0].lower()
 
     if first_arg in ("--start", "start"):
@@ -1512,6 +2115,21 @@ def main() -> int:
         except Exception as exc:
             _log(f"Error checking status: {exc}")
             return 1
+
+    if first_arg in ("--mcp", "mcp"):
+        try:
+            import mcp_server
+            sys.argv = ["mcp_server.py"] + raw_args[1:]
+            return mcp_server.main()
+        except Exception as exc:
+            _log(f"Error launching MCP server: {exc}")
+            return 1
+
+    if first_arg in ("--reload", "reload"):
+        policy_file = raw_args[1] if len(raw_args) > 1 and not raw_args[1].startswith("-") else None
+        res = reload_policy(policy_file)
+        print(f"Policy reloaded successfully: {res['custom_block_rules']} block rules, {res['custom_ask_rules']} ask rules, {res['path_rules']} path rules (backend: {res['backend']}, dry_run: {res['dry_run_enabled']})")
+        return 0
 
     show_explain = False
     cli_backend = None

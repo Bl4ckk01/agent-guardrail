@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="tests/"><img src="https://img.shields.io/badge/tests-68%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/tests-135%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-~37.4ms%20(neural)-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
@@ -45,6 +45,7 @@
 - [Google Antigravity Integration](#-google-antigravity-integration)
 - [Cursor Integration](#-cursor-integration)
 - [Grok Build Integration](#-grok-build-integration)
+- [Model Context Protocol (MCP) Server Integration](#-model-context-protocol-mcp-server-integration)
 - [Configuration & Options (policy.yaml)](#-configuration--options-policyyaml)
   - [Policy Structure](#policy-structure)
   - [Environment Variables](#environment-variables-reference)
@@ -255,6 +256,40 @@ A common vulnerability in naive command guardrails is **evasion and bypass attac
 
 11. **Canonical Path & Symlink Resolution**:
     - Resolves relative directory traversals (`./secrets/`, `foo/../secrets/`, redundant slashes `//`) and physical symlinks (`Path.resolve()`), preventing path restriction evasion.
+
+---
+
+### 🔒 Context-Aware Risk Scoring, Scoped Memory Boundaries & Tamper-Evident Audit Log
+
+Evaluating a command string in isolation is insufficient because real-world intent and impact depend on the active repository branch, working directory, exposed credentials, and prior actions in the session. Agent Guardrail enforces five production-grade runtime boundary layers:
+
+1. **Context-Aware Evaluation (`ExecutionContext`) & Multi-Step Chained Exfiltration Defense**:
+   - **Repository & Branch Awareness**: Automatically inspects `.git/HEAD` in `< 0.1 ms` (zero subprocess overhead) to detect protected branches (`main`, `master`, `production`, `release/*`) and elevates risk when git mutations or file deletions target production branches.
+   - **Working Directory Boundaries**: Verifies whether target file paths resolve outside the active project `cwd`.
+   - **Credential Presence Detection**: Checks whether sensitive environment variables (`AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, etc.) or `.env` files are active in the workspace (inspecting key presence only — secret values are never read or logged).
+   - **Multi-Step Chained Secret Exfiltration Prevention**: Tracks bounded, time-expiring capability history per session. If an agent reads a secret file (e.g., `.env`, `id_rsa`, `secrets/`) via a read tool and subsequently attempts an outbound network action (`curl`, `wget`, `urllib`, `nc`, `ssh`), the guardrail correlates the trajectory and immediately **blocks** the chained exfiltration (`block:chained secret exfiltration`).
+
+2. **Allowlisted Capabilities & Per-Action Risk Scoring (`0.00` – `1.00`)**:
+   - Every action is classified into explicit capability tags across all unwrapped command layers: `cap:read_only`, `cap:secret_access`, `cap:net_outbound`, `cap:fs_delete`, `cap:fs_write`, `cap:git_mutation`, `cap:pkg_install`, `cap:sys_admin`, and `cap:code_exec`.
+   - Computes a deterministic numerical `risk_score` (`0.00` to `1.00`) and explicit `risk_factors` combining rule tier severity, capability weights, workspace context multipliers, and neural probability distributions.
+
+3. **Non-Destructive Dry-Run Impact Previews**:
+   - Before any `ask_user` action is approved, `generate_dry_run_preview()` synthesizes a non-destructive pre-flight impact summary (`[Dry-Run Preview: ...]`) without mutating disk state:
+     - **Deletions (`cap:fs_delete`)**: Resolves globs and target paths in `cwd`, reporting exact matching file names and byte sizes.
+     - **Writes & Patches (`cap:fs_write`)**: Distinguishes between creating new files vs. overwriting existing files (with current byte size).
+     - **Git & Package Mutations**: Previews target branch state and dependency modifications.
+     - **Network Operations (`cap:net_outbound`)**: Extracts and highlights target outbound URLs/hosts.
+
+4. **Strict Memory Boundaries & Single-Use Scoped Approval Grants (Anti-Stale Permission)**:
+   - Inspired by review-first, bounded context architectures (such as [NeuraKeep](https://www.neurakeep.com)), human approvals are **never** stored as blanket session or turn-wide wildcards.
+   - When an action pauses for confirmation, the guardrail computes a cryptographic SHA-256 scope fingerprint (`compute_action_fingerprint(command, tool_name, cwd)`).
+   - Upon confirmation, a typed `approval_grant` is issued that is:
+     - **Strictly Scoped**: Bound to the exact command string, tool identifier, and normalized working directory (`cwd`). If a prompt injection swaps the command arguments or shifts `cwd` on retry (TOCTOU attack), the grant is immediately revoked (`approval_mismatch`).
+     - **Atomically Single-Use**: Consumed and erased on the very first matching execution (`approval_consumed`), ensuring a previously approved exception can **never** become permanent authorization.
+
+5. **Tamper-Evident Append-Only Audit Log (`verify_audit_log`)**:
+   - Every decision, capability list, risk score, dry-run preview, and approval lifecycle event is recorded in `~/.guardrail/guardrail.log` as an append-only **SHA-256 hash-chained JSONL ledger** (`seq`, `prev_hash`, `entry_hash`).
+   - Built-in cryptographic verification (`verify_audit_log()`) validates sequence continuity from the genesis hash (`0000...`) to the latest entry, immediately detecting any modified payload, deleted log line, or reordered event.
 
 ---
 
@@ -649,112 +684,335 @@ xAI's Grok Build terminal agent integrates via the native skill discovery system
 
 ---
 
-## 🛠️ Configuration & Options (`policy.yaml`)
+## 🔌 Model Context Protocol (MCP) Server Integration
 
-All safety thresholds, regex whitelists, blocklists, and protected directories are centrally configured in [`policy.yaml`](policy.yaml) **without editing Python code**.
+**Agent Guardrail** includes a native **Model Context Protocol (MCP)** server ([`mcp_server.py`](mcp_server.py)) implementing the standard **2024-11-05 JSON-RPC 2.0** specification over `stdio`.
 
-### Policy Structure
+Any MCP-compatible client—such as **Claude Desktop**, **Cursor**, **Google Antigravity**, **Zed**, or **VS Code Copilot**—can mount the server to inspect policies, query status, and verify actions programmatically.
+
+### 1. Launching the MCP Server
+```bash
+# Direct execution (stdio transport)
+python mcp_server.py
+
+# Or via check_action.py
+python check_action.py --mcp
+
+# Protocol self-test & compliance validation
+python mcp_server.py --test
+```
+
+### 2. Auto-Configuration & Client Setup
+
+Export pre-filled JSON configuration snippets for your environment:
+```bash
+python mcp_server.py --export-config
+```
+
+#### A. Cursor (`.cursor/mcp.json`)
+Configure automatically with:
+```bash
+python install.py --mcp
+# or: python mcp_server.py --install-cursor
+```
+This generates `.cursor/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "agent-guardrail": {
+      "command": "python",
+      "args": ["<path-to-repo>/mcp_server.py"]
+    }
+  }
+}
+```
+
+#### B. Claude Desktop (`claude_desktop_config.json`)
+Add to `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+```json
+{
+  "mcpServers": {
+    "agent-guardrail": {
+      "command": "python",
+      "args": ["<path-to-repo>/mcp_server.py"],
+      "cwd": "<path-to-repo>"
+    }
+  }
+}
+```
+
+### 3. Exposed MCP Tools, Resources & Prompts
+
+| Type | Name / URI | Description |
+| :--- | :--- | :--- |
+| **Tool** | `check_action` | Evaluates a single command string or intent (`proceed`, `ask_user`, `block`) with full explanation. |
+| **Tool** | `check_batch_actions` | Evaluates multiple commands and computes aggregated `most_severe` verdict. |
+| **Tool** | `get_guardrail_status` | Inspects live backend status, active ports, and loaded rules count. |
+| **Tool** | `list_active_rules` | Catalogs active built-in and custom block, ask, proceed, and path rules. |
+| **Tool** | `reload_policy` | Reloads `policy.yaml` dynamically without server restarts. |
+| **Resource** | `guardrail://policy` | Raw contents of the active `policy.yaml` configuration. |
+| **Resource** | `guardrail://status` | Real-time JSON health check of backends and daemons. |
+| **Resource** | `guardrail://rules` | Structured JSON catalog of active rules. |
+| **Prompt** | `guardrail-pre-execution-check` | Pre-flight security audit template asking the model to verify actions before execution. |
+| **Prompt** | `guardrail-safety-guidelines` | Safety guidelines summary suitable for system prompt integration. |
+
+---
+
+## ⚙️ Configuration Guide (`policy.yaml` & Environment Variables)
+
+Agent Guardrail is **100% declaratively configurable**. Every safety boundary, regex rule, branch protection, credential key, risk weight, dry-run preview, authorization memory window, and audit log setting can be customized in [`policy.yaml`](policy.yaml) or overridden via environment variables **without touching any Python code**.
+
+### Policy Discovery Order
+
+When evaluating actions or starting hooks, the policy engine searches for `policy.yaml` in the following priority order:
+1. **Explicit parameter**: Passed via `--policy <path>` CLI flag or function argument.
+2. **Environment variable**: Defined by `GUARDRAIL_POLICY_FILE=/path/to/custom_policy.yaml`.
+3. **Current Working Directory**: `./policy.yaml` in the project root.
+4. **Script Directory**: `policy.yaml` located alongside `check_action.py`.
+5. **Global User Home**: `~/.guardrail/policy.yaml` for system-wide defaults.
+
+---
+
+### Complete Annotated `policy.yaml` Reference
+
+Below is the complete reference schema of [`policy.yaml`](policy.yaml) with side-by-side comments explaining each setting:
 
 ```yaml
 # ==============================================================================
-# AGENT GUARDRAIL - POLICY & RULE CONFIGURATION (Claude Code & Codex)
+# AGENT GUARDRAIL - DECLARATIVE POLICY CONFIGURATION
 # ==============================================================================
 
+# ------------------------------------------------------------------------------
 # 1. CUSTOM COMMAND BLOCK RULES (< 0.1ms deterministic shield)
+# ------------------------------------------------------------------------------
+# Actions matching these regex patterns are immediately rejected with zero lag.
 custom_block_rules:
-  - name: "terraform destroy"
-    pattern: '\bterraform\s+destroy\b'
-  - name: "pulumi destroy"
+  - name: "terraform destroy"                   # Identifier shown in logs and explanation
+    pattern: '\bterraform\s+destroy\b'          # Regex matching destructive infrastructure teardown
+  - name: "pulumi destroy"                      # Pulumi destruction
     pattern: '\bpulumi\s+destroy\b'
-  - name: "aws s3 bucket deletion"
+  - name: "aws s3 bucket deletion"              # Forceful cloud storage deletion
     pattern: '\baws\s+s3\s+rb\b.*--force'
-  - name: "production database stop"
+  - name: "cloud infrastructure deletion"       # Generic cluster/server destruction
+    pattern: '\b(?:destroy|nuke|delete|erase|terminate)\b.{0,30}?\b(?:cluster|k8s|kubernetes|vps|server|ec2\s+instance)\b'
+  - name: "production database stop"            # Abrupt stopping of production database daemons
     pattern: '\b(?:systemctl|service)\s+(?:stop|kill)\s+(?:postgresql|mysql|mongod|redis)\b'
 
+# ------------------------------------------------------------------------------
 # 2. CUSTOM COMMAND ASK RULES (Explicit human confirmation required)
+# ------------------------------------------------------------------------------
+# Actions matching these patterns pause execution and request human authorization.
 custom_ask_rules:
-  - name: "docker run/exec/compose"
+  - name: "docker run/exec/compose"             # Container launches and orchestration
     pattern: '\bdocker\s+(?:run|exec|compose)\b'
-  - name: "kubectl apply/delete/patch"
+  - name: "kubectl apply/delete/patch"          # Kubernetes cluster modifications
     pattern: '\bkubectl\s+(?:apply|delete|patch|replace|scale)\b'
-  - name: "export environment variable"
+  - name: "export environment variable"         # Modifying shell environment variables
     pattern: '\b(?:export\s+[A-Za-z0-9_]+=|\$env:[A-Za-z0-9_]+\s*=|set\s+[A-Za-z0-9_]+=)'
-  - name: "global package installation"
+  - name: "global package installation"         # Global system-level package manager mutations
     pattern: '\b(?:npm\s+i\s+-g|pip\s+install\s+--user|cargo\s+install)\b'
+  - name: "network/firewall config change"      # Host firewall and routing changes
+    pattern: '\b(?:ufw\s+(?:enable|disable|allow|deny|delete|route|default)|iptables\s+(?:-[ADIRPF]|--append|--delete|--insert|--replace|--policy|--flush)|firewall-cmd\s+--(?:add|remove|set)|netsh\s+advfirewall\s+set)\b'
 
-# 3. CUSTOM COMMAND PROCEED RULES (Safe routine whitelist)
+# ------------------------------------------------------------------------------
+# 3. CUSTOM COMMAND PROCEED RULES (Safe routine developer whitelist)
+# ------------------------------------------------------------------------------
+# Benign, read-only developer actions that proceed silently with zero human friction.
 custom_proceed_rules:
-  - name: "docker read-only"
+  - name: "firewall read-only"                  # Querying firewall status without changes
+    pattern: '\b(?:iptables\s+(?:-[LS]|--list|--list-rules)|ufw\s+status|firewall-cmd\s+--(?:state|list))\b'
+  - name: "docker read-only"                    # Inspecting containers, images, and logs
     pattern: '\bdocker\s+(?:ps|images|logs|inspect|version)\b'
-  - name: "kubectl read-only"
+  - name: "kubectl read-only"                   # Querying Kubernetes resources
     pattern: '\bkubectl\s+(?:get|describe|logs|cluster-info)\b'
-  - name: "cargo check/test"
+  - name: "cargo check/test"                    # Rust compilation check and test runner
     pattern: '\bcargo\s+(?:check|test|clippy|fmt)\b'
-  - name: "terraform plan/validate"
+  - name: "npm audit/outdated"                  # Node package inspection
+    pattern: '\bnpm\s+(?:audit|outdated|list)\b'
+  - name: "pip list/show"                       # Python package inspection
+    pattern: '\bpip3?\s+(?:list|show|check)\b'
+  - name: "terraform plan/validate"             # Dry-run infrastructure validation
     pattern: '\bterraform\s+(?:plan|validate|fmt)\b'
 
+# ------------------------------------------------------------------------------
 # 4. PROTECTED PATH & DIRECTORY RULES
+# ------------------------------------------------------------------------------
+# Granular access control by file path or directory tree.
 path_rules:
-  # Protect system directory: block modifications, allow safe reads
-  - name: "protect system /etc"
-    path: "/etc"
-    decision: "block"
-    all_commands: false
+  - name: "protect system /etc"                 # Protect system configuration files
+    path: "/etc"                                # Path prefix or glob pattern
+    decision: "block"                           # Verdict: 'block', 'ask_user', or 'proceed'
+    all_commands: false                         # When false, only targets specific command verbs
     commands: ["rm", "mv", "chmod", "chown", "tee", "sed", "nano", "vim", "write", "modify", "edit", "delete", "remove"]
 
-  # Zero-access directory: block ALL operations
-  - name: "protect secrets & credentials"
+  - name: "protect secrets & credentials"       # Dedicated credentials folder
     path: "secrets/"
     decision: "block"
-    all_commands: true
+    all_commands: true                          # When true, blocks ALL tool operations on this path
 
-  # Production environment: require approval for all actions
-  - name: "protect production environment"
+  - name: "protect production environment"      # Production configuration directory
     path: "production/"
-    decision: "ask_user"
+    decision: "ask_user"                        # Always require human approval
     all_commands: true
 
-  # Documentation whitelist: allow safe edits
-  - name: "public documentation whitelist"
+  - name: "public documentation whitelist"      # Safe documentation directory
     path: "docs/"
-    decision: "proceed"
+    decision: "proceed"                         # Auto-allow edits to documentation
     all_commands: true
 
-# 5. GLOBAL SETTINGS - BACKEND SELECTOR
+# ------------------------------------------------------------------------------
+# 5. BRANCH PROTECTION RULES
+# ------------------------------------------------------------------------------
+# Protects sensitive git branches from automated agent mutations.
+branch_protection:
+  protected_branches:                           # List of protected git branch patterns
+    - "main"                                    # Production default branch
+    - "master"                                  # Legacy production branch
+    - "release/*"                               # Release candidate branches
+    - "prod*"                                   # Production tags or branches
+    - "staging"                                 # Staging deployment branch
+  require_confirmation: true                    # Require human approval for git push/merge to protected branches
+
+# ------------------------------------------------------------------------------
+# 6. CREDENTIALS & SENSITIVE FILE PROTECTION
+# ------------------------------------------------------------------------------
+# Prevents credential harvesting and secret exfiltration.
+credentials_protection:
+  sensitive_env_keys:                           # Environment variable keys containing secrets
+    - "AWS_SECRET_ACCESS_KEY"                   # AWS secret key
+    - "OPENAI_API_KEY"                          # OpenAI API token
+    - "ANTHROPIC_API_KEY"                       # Anthropic API token
+    - "GITHUB_TOKEN"                            # GitHub access token
+    - "GH_TOKEN"                                # GitHub CLI token
+    - "DATABASE_URL"                            # Database connection string
+    - "PROD_DB_PASSWORD"                        # Production database password
+    - "JWT_SECRET"                              # JWT authentication secret
+    - "ENCRYPTION_KEY"                          # Cryptographic key
+    - "PRIVATE_KEY"                             # Generic private key
+  sensitive_files:                              # Sensitive credential filenames
+    - ".env"                                    # Primary local environment secrets
+    - ".env.production"                         # Production environment secrets
+    - ".env.local"                              # Local overrides
+    - "id_rsa"                                  # SSH private key
+    - "id_ed25519"                              # SSH Ed25519 private key
+    - "credentials.json"                        # Google Cloud / AWS credential file
+    - "service_account.json"                    # Cloud service account JSON
+    - "secrets.yaml"                            # Kubernetes secrets YAML
+
+# ------------------------------------------------------------------------------
+# 7. PER-ACTION RISK SCORING & THRESHOLDS
+# ------------------------------------------------------------------------------
+# Contextual mathematical risk evaluation engine (0.00 = safe, 1.00 = dangerous).
+risk_scoring:
+  weights:                                      # Capability weights applied during risk calculation
+    "cap:secret_access": 0.35                   # Reading or accessing secrets/credentials
+    "cap:net_outbound": 0.25                    # Transmitting outbound network traffic
+    "cap:sys_admin": 0.25                       # System administration / privilege escalation
+    "cap:fs_delete": 0.20                       # File or directory deletion
+    "cap:git_mutation": 0.18                    # Remote git branch mutations (push, reset)
+    "cap:code_exec": 0.15                       # Arbitrary code execution (eval, bash -c)
+    "cap:pkg_install": 0.15                     # Installing packages or dependencies
+    "cap:fs_write": 0.10                        # Writing or modifying project files
+    "cap:read_only": 0.00                       # Benign read-only commands
+  block_threshold: 0.85                         # Risk score >= 0.85 triggers immediate BLOCK
+  ask_threshold: 0.45                          # Risk score >= 0.45 triggers ASK_USER confirmation
+  chained_exfiltration: true                    # Escalate to BLOCK if outbound network occurs after reading a secret
+
+# ------------------------------------------------------------------------------
+# 8. DRY-RUN IMPACT PREVIEWS
+# ------------------------------------------------------------------------------
+# Generates non-destructive filesystem and network previews before actions run.
+dry_run:
+  enabled: true                                 # Enable dry-run simulation in ask_user dialogs
+  max_preview_items: 5                          # Max preview files/items displayed in prompt
+
+# ------------------------------------------------------------------------------
+# 9. MEMORY BOUNDARIES & PERMISSION TTL
+# ------------------------------------------------------------------------------
+# Hard boundaries preventing approval drift, stale permissions, and injection reuse.
+memory_boundaries:
+  confirm_window_secs: 600                      # Approval window: human confirmation expires after 10 mins (600s)
+  action_history_ttl_secs: 1800                 # Session trajectory history TTL: 30 minutes (1800s)
+  max_action_history: 20                        # Maximum recent action states kept per session
+  strict_fingerprint: true                      # Require cryptographic SHA-256 action fingerprint match (prevents TOCTOU)
+
+# ------------------------------------------------------------------------------
+# 10. APPEND-ONLY TAMPER-EVIDENT AUDIT LOGGING
+# ------------------------------------------------------------------------------
+# Cryptographically chained SHA-256 log recording every evaluated action.
+audit_logging:
+  enabled: true                                 # Enable append-only audit logging
+  log_file: ""                                  # Custom log path (empty defaults to ~/.guardrail/guardrail.log)
+  hash_chaining: true                           # Enable cryptographic hash chaining (detects tampering/deletion)
+
+# ------------------------------------------------------------------------------
+# 11. GLOBAL SETTINGS - BACKEND SELECTOR
+# ------------------------------------------------------------------------------
 settings:
-  backend: "clm"                # 'clm' | 'd1' | 'jev' | 'rules'
-  timeout_secs: 5.0             # max request timeout in seconds
-  debug: false                  # stderr debug logging
+  backend: "rules"                              # Decision engine: 'rules' (instant zero-setup) | 'd1' | 'clm' | 'jev'
+  timeout_secs: 5.0                             # Network request timeout in seconds
+  debug: false                                  # Enable verbose stderr debug logging
 
   # --- Qwen 3.8B System 2 Settings ---
-  use_qwen: true
-  qwen_base_url: "http://127.0.0.1:8090/v1"
-  qwen_timeout_secs: 2.0
+  use_qwen: true                                # Enable deep semantic reasoning on esoteric CLI commands
+  qwen_base_url: "http://127.0.0.1:8090/v1"     # OpenAI-compatible API endpoint for Qwen
+  qwen_timeout_secs: 2.0                        # Max timeout for Qwen System 2 queries
 
   # --- Liquid AI d1-3B Settings (when backend is 'd1') ---
-  liquid_endpoint: "http://127.0.0.1:8800/v1"   # llama-server or LM Studio
-  liquid_model: "d1-3b"
-  liquid_min_confidence: 0.50                   # Confidence threshold to accept decision
+  liquid_endpoint: "http://127.0.0.1:8800/v1"   # llama-server, LM Studio, or Cloud endpoint
+  liquid_model: "d1-3b"                         # Model identifier
+  liquid_min_confidence: 0.50                   # Confidence threshold required to accept model verdict
   liquid_proceed_min_prob: 0.50                 # Minimum probability required for 'proceed'
-  liquid_block_alert_prob: 0.20                 # Alert threshold for risky operations
 
   # --- CLM Settings (when backend is 'clm') ---
-  clm_base_url: "http://127.0.0.1:8700"
+  clm_base_url: "http://127.0.0.1:8700"         # Endpoint for local clm-serve classifier
   clm_min_confidence: 0.50
   clm_proceed_min_prob: 0.50
   clm_block_alert_prob: 0.20
+
+# ------------------------------------------------------------------------------
+# 12. DAEMON AUTO-START & HARDWARE OFFLOAD (/guardrail start)
+# ------------------------------------------------------------------------------
+  manual_start: false                           # Set true to start servers manually; false to let guardrail auto-manage
+  d1_model_path: '/path/to/d1-3B-F16.gguf'      # Absolute path to Liquid d1 GGUF
+  qwen_model_path: '/path/to/Qwen3-8B.gguf'     # Absolute path to Qwen 3.8B GGUF
+  d1_gpu_layers: 20                             # GPU layers offloaded to VRAM (-ngl) for D1
+  qwen_gpu_layers: 0                            # GPU layers for Qwen embeddings (0 for CPU, 20-30 for GPU)
+  d1_port: 8800                                 # HTTP port for Liquid AI D1
+  qwen_port: 8090                               # HTTP port for Qwen embeddings
+  clm_port: 8700                                # HTTP port for clm-serve
 ```
+
+---
+
+### Dynamic Live Reloading (Zero-Downtime)
+
+You can update `policy.yaml` at any time without stopping the agent, ending your terminal session, or restarting background daemons.
+
+| Method | Command | Description |
+| :--- | :--- | :--- |
+| **Agent Chat Prompt** | `/guardrail reload` or `[[guardrail:reload]]` | Instructs the hook to reload rules directly inside Claude Code or Codex chat. |
+| **Terminal CLI** | `python check_action.py --reload` | Reloads policy from disk and prints a rule count and backend diagnostic report. |
+| **Hook CLI** | `python guardrail_hook.py reload` | Reloads policy and verifies hook lifecycle state. |
+| **MCP Tool** | `reload_policy` | Calls the MCP server tool to refresh in-memory rules for Cursor, Claude Desktop, etc. |
 
 ---
 
 ### Environment Variables Reference
 
+All policy parameters can be overridden at runtime via environment variables:
+
 | Variable | Default | Allowed Values | Description |
 |---|:---:|:---:|---|
-| `GUARDRAIL_BACKEND` | `clm` | `d1`, `clm`, `jev`, `rules` | Active decision backend engine |
-| `GUARDRAIL_POLICY_FILE` | `./policy.yaml` | Path | Custom path to policy YAML configuration |
+| `GUARDRAIL_BACKEND` | `rules` | `d1`, `clm`, `jev`, `rules` | Active decision backend engine |
+| `GUARDRAIL_POLICY_FILE` | *(auto-discovered)* | Path | Custom path to policy YAML configuration |
 | `GUARDRAIL_TIMEOUT_SECS` | `5.0` | float | Network timeout for backend HTTP requests |
 | `GUARDRAIL_DEBUG` | `0` | `0`, `1` | Enable verbose diagnostic logging to `stderr` |
+| `GUARDRAIL_CONFIRM_WINDOW_SECS` | `600` | float | Confirmation window duration in seconds (memory boundary) |
+| `GUARDRAIL_ACTION_HISTORY_TTL_SECS`| `1800` | float | Trajectory memory TTL in seconds (secret chain tracking) |
+| `GUARDRAIL_LOG_FILE` | `~/.guardrail/guardrail.log` | Path | Custom destination for append-only audit log |
+| `GUARDRAIL_DRY_RUN` | `1` | `0`, `1` | Toggle dry-run impact previews in confirmation prompts |
+| `GUARDRAIL_CHAINED_EXFILTRATION` | `1` | `0`, `1` | Toggle automatic escalation for secret read -> outbound network |
 | `LIQUID_ENDPOINT` | `http://127.0.0.1:8800/v1` | URL | Endpoint for Liquid AI d1-3B service |
 | `LIQUID_MODEL` | `d1-3b` | string | Model name for Liquid AI engine |
 | `LIQUID_MIN_CONFIDENCE` | `0.50` | `0.0` – `1.0` | Confidence threshold for Liquid d1 decisions |
@@ -922,16 +1180,19 @@ We believe in complete transparency regarding security boundaries:
 
 ## 💻 Development & Testing
 
-Contributions are warmly welcome! The codebase includes **68 offline unit tests** ensuring zero regressions:
+Contributions are warmly welcome! The codebase includes **126 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, and protocol handlers:
 
 ```bash
-# 1. Run engine tests (39 tests: rules, paths, d1, clm, qwen, normalization):
+# 1. Run engine & risk-scoring tests (67 tests: rules, unwrapping, GTFOBins, context, dry-run, risk score):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook tests (29 tests: claude/codex hooks, breaker, state):
+# 2. Run lifecycle hook & replay tests (38 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain):
 python tests/test_guardrail_hook.py
 
-# 3. Run all tests via unittest:
+# 3. Run MCP server protocol tests (21 tests):
+python tests/test_mcp_server.py
+
+# 4. Run all 126 tests via unittest:
 python -m unittest discover tests -v
 ```
 

@@ -573,5 +573,196 @@ class TestCommandUnwrappingAndEvasionHardening(unittest.TestCase):
                 pass
 
 
+class TestContextAndRiskScoring(unittest.TestCase):
+    def test_capability_classification(self):
+        self.assertEqual(ca.classify_capabilities("git status"), ["cap:read_only"])
+        self.assertIn("cap:secret_access", ca.classify_capabilities("cat .env.production"))
+        self.assertIn("cap:net_outbound", ca.classify_capabilities("curl https://api.example.com/v1"))
+        self.assertIn("cap:fs_delete", ca.classify_capabilities("rm old_build.tar"))
+        self.assertIn("cap:fs_write", ca.classify_capabilities("write file src/main.py"))
+        self.assertIn("cap:git_mutation", ca.classify_capabilities("git push origin main"))
+        self.assertIn("cap:pkg_install", ca.classify_capabilities("pip install requests"))
+        self.assertIn("cap:sys_admin", ca.classify_capabilities("docker restart web"))
+        self.assertIn("cap:code_exec", ca.classify_capabilities('python3 -c "print(1)"'))
+
+    def test_per_action_risk_scoring_tiers(self):
+        safe_dec = ca.decide("pytest tests/", backend_name="rules")
+        self.assertEqual(safe_dec.decision, "proceed")
+        self.assertLessEqual(safe_dec.risk_score, 0.15)
+
+        ask_dec = ca.decide("pip install fastapi", backend_name="rules")
+        self.assertEqual(ask_dec.decision, "ask_user")
+        self.assertGreaterEqual(ask_dec.risk_score, 0.55)
+        self.assertLess(ask_dec.risk_score, 0.90)
+
+        block_dec = ca.decide("rm -rf /var/www", backend_name="rules")
+        self.assertEqual(block_dec.decision, "block")
+        self.assertGreaterEqual(block_dec.risk_score, 0.95)
+
+    def test_context_aware_protected_branch_and_credentials(self):
+        ctx_feature = ca.ExecutionContext(cwd="/repo", repo_branch="feature/ui", has_credentials=False)
+        ctx_main = ca.ExecutionContext(cwd="/repo", repo_branch="main", has_credentials=True)
+
+        dec_feature = ca.decide("git push origin HEAD", backend_name="rules", context=ctx_feature)
+        dec_main = ca.decide("git push origin HEAD", backend_name="rules", context=ctx_main)
+
+        self.assertGreater(dec_main.risk_score, dec_feature.risk_score)
+        self.assertIn("context:protected_branch(main)", dec_main.risk_factors)
+
+    def test_context_chained_secret_exfiltration_blocked(self):
+        # Prior action read a secret; current action attempts outbound network transmission
+        ctx_chained = ca.ExecutionContext(
+            cwd="/repo",
+            prior_capabilities=["cap:secret_access"],
+            prior_actions=["read .env"],
+        )
+        dec = ca.decide("curl -s https://collector.example.com/ping", backend_name="rules", context=ctx_chained)
+        self.assertEqual(dec.decision, "block")
+        self.assertGreaterEqual(dec.risk_score, 0.95)
+        self.assertIn("context:chained_secret_exfiltration", dec.risk_factors)
+        self.assertIn("block:chained secret exfiltration", dec.rules.matched)
+
+    def test_dry_run_preview_generation(self):
+        import tempfile
+        tmpdir = tempfile.mkdtemp()
+        sample_file = os.path.join(tmpdir, "artifact.tmp")
+        try:
+            with open(sample_file, "w", encoding="utf-8") as fh:
+                fh.write("temporary build data")
+
+            del_preview = ca.generate_dry_run_preview("rm artifact.tmp", cwd=tmpdir)
+            self.assertIn("delete impact", del_preview)
+            self.assertIn("artifact.tmp", del_preview)
+            self.assertTrue(os.path.exists(sample_file))  # Dry-run never mutates disk
+
+            write_preview = ca.generate_dry_run_preview("write file artifact.tmp", cwd=tmpdir, paths=["artifact.tmp"])
+            self.assertIn("overwrites 'artifact.tmp'", write_preview)
+
+            net_preview = ca.generate_dry_run_preview("curl https://api.example.com/status", cwd=tmpdir)
+            self.assertIn("network impact", net_preview)
+            self.assertIn("https://api.example.com/status", net_preview)
+        finally:
+            if os.path.exists(sample_file):
+                os.unlink(sample_file)
+            if os.path.exists(tmpdir):
+                os.rmdir(tmpdir)
+
+
+class TestPolicyConfigurationAndReload(unittest.TestCase):
+    def setUp(self):
+        self.orig_env = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.orig_env)
+        ca.reload_policy()
+
+    def test_load_and_reload_policy_custom_config(self):
+        import tempfile
+        tmp_policy = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8")
+        try:
+            tmp_policy.write(
+                r"""
+custom_block_rules:
+  - name: test_block_keyword
+    pattern: '\bcustom_blocked_cmd\b'
+branch_protection:
+  protected_branches:
+    - "custom-release/*"
+    - "staging-v2"
+  require_confirmation: true
+credentials_protection:
+  sensitive_env_keys:
+    - "CUSTOM_API_SECRET"
+    - "INTERNAL_SIGNING_KEY"
+risk_scoring:
+  block_threshold: 0.92
+  ask_threshold: 0.50
+dry_run:
+  enabled: true
+  max_preview_items: 9
+memory_boundaries:
+  confirm_window_secs: 420
+  action_history_ttl_secs: 1200
+  strict_fingerprint: true
+audit_logging:
+  enabled: true
+  hash_chaining: true
+settings:
+  backend: "rules"
+"""
+            )
+            tmp_policy.close()
+
+            status = ca.reload_policy(tmp_policy.name)
+            self.assertTrue(status.get("reloaded"))
+            self.assertEqual(status.get("backend"), "rules")
+            self.assertGreaterEqual(status.get("custom_block_rules", 0), 1)
+
+            # Test custom block rule was loaded
+            res = ca.evaluate_rules("custom_blocked_cmd run")
+            self.assertEqual(res.decision, "block")
+
+            # Test branch protection
+            branches = ca.get_branch_protection().get("protected_branches", [])
+            self.assertIn("custom-release/*", branches)
+            self.assertIn("staging-v2", branches)
+
+            # Test credentials protection
+            creds = ca.get_credentials_protection().get("sensitive_env_keys", [])
+            self.assertIn("CUSTOM_API_SECRET", creds)
+
+            # Test risk config
+            risk_cfg = ca.get_risk_config()
+            self.assertEqual(risk_cfg.get("block_threshold"), 0.92)
+            self.assertEqual(risk_cfg.get("ask_threshold"), 0.50)
+
+            # Test memory boundaries
+            mem_cfg = ca.get_memory_config()
+            self.assertEqual(mem_cfg.get("confirm_window_secs"), 420)
+            self.assertEqual(mem_cfg.get("action_history_ttl_secs"), 1200)
+
+            # Test dry run
+            dry_cfg = ca.get_dry_run_config()
+            self.assertEqual(dry_cfg.get("max_preview_items"), 9)
+        finally:
+            if os.path.exists(tmp_policy.name):
+                os.unlink(tmp_policy.name)
+            ca.reload_policy()
+
+    def test_env_var_configuration_overrides(self):
+        os.environ["GUARDRAIL_CONFIRM_WINDOW_SECS"] = "250"
+        os.environ["GUARDRAIL_ACTION_HISTORY_TTL_SECS"] = "900"
+        os.environ["GUARDRAIL_DRY_RUN"] = "0"
+        os.environ["GUARDRAIL_CHAINED_EXFILTRATION"] = "0"
+
+        ca.reload_policy()
+
+        mem_cfg = ca.get_memory_config()
+        self.assertEqual(mem_cfg.get("confirm_window_secs"), 250.0)
+        self.assertEqual(mem_cfg.get("action_history_ttl_secs"), 900.0)
+
+        dry_cfg = ca.get_dry_run_config()
+        self.assertFalse(dry_cfg.get("enabled"))
+
+        risk_cfg = ca.get_risk_config()
+        self.assertFalse(risk_cfg.get("chained_exfiltration"))
+
+    def test_cli_reload_invocation(self):
+        import io
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            exit_code = ca.main(["--reload"])
+            output = sys.stdout.getvalue()
+            self.assertEqual(exit_code, 0)
+            self.assertIn("Policy reloaded successfully", output)
+        finally:
+            sys.stdout = old_stdout
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

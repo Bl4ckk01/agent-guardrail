@@ -59,3 +59,30 @@ In chat with any supported agent, users can manage the guardrail using:
 - `/guardrail off`: Temporarily disable monitoring for administrative maintenance.
 - `/guardrail stop`: Stop background daemons managed by the guardrail.
 - `/guardrail status`: View active status and live daemon connectivity.
+
+---
+
+## 4. Native Model Context Protocol (MCP) Integration
+
+Any MCP-compliant client (Claude Desktop, Cursor, Antigravity, Zed, VS Code) can mount Agent Guardrail directly:
+
+### Server Command
+```bash
+python mcp_server.py
+# or
+python check_action.py --mcp
+```
+
+### Export Configuration Snippets
+```bash
+python mcp_server.py --export-config
+```
+
+### Exposed MCP Tools & Resources
+- **Tool `check_action`**: Verify any command or natural language intent.
+- **Tool `check_batch_actions`**: Evaluate multiple commands in batch and return overall verdict.
+- **Tool `get_guardrail_status`**: Inspect active backend, daemons, and rule count.
+- **Tool `reload_policy`**: Reload `policy.yaml` dynamically without server restart.
+- **Resources**: `guardrail://policy`, `guardrail://status`, `guardrail://rules`.
+- **Prompts**: `guardrail-pre-execution-check`, `guardrail-safety-guidelines`.
+

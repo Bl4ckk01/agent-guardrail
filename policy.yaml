@@ -9,45 +9,45 @@
 
 # --- 1. CUSTOM COMMAND BLOCK RULES ---
 custom_block_rules:
-  - name: "terraform destroy"
-    pattern: '\bterraform\s+destroy\b'
-  - name: "pulumi destroy"
-    pattern: '\bpulumi\s+destroy\b'
-  - name: "aws s3 bucket deletion"
-    pattern: '\baws\s+s3\s+rb\b.*--force'
-  - name: "cloud infrastructure deletion"
+  - name: "terraform destroy"                   # Identifier shown in logs and explanation
+    pattern: '\bterraform\s+destroy\b'          # Regex matching destructive infrastructure teardown
+  - name: "pulumi destroy"                      # Pulumi stack destruction
+    pattern: '\bpulumi\s+destroy\b'             # Regex matching pulumi destroy
+  - name: "aws s3 bucket deletion"              # Forceful cloud bucket deletion
+    pattern: '\baws\s+s3\s+rb\b.*--force'       # Regex matching aws s3 rb --force
+  - name: "cloud infrastructure deletion"       # Cluster or VM instance termination
     pattern: '\b(?:destroy|nuke|delete|erase|terminate)\b.{0,30}?\b(?:cluster|k8s|kubernetes|vps|server|ec2\s+instance)\b'
-  - name: "production database stop"
+  - name: "production database stop"            # Stopping production database services
     pattern: '\b(?:systemctl|service)\s+(?:stop|kill)\s+(?:postgresql|mysql|mongod|redis)\b'
 
 # --- 2. CUSTOM COMMAND ASK RULES (CONFIRMATION REQUIRED) ---
 custom_ask_rules:
-  - name: "docker run/exec/compose"
-    pattern: '\bdocker\s+(?:run|exec|compose)\b'
-  - name: "kubectl apply/delete/patch"
+  - name: "docker run/exec/compose"             # Starting containers or composing stacks
+    pattern: '\bdocker\s+(?:run|exec|compose)\b' # Requires human confirmation
+  - name: "kubectl apply/delete/patch"          # Mutating Kubernetes clusters
     pattern: '\bkubectl\s+(?:apply|delete|patch|replace|scale)\b'
-  - name: "export environment variable"
+  - name: "export environment variable"         # Modifying shell environment variables
     pattern: '\b(?:export\s+[A-Za-z0-9_]+=|\$env:[A-Za-z0-9_]+\s*=|set\s+[A-Za-z0-9_]+=)'
-  - name: "global package installation"
+  - name: "global package installation"         # Installing packages at the system level
     pattern: '\b(?:npm\s+i\s+-g|pip\s+install\s+--user|cargo\s+install)\b'
-  - name: "network/firewall config change"
+  - name: "network/firewall config change"      # Mutating local firewall rules or routing
     pattern: '\b(?:ufw\s+(?:enable|disable|allow|deny|delete|route|default)|iptables\s+(?:-[ADIRPF]|--append|--delete|--insert|--replace|--policy|--flush)|firewall-cmd\s+--(?:add|remove|set)|netsh\s+advfirewall\s+set)\b'
 
 # --- 3. CUSTOM COMMAND PROCEED RULES (WHITELIST) ---
 custom_proceed_rules:
-  - name: "firewall read-only"
+  - name: "firewall read-only"                  # Querying firewall status without changes
     pattern: '\b(?:iptables\s+(?:-[LS]|--list|--list-rules)|ufw\s+status|firewall-cmd\s+--(?:state|list))\b'
-  - name: "docker read-only"
+  - name: "docker read-only"                    # Listing and inspecting containers/images
     pattern: '\bdocker\s+(?:ps|images|logs|inspect|version)\b'
-  - name: "kubectl read-only"
+  - name: "kubectl read-only"                   # Querying Kubernetes resources safely
     pattern: '\bkubectl\s+(?:get|describe|logs|cluster-info)\b'
-  - name: "cargo check/test"
+  - name: "cargo check/test"                    # Rust compilation check and test suite
     pattern: '\bcargo\s+(?:check|test|clippy|fmt)\b'
-  - name: "npm audit/outdated"
+  - name: "npm audit/outdated"                  # Node vulnerability audit and outdated check
     pattern: '\bnpm\s+(?:audit|outdated|list)\b'
-  - name: "pip list/show"
+  - name: "pip list/show"                       # Python installed packages inspection
     pattern: '\bpip3?\s+(?:list|show|check)\b'
-  - name: "terraform plan/validate"
+  - name: "terraform plan/validate"             # Dry-run infrastructure validation
     pattern: '\bterraform\s+(?:plan|validate|fmt)\b'
 
 # --- 4. PROTECTED PATH & DIRECTORY RULES ---
@@ -85,7 +85,129 @@ path_rules:
     all_commands: true
 
 # ==============================================================================
-# 5. GLOBAL SETTINGS - BACKEND SELECTOR
+# 5. BRANCH PROTECTION RULES (Git Repository Context)
+# ==============================================================================
+# Prevent destructive git operations (force push, hard reset, rebase, deletion)
+# from silently modifying production or release branches.
+#
+# - protected_branches: list of branch names or wildcards (e.g. main, master, prod*, release/*)
+# - require_confirmation: when true, git mutations on these branches escalate to 'ask_user'
+# ==============================================================================
+branch_protection:
+  protected_branches:
+    - "main"                    # Primary production branch
+    - "master"                  # Legacy production branch
+    - "prod*"                   # Any branch starting with prod (e.g. production, prod-eu)
+    - "release/*"               # Release branches (e.g. release/v1.0.0)
+    - "staging"                 # Pre-production staging branch
+  require_confirmation: true    # Require human approval for git mutations on protected branches
+
+
+# ==============================================================================
+# 6. CREDENTIAL & SECRET EXPOSURE DETECTION (Context Awareness)
+# ==============================================================================
+# Detect sensitive environment variables and credential files in the workspace.
+# If credentials are exposed, outbound network commands or code executions escalate in risk.
+#
+# - sensitive_env_keys: list of environment variable names or wildcards to monitor (presence only)
+# - sensitive_files: list of filenames or glob patterns containing secrets (never read or logged)
+# ==============================================================================
+credentials_protection:
+  sensitive_env_keys:
+    - "AWS_SECRET_ACCESS_KEY"   # AWS secret credential
+    - "AWS_SESSION_TOKEN"       # AWS temporary session token
+    - "GITHUB_TOKEN"            # GitHub personal access or workflow token
+    - "GH_TOKEN"                # GitHub CLI token
+    - "OPENAI_API_KEY"          # OpenAI API secret key
+    - "ANTHROPIC_API_KEY"       # Anthropic API secret key
+    - "DATABASE_URL"            # Database connection string with credentials
+    - "STRIPE_SECRET_KEY"       # Stripe payment gateway secret key
+    - "PRIVATE_KEY"             # RSA/ECDSA/SSH private key environment variable
+    - "NPM_TOKEN"               # NPM publishing authentication token
+    - "PYPI_API_TOKEN"          # PyPI publishing authentication token
+    - "SLACK_BOT_TOKEN"         # Slack bot OAuth token
+  sensitive_files:
+    - ".env"                    # Standard dotenv file
+    - ".env.*"                  # Environment-specific dotenv files (.env.local, .env.production)
+    - "credentials.json"        # Cloud / Google / Service account credentials
+    - "secrets.yaml"            # Kubernetes or deployment secret manifest
+    - "secrets.yml"             # Kubernetes or deployment secret manifest
+    - "id_rsa"                  # SSH private key
+    - "id_rsa*"                 # SSH private keys
+    - "id_ed25519"              # Ed25519 SSH private key
+    - "*.pem"                   # X.509 certificates and private keys
+    - "*.key"                   # Generic cryptographic keys
+
+
+# ==============================================================================
+# 7. CAPABILITY RISK SCORING & THRESHOLDS
+# ==============================================================================
+# Fine-tune the deterministic risk scoring engine (0.00 to 1.00):
+# - weights: risk contribution per capability category
+# - block_threshold: score >= this threshold triggers immediate BLOCK
+# - ask_threshold: score >= this threshold triggers confirmation ASK_USER
+# - chained_exfiltration: detect multi-step secret read -> network exfiltration chains
+# ==============================================================================
+risk_scoring:
+  weights:
+    "cap:secret_access": 0.35   # Reading or touching credentials/keys (.env, id_rsa, secrets/)
+    "cap:fs_delete": 0.25       # Deleting files or directories (rm, del, wipefs, clean)
+    "cap:sys_admin": 0.20       # Privileged system administration (sudo, docker, systemctl)
+    "cap:net_outbound": 0.20    # Outbound network requests (curl, wget, ssh, sockets)
+    "cap:git_mutation": 0.18    # Git state modifications (git push, reset, checkout -f)
+    "cap:code_exec": 0.15       # Dynamic inline script execution (python -c, bash -c, eval)
+    "cap:pkg_install": 0.15     # Package installations (pip install, npm install)
+    "cap:fs_write": 0.10        # Writing or modifying files (write, patch, sed -i)
+    "cap:read_only": 0.00       # Safe inspections (git status, pytest, ls)
+  block_threshold: 0.85         # Actions scoring >= 0.85 are hard-blocked
+  ask_threshold: 0.45           # Actions scoring >= 0.45 require human confirmation
+  chained_exfiltration: true    # Automatically block outbound requests following secret reads
+
+
+# ==============================================================================
+# 8. NON-DESTRUCTIVE DRY-RUN IMPACT PREVIEWS
+# ==============================================================================
+# Generate pre-execution impact summaries before human confirmation:
+# - enabled: true to synthesize [Dry-Run Preview: ...] in confirmation prompts
+# - max_preview_items: maximum number of affected files/globs to list in preview
+# ==============================================================================
+dry_run:
+  enabled: true                 # Show file deletion/write/git impact previews before user confirms
+  max_preview_items: 5          # List up to 5 matching files and sizes in the confirmation dialog
+
+
+# ==============================================================================
+# 9. MEMORY BOUNDARIES & EPHEMERAL APPROVALS (NeuraKeep Architecture)
+# ==============================================================================
+# Prevent approved exceptions from becoming permanent authorization:
+# - confirm_window_secs: max seconds an approval remains valid before expiring
+# - action_history_ttl_secs: retention window for session capability correlation
+# - max_action_history: maximum recent actions tracked per session
+# - strict_fingerprint: bind approval to SHA-256 fingerprint of (cmd, tool, cwd)
+# ==============================================================================
+memory_boundaries:
+  confirm_window_secs: 600      # 10 minutes maximum approval confirmation validity
+  action_history_ttl_secs: 1800 # 30 minutes action history window for chained exfiltration
+  max_action_history: 20        # Keep last 20 actions per session for trajectory correlation
+  strict_fingerprint: true      # Enforce exact command + working directory match on retry
+
+
+# ==============================================================================
+# 10. TAMPER-EVIDENT APPEND-ONLY AUDIT LOG
+# ==============================================================================
+# Cryptographic SHA-256 hash-chained JSONL audit ledger:
+# - enabled: true to log every evaluation, prompt, and tool interception
+# - log_file: path to log file (empty defaults to ~/.guardrail/guardrail.log)
+# - hash_chaining: link each record to previous record's hash (tamper detection)
+# ==============================================================================
+audit_logging:
+  enabled: true                 # Enable append-only audit logging
+  log_file: ""                  # Custom log path (empty = ~/.guardrail/guardrail.log)
+  hash_chaining: true           # Enable cryptographic SHA-256 hash chaining
+
+
+# ==============================================================================
+# 11. GLOBAL SETTINGS - BACKEND SELECTOR
 # ==============================================================================
 # Choose which decision engine to use:
 #
@@ -120,7 +242,7 @@ settings:
   clm_block_alert_prob: 0.20
 
   # ==============================================================================
-  # 6. DAEMON AUTO-START & MODEL MANAGEMENT (/guardrail start)
+  # 12. DAEMON AUTO-START & MODEL MANAGEMENT (/guardrail start)
   # ==============================================================================
   # Choose whether to start local model servers manually or automatically:
   #   manual_start: true   -> You manage and launch servers manually in terminals (see README.md).
@@ -153,4 +275,5 @@ settings:
   d1_port: 8800                 # HTTP port for Liquid AI D1
   qwen_port: 8090               # HTTP port for Qwen embeddings
   clm_port: 8700                # HTTP port for clm-serve
+
 
