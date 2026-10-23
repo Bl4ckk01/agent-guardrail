@@ -80,6 +80,21 @@ def merge_json_hooks(target_path: Path, new_hooks_cfg: dict) -> None:
     target_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def sync_skill_copy(src: Path, target_dir: Path, skill_name: str) -> None:
+    """Copy root SKILL.md into target_dir, adjusting frontmatter name for alias directories."""
+    if not src.exists():
+        return
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dest = target_dir / "SKILL.md"
+    if skill_name == "guardrail":
+        shutil.copy2(src, dest)
+    else:
+        content = src.read_text(encoding="utf-8")
+        if content.startswith("---\nname: guardrail\n"):
+            content = content.replace("---\nname: guardrail\n", f"---\nname: {skill_name}\n", 1)
+        dest.write_text(content, encoding="utf-8")
+
+
 def install_shared(workspace: bool, is_global: bool) -> None:
     if workspace:
         # 1. Root SKILL.md
@@ -142,20 +157,12 @@ def install_claude(workspace: bool, is_global: bool) -> None:
         print("  ✔ .claude/settings.json configured with lifecycle hooks")
 
         for sname in ("agent-guardrail", "guardrail"):
-            sdir = HERE / ".claude" / "skills" / sname
-            sdir.mkdir(parents=True, exist_ok=True)
-            src = HERE / "SKILL.md"
-            if src.exists():
-                shutil.copy2(src, sdir / "SKILL.md")
+            sync_skill_copy(HERE / "SKILL.md", HERE / ".claude" / "skills" / sname, sname)
         print("  ✔ .claude/skills/ synchronized (/guardrail)")
 
     if is_global:
         for sname in ("agent-guardrail", "guardrail"):
-            gdir = HOME / ".claude" / "skills" / sname
-            gdir.mkdir(parents=True, exist_ok=True)
-            src = HERE / "SKILL.md"
-            if src.exists():
-                shutil.copy2(src, gdir / "SKILL.md")
+            sync_skill_copy(HERE / "SKILL.md", HOME / ".claude" / "skills" / sname, sname)
         print("  ✔ ~/.claude/skills/ configured globally")
 
 
@@ -193,11 +200,7 @@ def install_codex(workspace: bool, is_global: bool) -> None:
         print("  ✔ .codex/prompts/guardrail.md ready (/guardrail, $guardrail)")
 
         for sname in ("agent-guardrail", "guardrail"):
-            sdir = HERE / ".codex" / "skills" / sname
-            sdir.mkdir(parents=True, exist_ok=True)
-            src = HERE / "SKILL.md"
-            if src.exists():
-                shutil.copy2(src, sdir / "SKILL.md")
+            sync_skill_copy(HERE / "SKILL.md", HERE / ".codex" / "skills" / sname, sname)
         print("  ✔ .codex/skills/ synchronized")
 
     if is_global:
@@ -269,22 +272,14 @@ def install_antigravity(workspace: bool, is_global: bool) -> None:
 
         # 2. Antigravity Skills in .agents/skills/
         for sname in ("agent-guardrail", "guardrail"):
-            sdir = HERE / ".agents" / "skills" / sname
-            sdir.mkdir(parents=True, exist_ok=True)
-            src = HERE / "SKILL.md"
-            if src.exists():
-                shutil.copy2(src, sdir / "SKILL.md")
+            sync_skill_copy(HERE / "SKILL.md", HERE / ".agents" / "skills" / sname, sname)
         print("  ✔ .agents/skills/ synchronized (/guardrail)")
 
     if is_global:
         # Global Antigravity skills
         for target_root in (HOME / ".gemini" / "antigravity" / "skills", HOME / ".gemini" / "config" / "skills"):
             for sname in ("agent-guardrail", "guardrail"):
-                gdir = target_root / sname
-                gdir.mkdir(parents=True, exist_ok=True)
-                src = HERE / "SKILL.md"
-                if src.exists():
-                    shutil.copy2(src, gdir / "SKILL.md")
+                sync_skill_copy(HERE / "SKILL.md", target_root / sname, sname)
         print("  ✔ ~/.gemini/antigravity/skills/ configured globally")
 
 
@@ -303,7 +298,7 @@ def install_cursor(workspace: bool, is_global: bool) -> None:
                 "- PROHIBITED: rm -rf, git push -f, DROP TABLE, deleting .env or secrets.\n"
                 "- CONFIRMATION: Ask before modifying docker-compose, configs, or infrastructure.\n"
                 "- PROCEED: Safe read-only commands (ls, git status, pytest, ruff) proceed silently.\n"
-                "Verify uncertain commands via: `python check_action.py \"<command>\"`\n",
+                "Verify uncertain commands via: `python check_action.py \"<command>\" --json`\n",
                 encoding="utf-8",
             )
         print("  ✔ .cursor/rules/guardrail.mdc configured (alwaysApply: true)")
@@ -342,11 +337,7 @@ def install_grok(workspace: bool, is_global: bool) -> None:
     if workspace:
         # 1. Grok Skills in .grok/skills/
         for sname in ("agent-guardrail", "guardrail"):
-            sdir = HERE / ".grok" / "skills" / sname
-            sdir.mkdir(parents=True, exist_ok=True)
-            src = HERE / "SKILL.md"
-            if src.exists():
-                shutil.copy2(src, sdir / "SKILL.md")
+            sync_skill_copy(HERE / "SKILL.md", HERE / ".grok" / "skills" / sname, sname)
         print("  ✔ .grok/skills/ synchronized (/guardrail)")
 
         # 2. AGENTS.md verified for Grok
@@ -355,11 +346,7 @@ def install_grok(workspace: bool, is_global: bool) -> None:
 
     if is_global:
         for sname in ("agent-guardrail", "guardrail"):
-            gdir = HOME / ".grok" / "skills" / sname
-            gdir.mkdir(parents=True, exist_ok=True)
-            src = HERE / "SKILL.md"
-            if src.exists():
-                shutil.copy2(src, gdir / "SKILL.md")
+            sync_skill_copy(HERE / "SKILL.md", HOME / ".grok" / "skills" / sname, sname)
         print("  ✔ ~/.grok/skills/ configured globally")
 
 
@@ -377,6 +364,22 @@ def run_checks() -> None:
         print("  ✔ Liquid AI D1 server online at http://localhost:8800 (port 8800)")
     else:
         print("  ℹ️ Liquid AI D1 server offline at http://localhost:8800 (start via /guardrail start)")
+
+    # Skill synchronization check
+    root_skill = HERE / "SKILL.md"
+    if root_skill.exists():
+        root_bytes = root_skill.read_bytes()
+        skill_targets = [
+            HERE / ".claude" / "skills" / "guardrail" / "SKILL.md",
+            HERE / ".codex" / "skills" / "guardrail" / "SKILL.md",
+            HERE / ".agents" / "skills" / "guardrail" / "SKILL.md",
+            HERE / ".grok" / "skills" / "guardrail" / "SKILL.md",
+        ]
+        synced = sum(1 for p in skill_targets if p.exists() and p.read_bytes() == root_bytes)
+        if synced == len(skill_targets):
+            print(f"  ✔ Skill files synchronized ({synced}/{len(skill_targets)} platform copies match root SKILL.md)")
+        else:
+            print(f"  ⚠️ Skill drift detected ({synced}/{len(skill_targets)} copies match root SKILL.md; run `python install.py` to sync)")
 
     # Multi-agent simulation tests
     try:

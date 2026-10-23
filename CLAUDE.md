@@ -19,6 +19,7 @@ python install.py --cursor
 python install.py --antigravity
 python install.py --codex
 python install.py --grok
+python install.py --mcp
 
 # Global installation into home directories (~/)
 python install.py --global
@@ -28,10 +29,10 @@ python install.py --global
 
 ## 2. How to Use: `/guardrail` Command
 
-Never execute manual Python verification scripts (`python check_action.py "..."`) before commands.
+When native lifecycle hooks are active (Claude Code, Codex, Antigravity), do not execute manual Python verification scripts before routine commands.
 
 Users activate protection simply by typing:
-```
+```text
 /guardrail
 ```
 *(or `/guardrail on`, or `$guardrail` on Codex).*
@@ -40,7 +41,7 @@ Once activated:
 1. Lifecycle hooks (`UserPromptSubmit`, `PreToolUse`) intercept every user request and tool call (`Bash`, `PowerShell`, `Write`, `Edit`, `write_to_file`, `replace_file_content`).
 2. Safe read-only actions (`ls`, `git status`, test runners) pass silently with zero delay.
 3. Sensitive actions (`ask_user`) prompt for human approval (native interactive dialog on Claude Code and Antigravity, confirmation in chat on Codex, Cursor, Grok).
-4. Prohibited actions (`block`) are halted immediately.
+4. Prohibited actions (`block`) are halted immediately. Never attempt to bypass a block by rephrasing, splitting, or obfuscating the command.
 
 ---
 
@@ -50,15 +51,19 @@ Once activated:
 - `/guardrail start`: Launch background daemon and enable protection.
 - `/guardrail off`: Temporarily disable protection for manual maintenance.
 - `/guardrail stop`: Stop background daemon and disable protection.
-- `/guardrail status`: View active status and backend configuration.
+- `/guardrail status`: View active status, configured backend, and daemon health.
+- `/guardrail reload`: Dynamically reload `policy.yaml` rules without restarting the session.
+- `/guardrail check <cmd>`: Dry-run evaluate `<cmd>` (verdict, risk score, preview) without running it.
+- `/guardrail why`: Explain the most recent blocked or confirmation-required action from the audit log.
+- `/guardrail doctor`: Run unified diagnostics (policy, audit hash chain, skill sync, daemons).
 
 ---
 
 ## 4. Unit Tests
 
-Run the test suites:
+Run the test suites (135 tests total):
 ```bash
-python -m unittest test_check_action -v
-python -m unittest test_guardrail_hook -v
+python -B tests/test_check_action.py
+python -B tests/test_guardrail_hook.py
+python -B tests/test_mcp_server.py
 ```
-

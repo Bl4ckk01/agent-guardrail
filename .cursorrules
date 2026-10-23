@@ -3,14 +3,14 @@
 
 You must strictly adhere to the safety guardrail defined in policy.yaml:
 
-1. BLOCK (Refuse immediately):
+1. BLOCK (Refuse immediately — never retry by rephrasing, splitting, or encoding):
    - Never run recursive file deletions (rm -rf, rmdir /s, Remove-Item -Recurse -Force).
-   - Never force-push or delete branches on remote git repositories (git push -f, git push --force).
+   - Never force-push or delete branches on remote git repositories (git push -f, git push --force, git reset --hard).
    - Never execute SQL drops/truncations (DROP TABLE, TRUNCATE, DELETE without WHERE).
-   - Never print, export, or commit secrets (.env, API keys, private keys, certificates).
-   - Never run disk formatting or kernel-level mutations (mkfs, format, dd to raw devices).
+   - Never print, export, exfiltrate, or commit secrets (.env, API keys, private keys, certificates).
+   - Never modify or disable guardrail control files (policy.yaml, check_action.py, guardrail_hook.py, mcp_server.py, .cursorrules).
 
-2. ASK USER (Request human confirmation before running):
+2. ASK USER (Request explicit human confirmation in the current turn before running):
    - Modifications to .env, docker-compose.yml, Dockerfile, or production configs.
    - Container executions: docker run, docker exec, docker compose up/down.
    - Kubernetes / Cloud mutations: kubectl apply/delete, terraform apply.
@@ -21,4 +21,5 @@ You must strictly adhere to the safety guardrail defined in policy.yaml:
    - Test suites and linters: pytest, npm test, cargo test, ruff, eslint, mypy.
    - Routine code edits within the workspace.
 
-Verify any uncertain command via: python check_action.py "<command>"
+Before executing any non-read-only command, verify it via the `agent-guardrail` MCP `check_action` tool or run:
+python check_action.py "<command>" --json

@@ -36,16 +36,21 @@ Routine safe developer workflows proceed with zero friction:
 
 ## 2. Programmatic Verification
 
-Agents can programmatically verify whether an action is permitted under the active policy by executing:
+In hookless environments (such as Cursor or Grok Build), agents MUST verify non-read-only commands before executing them via the `agent-guardrail` MCP `check_action` tool or by running:
 ```bash
-python check_action.py "<command or natural language intent>"
+python check_action.py "<command or natural language intent>" --json
 ```
 The output JSON returns:
 ```json
 {
   "decision": "proceed | ask_user | block",
   "backend": "rules | d1 | clm | jev",
-  "matched_rules": [...]
+  "risk_score": 0.0,
+  "reason": "...",
+  "matched_rules": [...],
+  "risk_factors": [...],
+  "capabilities": [...],
+  "dry_run_preview": "..."
 }
 ```
 
@@ -60,6 +65,9 @@ In chat with any supported agent, users can manage the guardrail using:
 - `/guardrail stop`: Stop background daemons managed by the guardrail.
 - `/guardrail status`: View active status and live daemon connectivity.
 - `/guardrail reload`: Reload `policy.yaml` configuration dynamically without restart.
+- `/guardrail check <cmd>`: Dry-run evaluate a command without executing it.
+- `/guardrail why`: Explain the last blocked or confirmation-required action from the audit log.
+- `/guardrail doctor`: Run unified diagnostics across policy, audit log hash chain, skills, and daemons.
 
 ---
 

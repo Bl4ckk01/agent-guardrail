@@ -15,15 +15,15 @@ You must **NEVER** execute or propose any of the following destructive actions:
 - **Force Git Mutations**: `git push --force`, `git push -f`, deleting remote branches (`git push :main`, `git push --delete`), or hard resets (`git reset --hard`).
 - **Database Destruction**: `DROP TABLE`, `DROP DATABASE`, `TRUNCATE TABLE`, unbounded `DELETE FROM` or `UPDATE` without a `WHERE` clause.
 - **Disk / System Destruction**: `format`, `mkfs`, `diskpart`, `dd if=... of=/dev/...`, `chmod 777`, `:(){ :|:& };:`.
-- **Secret Leaks / Exposure**: Printing, publishing, committing, or exporting `.env` files, API keys, private keys (`id_rsa`, `.pem`, `master.key`), tokens, or credentials.
-- **Security Bypasses**: Disabling firewall, antivirus, defender, or guardrail controls.
+- **Secret Leaks / Exposure**: Printing, publishing, committing, or exporting `.env` files, API keys, private keys (`id_rsa`, `.pem`, `master.key`), tokens, or credentials, or sending them over outbound network requests after reading.
+- **Control-Plane Tampering**: Modifying, deleting, or disabling `policy.yaml`, `check_action.py`, `guardrail_hook.py`, `mcp_server.py`, or `.cursor/rules/guardrail.mdc`.
 
-If requested to perform any of these, immediately refuse and explain the policy violation.
+If requested to perform any of these, immediately refuse, explain the policy violation, and **never** retry by rephrasing, splitting, or obfuscating the command.
 
 ## 2. ⚠️ SENSITIVE ACTIONS (Ask Confirmation First)
-Before performing any of the following, pause and ask the user for explicit confirmation in chat:
+Before performing any of the following, pause, show the exact command and expected impact, and ask the user for explicit confirmation in chat:
 - Modifying configuration files: `.env`, `docker-compose.yml`, `Dockerfile`, `requirements.txt`, `package.json`.
-- Running container commands: `docker run`, `docker exec`, `docker-compose up/down`.
+- Running container commands: `docker run`, `docker exec`, `docker compose up/down`.
 - Modifying infrastructure / cloud: `kubectl apply/delete`, `terraform apply`, `aws` modifications.
 - Installing global packages: `npm i -g`, `pip install --user`.
 - Modifying system services or firewall rules: `systemctl`, `ufw`, `iptables`.
@@ -33,14 +33,13 @@ Routine read-only and standard developer actions proceed without delay:
 - Inspecting files: `cat`, `head`, `tail`, `grep`, `find`, `ls`, `dir`.
 - Version control read-only: `git status`, `git diff`, `git log`, `git show`, `git branch`.
 - Test runners and linters: `pytest`, `npm test`, `cargo test`, `ruff check`, `mypy`, `eslint`.
-- Safe file edits, refactorings, adding unit tests, fixing typos.
+- Safe file edits, refactorings, adding unit tests, fixing typos within the project workspace.
 
-## 🔍 Validation via Guardrail Engine
-To programmatically check if a specific command or action is permitted under the current policy, you can run:
-```bash
-python check_action.py "<command-or-description>"
-```
-Or check the live daemon status with:
-```bash
-python daemon_manager.py --status
-```
+## 🔍 Pre-Execution Verification (MCP or CLI)
+Because Cursor does not attach shell lifecycle hooks automatically, verify any non-read-only command before running it:
+- **Via MCP (Preferred)**: Call the `check_action` tool on the `agent-guardrail` MCP server.
+- **Via CLI**:
+  ```bash
+  python check_action.py "<command-or-description>" --json
+  ```
+- **Diagnostics**: Run `python check_action.py --why` to inspect the last blocked action or `python check_action.py --doctor` for a full health report.

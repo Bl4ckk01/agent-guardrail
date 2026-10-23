@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="tests/"><img src="https://img.shields.io/badge/tests-135%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/tests-141%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-~37.4ms%20(neural)-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
@@ -439,6 +439,9 @@ From that point forward:
 | `/guardrail start` | Automatically launches background daemons for D1 or CLM |
 | `/guardrail stop` | Stops background daemons managed by the guardrail |
 | `/guardrail reload` | Dynamically reloads `policy.yaml` configuration without restarting the session |
+| `/guardrail check <cmd>` | Dry-run evaluates a command in chat without executing it |
+| `/guardrail why` | Explains the most recent blocked or confirmation-required action from the audit log |
+| `/guardrail doctor` | Runs a unified health check (policy, SHA-256 audit log chain, skill sync, daemons) |
 
 ---
 
@@ -453,14 +456,18 @@ python check_action.py "git status && pytest"
 # Destructive command -> returns 'block' (instant zero-tolerance shield)
 python check_action.py "rm -rf build/ && rm -rf node_modules"
 
+# Machine-readable JSON output (decision, risk_score, matched_rules, capabilities, dry_run_preview):
+python check_action.py "docker run -d -p 80:80 nginx" --json
+
 # Test specific backend with full explanation:
 python check_action.py "npm install lodash" --backend d1 --explain
 
-# Ambiguous command requiring confirmation:
-python check_action.py "docker run -d -p 80:80 nginx" --backend clm --explain
+# Safely whitelist a routine project command in policy.yaml (terminal user only):
+python check_action.py --allow '\bmy_custom_build_tool\s+--check\b' --name "custom build check"
 
-# Pure deterministic regex test (zero models required):
-python check_action.py "DROP DATABASE production_users;" --backend rules
+# Inspect last intercepted action or run full health diagnostics:
+python check_action.py --why
+python check_action.py --doctor
 
 # Launch native Model Context Protocol (MCP) JSON-RPC 2.0 server:
 python check_action.py --mcp
@@ -1186,19 +1193,19 @@ We believe in complete transparency regarding security boundaries:
 
 ## 💻 Development & Testing
 
-Contributions are warmly welcome! The codebase includes **135 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, and protocol handlers:
+Contributions are warmly welcome! The codebase includes **141 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, skill synchronization, and protocol handlers:
 
 ```bash
-# 1. Run engine & risk-scoring tests (70 tests: rules, unwrapping, GTFOBins, context, dry-run, risk score):
+# 1. Run engine & risk-scoring tests (72 tests: rules, unwrapping, GTFOBins, context, dry-run, risk score, JSON, custom allow):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook & replay tests (44 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain):
+# 2. Run lifecycle hook & replay tests (48 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, check/why/doctor, skill sync):
 python tests/test_guardrail_hook.py
 
 # 3. Run MCP server protocol tests (21 tests):
 python tests/test_mcp_server.py
 
-# 4. Run all 135 tests via unittest:
+# 4. Run all 141 tests via unittest:
 python -m unittest discover -s tests -p "test_*.py"
 ```
 

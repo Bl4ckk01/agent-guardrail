@@ -285,8 +285,8 @@ def verify_audit_log(log_path: Path | None = None) -> tuple[bool, str, int]:
 # --- Commands & Prompts ---
 
 _EXPLICIT_CMD_RE = re.compile(
-    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?",
-    re.IGNORECASE,
+    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload|why|doctor|check)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?(?:\s+(?P<rest>.*))?$",
+    re.IGNORECASE | re.DOTALL,
 )
 _PLAIN_CMD_RE = re.compile(
     r"^\s*(?:agent[-_])?guardrail(?:\s+(?P<arg>\S+))?\s*$",
@@ -299,6 +299,9 @@ _ARG_MAP = {
     "stop": "stop",
     "status": "status", "info": "status",
     "reload": "reload", "r": "reload",
+    "why": "why",
+    "doctor": "doctor", "health": "doctor",
+    "check": "check", "test": "check",
 }
 _CONFIRM_RE = re.compile(
     r"\b(?:yes|y|ok|okay|confirm|confirmed|approve|approved|proceed|go|continue|done)\b",
@@ -319,29 +322,157 @@ def is_confirmation(prompt: str) -> bool:
     return bool(_CONFIRM_RE.search(text))
 
 
-def parse_command(prompt: str) -> str | None:
+def parse_command_with_arg(prompt: str) -> tuple[str | None, str]:
     text = (prompt or "").strip()
     if not text:
-        return None
+        return None, ""
     m = _EXPLICIT_CMD_RE.match(text)
     if m:
         marker = (m.group("marker") or "").lower()
+        arg = (m.group("arg") or "").strip()
+        rest = (m.group("rest") or "").strip()
         if marker:
-            return _ARG_MAP.get(marker, "on")
-        arg = (m.group("arg") or "").lower()
-        return _ARG_MAP.get(arg, "on")
+            cmd = _ARG_MAP.get(marker, "on")
+            payload = f"{arg} {rest}".strip() if arg else rest
+            return cmd, payload
+        cmd = _ARG_MAP.get(arg.lower(), "on")
+        return cmd, rest
     m2 = _PLAIN_CMD_RE.match(text)
     if m2:
         arg = (m2.group("arg") or "").lower()
-        return _ARG_MAP.get(arg, "on")
-    return None
+        return _ARG_MAP.get(arg, "on"), ""
+    return None, ""
+
+
+def parse_command(prompt: str) -> str | None:
+    cmd, _ = parse_command_with_arg(prompt)
+    return cmd
 
 
 def status_text(active: bool) -> str:
-    backend = os.environ.get("GUARDRAIL_BACKEND", "clm")
+    backend = os.environ.get("GUARDRAIL_BACKEND")
+    if not backend:
+        try:
+            import check_action as ca
+            if not ca._POLICY_LOADED:
+                ca.load_policy()
+            backend = str(ca._POLICY_SETTINGS.get("backend", "rules"))
+        except Exception:
+            backend = "rules"
     if active:
         return f"{ICON} Agent Guardrail ACTIVE (backend: {backend}). Every shell command, file modification, and tool execution is evaluated before running."
     return f"{ICON} Agent Guardrail DISABLED for this session."
+
+
+def format_check_report(action_text: str) -> str:
+    """Evaluate a command or action in dry-run mode without executing it."""
+    import check_action as ca
+    text = (action_text or "").strip()
+    if not text:
+        return f"{ICON} Usage: `/guardrail check <command>` (e.g., `/guardrail check rm -rf build/`)"
+    ctx = ca.ExecutionContext(cwd=os.getcwd())
+    res = ca.decide(text, context=ctx)
+    matched = ", ".join(res.rules.matched) if res.rules.matched else "none"
+    caps = ", ".join(res.capabilities) if res.capabilities else "none"
+    lines = [
+        f"{ICON} Agent Guardrail Dry-Run Check:",
+        f"  • Command / Intent: `{text}`",
+        f"  • Verdict: **{res.decision.upper()}** (risk score: `{res.risk_score:.2f}`, backend: `{res.backend}`)",
+        f"  • Matched Rules: {matched}",
+        f"  • Capabilities: {caps}",
+    ]
+    if res.dry_run_preview:
+        lines.append(f"  • Dry-Run Preview: {res.dry_run_preview}")
+    return "\n".join(lines)
+
+
+def format_why_report(log_path: Path | None = None) -> str:
+    """Inspect the most recent blocked or confirmation-required entry in the audit log."""
+    target = log_path or LOG_PATH
+    if not target.is_file():
+        return f"{ICON} No audit log found at {target} (no actions intercepted yet)."
+    last_entry = None
+    try:
+        with target.open("r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("decision") in ("block", "ask_user") or obj.get("event") in (
+                    "self_tamper", "chained_exfil", "approval_expired", "approval_mismatch"
+                ):
+                    last_entry = obj
+    except OSError as exc:
+        return f"{ICON} Could not read audit log: {exc}"
+
+    if not last_entry:
+        return f"{ICON} No blocked or confirmation-required actions recorded in the audit log yet."
+
+    dec = str(last_entry.get("decision") or last_entry.get("event") or "intercepted").upper()
+    cmd_text = last_entry.get("cmd") or last_entry.get("text") or "(unknown)"
+    why_text = last_entry.get("why") or last_entry.get("reason") or "policy match"
+    risk = last_entry.get("risk_score")
+    risk_str = f"{risk:.2f}" if isinstance(risk, (int, float)) else "N/A"
+    ts = last_entry.get("ts") or "unknown time"
+
+    lines = [
+        f"{ICON} Last Intercepted Action (`{ts}`):",
+        f"  • Verdict: **{dec}** (risk score: `{risk_str}`)",
+        f"  • Action / Command: `{cmd_text}`",
+        f"  • Triggered Rule / Reason: `{why_text}`",
+    ]
+    if last_entry.get("dry_run_preview"):
+        lines.append(f"  • Dry-Run Preview: {last_entry['dry_run_preview']}")
+    if dec == "ASK_USER":
+        lines.append(
+            "  • How to proceed: Reply `confirm` or `yes` in chat (or approve the native IDE dialog) to authorize this single execution."
+        )
+    else:
+        lines.append(
+            "  • How to proceed: If this is a safe command for your workflow, add a narrow pattern under `custom_proceed_rules` in `policy.yaml` (or run `python check_action.py --allow \"<regex>\"` in your terminal) and run `/guardrail reload`."
+        )
+    return "\n".join(lines)
+
+
+def format_doctor_report(log_path: Path | None = None) -> str:
+    """Generate a unified health & diagnostic report for policy, audit log, skills, and daemons."""
+    import check_action as ca
+    info = ca.reload_policy()
+    loaded_path = ca.get_loaded_policy_path() or "policy.yaml (defaults)"
+    ok_log, log_msg, _ = verify_audit_log(log_path)
+
+    root_dir = Path(__file__).resolve().parent
+    root_skill = root_dir / "SKILL.md"
+    skill_Targets = [
+        root_dir / ".claude" / "skills" / "guardrail" / "SKILL.md",
+        root_dir / ".codex" / "skills" / "guardrail" / "SKILL.md",
+        root_dir / ".agents" / "skills" / "guardrail" / "SKILL.md",
+        root_dir / ".grok" / "skills" / "guardrail" / "SKILL.md",
+    ]
+    synced = 0
+    if root_skill.is_file():
+        root_bytes = root_skill.read_bytes()
+        for t in skill_Targets:
+            if t.is_file() and t.read_bytes() == root_bytes:
+                synced += 1
+
+    lines = [
+        f"{ICON} Agent Guardrail Doctor — Unified Health Report:",
+        f"  • Policy File: `{loaded_path}` (active backend: `{info['backend']}`)",
+        f"  • Loaded Rules: {info['custom_block_rules']} custom block, {info['custom_ask_rules']} custom ask, {info['custom_proceed_rules']} custom proceed, {info['path_rules']} path rules, {info['protected_branches']} protected branches",
+        f"  • Audit Log Integrity: {'✔ ' if ok_log else '❌ '}{log_msg}",
+        f"  • Workspace Skills Synced: {synced}/{len(skill_Targets)} platforms synchronized with root `SKILL.md`",
+    ]
+    try:
+        import daemon_manager
+        lines.append("\n" + daemon_manager.format_status_report())
+    except Exception:
+        pass
+    return "\n".join(lines)
 
 
 # --- Tool Inspection ---
@@ -455,8 +586,8 @@ def _patch_actions(patch: str) -> list[str]:
 
 _GUARDRAIL_CONTROL_FILES = (
     "policy.yaml", "policy.yml", "check_action.py", "guardrail_hook.py",
-    "daemon_manager.py", "install.py", ".guardrail", ".claude/settings.json",
-    ".codex/hooks.json", ".agents/hooks.json", ".cursorrules",
+    "daemon_manager.py", "install.py", "mcp_server.py", ".guardrail", ".claude/settings.json",
+    ".codex/hooks.json", ".agents/hooks.json", ".cursorrules", ".cursor/rules/guardrail.mdc",
 )
 
 
@@ -598,7 +729,7 @@ def on_prompt_submit(event: dict, host: str, state: State):
     sid = str(event.get("session_id") or "")
     prompt = str(event.get("prompt") or "")
     turn = event.get("turn_id")
-    cmd = parse_command(prompt)
+    cmd, cmd_arg = parse_command_with_arg(prompt)
 
     if cmd is not None:
         daemon_msg = ""
@@ -633,8 +764,14 @@ def on_prompt_submit(event: dict, host: str, state: State):
                 f"  • Protected branches: {reload_info.get('protected_branches', 0)}\n"
                 f"  • Dry-run preview: {'enabled' if reload_info.get('dry_run_enabled') else 'disabled'}"
             )
+        elif cmd == "check":
+            daemon_msg = format_check_report(cmd_arg)
+        elif cmd == "why":
+            daemon_msg = format_why_report()
+        elif cmd == "doctor":
+            daemon_msg = format_doctor_report()
 
-        active = is_active(state, sid, host) if cmd in ("status", "reload") else (cmd in ("on", "start"))
+        active = is_active(state, sid, host) if cmd in ("status", "reload", "check", "why", "doctor") else (cmd in ("on", "start"))
         log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
 
         status_rep = ""
@@ -662,7 +799,7 @@ def on_prompt_submit(event: dict, host: str, state: State):
                         "additionalContext": f"{status_text(active)}{status_rep}",
                     }
                 }, 0
-            if cmd == "reload":
+            if cmd in ("reload", "check", "why", "doctor"):
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "UserPromptSubmit",
@@ -689,7 +826,7 @@ def on_prompt_submit(event: dict, host: str, state: State):
                 "stopReason": f"{status_text(active)}{status_rep}",
                 "reason": f"{status_text(active)}{status_rep}",
             }, 0
-        if cmd == "reload":
+        if cmd in ("reload", "check", "why", "doctor"):
             return {
                 "decision": "block",
                 "continue": False,
@@ -800,12 +937,15 @@ def on_prompt_expansion(event: dict, host: str, state: State):
     if cmd_name != "guardrail":
         return None, 0
     sid = str(event.get("session_id") or "")
-    arg = str(event.get("command_args") or "").strip().lower().split(" ")[0]
+    raw_args = str(event.get("command_args") or "").strip()
+    parts = raw_args.split(" ", 1)
+    arg = parts[0].lower()
+    rest_arg = parts[1].strip() if len(parts) > 1 else ""
     cmd = _ARG_MAP.get(arg, "on")
     if cmd in ("on", "off"):
         state.update(sid, active=(cmd == "on"), pending=None, approved_turn=None, approval_grant=None)
         state.update("_default", active=(cmd == "on"), pending=None, approved_turn=None, approval_grant=None)
-    active = is_active(state, sid, host) if cmd in ("status", "reload") else (cmd == "on")
+    active = is_active(state, sid, host) if cmd in ("status", "reload", "check", "why", "doctor") else (cmd == "on")
     log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
     if cmd in ("off", "status"):
         return {"decision": "block", "reason": status_text(active)}, 0
@@ -823,6 +963,12 @@ def on_prompt_expansion(event: dict, host: str, state: State):
             f"  • Dry-run preview: {'enabled' if reload_info.get('dry_run_enabled') else 'disabled'}"
         )
         return {"decision": "block", "reason": msg}, 0
+    if cmd == "check":
+        return {"decision": "block", "reason": format_check_report(rest_arg)}, 0
+    if cmd == "why":
+        return {"decision": "block", "reason": format_why_report()}, 0
+    if cmd == "doctor":
+        return {"decision": "block", "reason": format_doctor_report()}, 0
     return {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptExpansion",
@@ -1075,6 +1221,18 @@ def main(argv: list[str]) -> int:
         res = ca.reload_policy(policy_arg)
         loaded = ca.get_loaded_policy_path() or "policy.yaml"
         print(f"{ICON} Policy reloaded from {loaded}: {res}")
+        return 0
+
+    if argv[0] in ("check", "test"):
+        print(format_check_report(" ".join(argv[1:])))
+        return 0
+
+    if argv[0] == "why":
+        print(format_why_report())
+        return 0
+
+    if argv[0] in ("doctor", "health"):
+        print(format_doctor_report())
         return 0
 
     print(__doc__, file=sys.stderr)

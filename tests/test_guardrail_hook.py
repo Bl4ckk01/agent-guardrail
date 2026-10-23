@@ -720,8 +720,96 @@ class HookReloadAndDynamicConfigTests(unittest.TestCase):
             if orig_window is not None:
                 ca.get_memory_config()["confirm_window_secs"] = orig_window
 
+    def test_status_text_uses_policy_backend_not_hardcoded_clm(self):
+        os.environ.pop("GUARDRAIL_BACKEND", None)
+        ca.reload_policy()
+        txt = gh.status_text(True)
+        self.assertIn("backend: rules", txt)
+
+    def test_slash_command_check_in_chat(self):
+        out_safe, code1 = gh.on_prompt_submit(
+            {"prompt": "/guardrail check git status", "session_id": "sess-chk"},
+            "claude",
+            self.st,
+        )
+        self.assertEqual(code1, 0)
+        ctx_safe = out_safe["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("PROCEED", ctx_safe)
+
+        out_block, code2 = gh.on_prompt_submit(
+            {"prompt": "/guardrail check rm -rf /", "session_id": "sess-chk"},
+            "codex",
+            self.st,
+        )
+        self.assertEqual(code2, 0)
+        self.assertEqual(out_block["decision"], "block")
+        self.assertIn("BLOCK", out_block["stopReason"])
+
+    def test_slash_command_why_and_doctor(self):
+        import tempfile
+        tmp_log = Path(tempfile.mktemp(suffix=".log"))
+        try:
+            gh.log(
+                {
+                    "event": "tool",
+                    "session_id": "sess-why",
+                    "tool": "Bash",
+                    "cmd": "rm -rf /var/www",
+                    "decision": "block",
+                    "backend": "rules",
+                    "risk_score": 0.99,
+                    "matched_rules": ["block:rm recursive/force"],
+                    "reason": "matched block rules: rm recursive/force",
+                },
+                log_path=tmp_log,
+            )
+            why_report = gh.format_why_report(log_path=tmp_log)
+            self.assertIn("BLOCK", why_report)
+            self.assertIn("rm -rf /var/www", why_report)
+            self.assertIn("rm recursive/force", why_report)
+
+            doc_report = gh.format_doctor_report(log_path=tmp_log)
+            self.assertIn("Guardrail Doctor", doc_report)
+            self.assertIn("Audit Log Integrity: ✔", doc_report)
+            self.assertIn("4/4 platforms synchronized", doc_report)
+        finally:
+            if tmp_log.exists():
+                tmp_log.unlink()
+
+        out_doc, code_doc = gh.on_prompt_submit(
+            {"prompt": "/guardrail doctor", "session_id": "sess-doc"},
+            "claude",
+            self.st,
+        )
+        self.assertEqual(code_doc, 0)
+        self.assertIn("Guardrail Doctor", out_doc["hookSpecificOutput"]["additionalContext"])
+
+    def test_skill_files_synchronized_and_commands_documented(self):
+        root_skill = Path(__file__).resolve().parent.parent / "SKILL.md"
+        self.assertTrue(root_skill.exists(), "Root SKILL.md must exist")
+        skill_text = root_skill.read_text(encoding="utf-8")
+        root_bytes = root_skill.read_bytes()
+
+        # Verify all canonical commands supported by guardrail_hook are documented in SKILL.md
+        canonical_cmds = set(gh._ARG_MAP.values())
+        for cmd in canonical_cmds:
+            self.assertIn(f"/guardrail {cmd}", skill_text, f"/guardrail {cmd} missing from SKILL.md")
+
+        # Verify all 4 workspace guardrail/SKILL.md copies match root SKILL.md byte-for-byte
+        repo_root = root_skill.parent
+        for rel in (
+            ".claude/skills/guardrail/SKILL.md",
+            ".codex/skills/guardrail/SKILL.md",
+            ".agents/skills/guardrail/SKILL.md",
+            ".grok/skills/guardrail/SKILL.md",
+        ):
+            target = repo_root / rel
+            self.assertTrue(target.exists(), f"{rel} missing")
+            self.assertEqual(target.read_bytes(), root_bytes, f"{rel} out of sync with root SKILL.md")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

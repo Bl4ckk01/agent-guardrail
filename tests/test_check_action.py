@@ -761,8 +761,72 @@ settings:
         finally:
             sys.stdout = old_stdout
 
+    def test_decision_to_dict_and_cli_json_output(self):
+        import io
+        import json
+        import sys
+        dec = ca.decide("git status", backend_name="rules")
+        payload = dec.to_dict()
+        self.assertEqual(payload["decision"], "proceed")
+        self.assertEqual(payload["backend"], "rules")
+        self.assertIn("risk_score", payload)
+        self.assertIn("matched_rules", payload)
+        self.assertIn("capabilities", payload)
+
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            exit_code = ca.main(["docker run -d nginx", "--backend", "rules", "--json"])
+            raw = sys.stdout.getvalue().strip()
+            self.assertEqual(exit_code, 0)
+            parsed = json.loads(raw)
+            self.assertEqual(parsed["decision"], "ask_user")
+            self.assertEqual(parsed["backend"], "rules")
+            self.assertIsInstance(parsed["matched_rules"], list)
+        finally:
+            sys.stdout = old_stdout
+
+    def test_allow_custom_rule_and_tamper_protection(self):
+        import tempfile
+        tmp_policy = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8")
+        try:
+            tmp_policy.write(
+                "custom_proceed_rules:\n"
+                "  - name: \"existing safe rule\"\n"
+                "    pattern: '\\bcargo\\s+check\\b'\n"
+                "settings:\n"
+                "  backend: \"rules\"\n"
+            )
+            tmp_policy.close()
+
+            # Safe pattern should be accepted
+            ok1, msg1 = ca.allow_custom_rule(r"\bmy_safe_linter\s+--check\b", name="my safe linter", policy_file=tmp_policy.name)
+            self.assertTrue(ok1)
+            self.assertIn("Added custom proceed rule", msg1)
+
+            # Duplicate pattern should report already present
+            ok2, msg2 = ca.allow_custom_rule(r"\bmy_safe_linter\s+--check\b", name="my safe linter", policy_file=tmp_policy.name)
+            self.assertTrue(ok2)
+            self.assertIn("already present", msg2)
+
+            # Catch-all or destructive pattern must be rejected
+            ok_bad, _ = ca.allow_custom_rule(".*", name="catch all", policy_file=tmp_policy.name)
+            self.assertFalse(ok_bad)
+            ok_rm, _ = ca.allow_custom_rule(r"rm\s+-rf.*", name="allow rm", policy_file=tmp_policy.name)
+            self.assertFalse(ok_rm)
+
+            # Agent attempting to invoke check_action.py --allow must be blocked by self-tampering rules
+            tamper_dec = ca.evaluate_rules('python check_action.py --allow "\\bmy_tool\\b"')
+            self.assertEqual(tamper_dec.decision, "block")
+            self.assertIn("block:guardrail self tampering command", tamper_dec.matched)
+        finally:
+            if os.path.exists(tmp_policy.name):
+                os.unlink(tmp_policy.name)
+            ca.reload_policy()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

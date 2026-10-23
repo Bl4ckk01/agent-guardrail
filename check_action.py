@@ -167,8 +167,8 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("secret exfiltration curl wget", r"\b(?:curl|wget)\b.*(?:-d|--data(?:-binary)?|-F|--post-file)\s*@(?:/etc/|\.env|\$env:|\S*id_rsa|\S*id_ed25519)"),
     ("shell startup file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*~?/?(?:\.bashrc|\.bash_profile|\.zshrc|\.profile|/etc/profile|/etc/environment|\$profile)\b"),
     ("crontab file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*/etc/cron"),
-    ("guardrail self tampering file", r"\b(?:rm|del|erase|unlink|remove-item|drop|truncate|format)\b.*(?:\bpolicy\.ya?ml\b|\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\binstall\.py\b|\.guardrail\b|\.claude/settings\.json\b|\.codex/hooks\.json\b|\.agents/hooks\.json\b|\.cursorrules\b)"),
-    ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
+    ("guardrail self tampering file", r"\b(?:rm|del|erase|unlink|remove-item|drop|truncate|format)\b.*(?:\bpolicy\.ya?ml\b|\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\binstall\.py\b|\bmcp_server\.py\b|\.guardrail\b|\.claude/settings\.json\b|\.codex/hooks\.json\b|\.agents/hooks\.json\b|\.cursorrules\b)"),
+    ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
     ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
 )
 
@@ -896,6 +896,54 @@ def reload_policy(file_path: str | Path | None = None) -> dict:
         "protected_branches": len(_BRANCH_PROTECTION.get("protected_branches", [])),
         "dry_run_enabled": _DRY_RUN_CONFIG.get("enabled", True),
     }
+
+
+def allow_custom_rule(
+    pattern: str,
+    name: str | None = None,
+    policy_file: str | Path | None = None,
+) -> tuple[bool, str]:
+    """
+    Append a safe custom proceed regex rule to policy.yaml (for user terminal invocation).
+    Rejects overly broad catch-all patterns or invalid regular expressions.
+    """
+    pat = (pattern or "").strip()
+    if not pat:
+        return False, "Pattern cannot be empty."
+    if pat in (".*", ".+", "^.*$", "^.+$", "\\s*", "\\S+", ".") or len(pat) < 3:
+        return False, f"Refusing overly broad wildcard pattern: '{pat}'."
+    try:
+        compiled = re.compile(pat, re.IGNORECASE)
+    except re.error as exc:
+        return False, f"Invalid regular expression '{pat}': {exc}"
+    if compiled.search("") or compiled.search("rm -rf /"):
+        return False, f"Pattern '{pat}' is unsafe (matches empty string or destructive commands)."
+
+    target = _find_policy_file(policy_file)
+    if target is None:
+        target = Path(__file__).resolve().parent / "policy.yaml"
+
+    rule_name = (name or f"user allow: {pat[:32]}").strip().replace('"', "'")
+    escaped_pat = pat.replace("'", "''")
+    new_entry = f'  - name: "{rule_name}"\n    pattern: \'{escaped_pat}\'\n'
+
+    try:
+        content = target.read_text(encoding="utf-8") if target.is_file() else ""
+        if f"pattern: '{escaped_pat}'" in content or f'pattern: "{pat}"' in content:
+            reload_policy(target)
+            return True, f"Pattern '{pat}' is already present in {target}."
+
+        m = re.search(r"^custom_proceed_rules:\s*\n", content, flags=re.MULTILINE)
+        if m:
+            insert_pos = m.end()
+            updated = content[:insert_pos] + new_entry + content[insert_pos:]
+        else:
+            updated = content.rstrip() + f"\n\ncustom_proceed_rules:\n{new_entry}"
+        target.write_text(updated, encoding="utf-8")
+        reload_policy(target)
+        return True, f"Added custom proceed rule '{rule_name}' ({pat}) to {target} and reloaded policy."
+    except OSError as exc:
+        return False, f"Failed to update {target}: {exc}"
 
 
 def evaluate_rules(description: str) -> RuleResult:
@@ -1969,6 +2017,24 @@ class Decision:
             parts.append(f"backend_error={self.error}")
         return " | ".join(parts)
 
+    def to_dict(self) -> dict:
+        reason = (
+            ", ".join(self.rules.matched)
+            if self.rules.matched
+            else (self.model.note if self.model and self.model.note else self.decision)
+        )
+        return {
+            "decision": self.decision,
+            "backend": self.backend,
+            "risk_score": round(self.risk_score, 2),
+            "reason": reason,
+            "matched_rules": list(self.rules.matched),
+            "risk_factors": list(self.risk_factors),
+            "capabilities": list(self.capabilities),
+            "dry_run_preview": self.dry_run_preview,
+            "explanation": self.explain(),
+        }
+
 
 def fallback_decision(description: str) -> str:
     """Model failure fallback: use rules, never silent proceed."""
@@ -2081,8 +2147,9 @@ def decide(
 def main(argv: list[str] | None = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     if not raw_args:
-        _log('Usage: check_action.py "<action description>" [--backend <clm|d1|jev|rules>] [--explain]')
-        _log('       check_action.py --start | --stop | --status | --mcp | --reload')
+        _log('Usage: check_action.py "<action description>" [--backend <clm|d1|jev|rules>] [--explain] [--json]')
+        _log('       check_action.py --start | --stop | --status | --mcp | --reload | --why | --doctor')
+        _log('       check_action.py --allow "<regex>" [--name "<rule name>"] [--policy <path>]')
         return 2
 
     first_arg = raw_args[0].lower()
@@ -2131,7 +2198,39 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Policy reloaded successfully: {res['custom_block_rules']} block rules, {res['custom_ask_rules']} ask rules, {res['path_rules']} path rules (backend: {res['backend']}, dry_run: {res['dry_run_enabled']})")
         return 0
 
+    if first_arg in ("--why", "why"):
+        import guardrail_hook
+        print(guardrail_hook.format_why_report())
+        return 0
+
+    if first_arg in ("--doctor", "doctor"):
+        import guardrail_hook
+        print(guardrail_hook.format_doctor_report())
+        return 0
+
+    if first_arg in ("--allow", "allow"):
+        if len(raw_args) < 2:
+            _log('Usage: check_action.py --allow "<regex>" [--name "<rule name>"] [--policy <path>]')
+            return 2
+        pattern = raw_args[1]
+        rule_name = None
+        policy_file = None
+        i = 2
+        while i < len(raw_args):
+            if raw_args[i] == "--name" and i + 1 < len(raw_args):
+                rule_name = raw_args[i + 1]
+                i += 2
+            elif raw_args[i] == "--policy" and i + 1 < len(raw_args):
+                policy_file = raw_args[i + 1]
+                i += 2
+            else:
+                i += 1
+        ok, msg = allow_custom_rule(pattern, name=rule_name, policy_file=policy_file)
+        print(msg)
+        return 0 if ok else 1
+
     show_explain = False
+    output_json = False
     cli_backend = None
     cleaned_args = []
     skip_next = False
@@ -2141,6 +2240,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if arg in ("--explain", "-e", "--verbose", "-v"):
             show_explain = True
+        elif arg in ("--json", "-j"):
+            output_json = True
         elif arg in ("--backend", "-b") and i + 1 < len(raw_args):
             cli_backend = raw_args[i + 1]
             skip_next = True
@@ -2150,7 +2251,7 @@ def main(argv: list[str] | None = None) -> int:
             cleaned_args.append(arg)
 
     if not cleaned_args:
-        _log('Usage: check_action.py "<action description>" [--backend <clm|d1|jev|rules>] [--explain]')
+        _log('Usage: check_action.py "<action description>" [--backend <clm|d1|jev|rules>] [--explain] [--json]')
         return 2
 
     description = " ".join(cleaned_args)
@@ -2161,7 +2262,10 @@ def main(argv: list[str] | None = None) -> int:
     if _debug_enabled() or show_explain:
         _log(f"[guardrail] {result.explain()}")
 
-    print(result.decision)
+    if output_json:
+        print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+    else:
+        print(result.decision)
     return 0
 
 
