@@ -217,6 +217,22 @@ class ClaudeHookTests(unittest.TestCase):
         hso = out["hookSpecificOutput"]
         self.assertEqual(hso["permissionDecision"], "ask")
 
+    def test_pre_tool_non_shell_tool_mentioning_file_names_is_not_blocked(self):
+        # Regression: a bare file name such as SKILL.md used to pull the file's content
+        # (which documents rm -rf, force push, ...) into the rules and block any tool call.
+        self.st.update("claude-sess", active=True)
+        event = {
+            "hook_event_name": "PreToolUse",
+            "session_id": "claude-sess",
+            "tool_name": "mcp__ccd_turn__update_plan",
+            "tool_input": {"items": [{"content": "Update SKILL.md, policy.yaml and install.py"}]},
+        }
+        with mock.patch.dict(os.environ, {"GUARDRAIL_BACKEND": "rules"}):
+            out, code = gh.handle(event, "claude", self.st)
+        self.assertEqual(code, 0)
+        if out is not None:
+            self.assertNotEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
 
 class CodexHookTests(unittest.TestCase):
     def setUp(self):

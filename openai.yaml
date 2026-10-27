@@ -8,5 +8,4 @@ invocation:
 dependencies:
   tools:
     - python
-  env:
-    - CLM_SERVER_URL
+  # Optional: set CLM_SERVER_URL only when settings.backend is 'clm' (default backend is 'rules').

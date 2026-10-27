@@ -114,8 +114,8 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("delete folder nlp", r"\b(?:delet\w*|remov\w*)\s+(?:(?:the\s+|a\s+)?(?:folder|directory|dir)\s+(?:of)?|(?:the\s+)?contents?\s+(?:of\s+)?(?:folder|directory)\w*)\b"),
     ("recursive deletion nlp", r"\b(?:remov\w*|delet\w*)\s+.{0,80}?\brecursive\w*\b"),
     ("drop sql", r"\bdrop\s+(?:table|database|schema|collection|index|view|user)\b"),
-    ("truncate sql", r"\btruncate\s+table\b|\btruncate\s+[\w.\"`\[\]]+\s*;"),
-    ("unbounded delete", r"\bdelete\s+from\s+[\w.\"`\[\]]+\s*;"),
+    ("truncate sql", r"\btruncate\s+table\b|\btruncate\s+[\w.\"`\[\]]+\s*(?:;|[\"'])"),
+    ("unbounded delete", r"\bdelete\s+from\s+[\w.\"`\[\]]+\s*(?:;|[\"']|$)"),
     ("unbounded update", r"\bupdate\s+[\w.\"`\[\]]+\s+set\s+\w+\s*=(?!.*\bwhere\b)"),
     ("flushall", r"\bflush(?:all|db)\b|\bdropdatabase\b"),
     ("disk format",
@@ -128,7 +128,7 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("secret exposure",
      r"\bgit\s+add\b.*(?:\.env|id_rsa|id_ed25519|\.pem|master\.key|\.key\b)"
      r"|\bmake\s+public\w*.{0,50}?(?:keys?|secrets?|credentials?)"
-     r"|(?!\b.*(?:reset|recovery|change)\s+password\b)\b(?:commit\w*|publish\w*|leak\w*|expos\w*|print\w*|shar\w*|send\w*|post|echo|cat|type|paste|write\w*|include|put\b|insert\w*|save\b|export\w*)\b"
+     r"|(?!\b.*(?:reset|recovery|change)\s+password\b)\b(?:commit\w*|publish\w*|leak\w*|expos\w*|print\w*|shar\w*|send\w*|post|echo|cat|type|get-content|gc|head|tail|paste|write\w*|include|put\b|insert\w*|save\b|export\w*)\b"
      r".{0,50}?" + _SECRET),
     ("malicious intent", r"\bmalware\b|\bransomware\b|\bkeylogger\b|\bbackdoor\b|\bexploit\w*|exfiltrat\w*|\brootkit\w*|\btrojan\w*|hidden\s+account|\bminer\b|cryptominer|cryptomining|hide\s+(?:unauthorized\s+)?access|cover\s+(?:up\s+)?tracks"),
     ("security bypass",
@@ -143,12 +143,12 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("flush firewall", r"\biptables\s+-[fF]\b"),
     ("zfs destroy", r"\bzfs\s+destroy\b"),
     ("python script destructive", r"\bpython\d?\s+(?:-c\s+)?.*(?:\bos\.(?:system|remove|unlink|rmdir|popen)\b|\bsubprocess\.(?:run|call|Popen|check_call|check_output)\b|\bshutil\.(?:rmtree|move)\b)"),
-    ("node script destructive", r"\bnode\s+(?:-e|--eval)\s+.*(?:\bchild_process\b|\bfs\.(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\b)"),
+    ("node script destructive", r"\bnode\s+(?:-e|--eval)\s+.*(?:\bchild_process\b|\bfs\.(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\b|\.(?:rm|rmSync|unlink|unlinkSync|rmdir|rmdirSync)\s*\()"),
     ("perl script destructive", r"\bperl\s+-e\s+.*(?:\bsystem\b|\bunlink\b|\brmdir\b)"),
     ("ruby script destructive", r"\bruby\s+-e\s+.*(?:\bsystem\b|FileUtils\.(?:rm|rm_rf|remove_dir)|File\.delete)"),
     ("php script destructive", r"\bphp\s+-r\s+.*(?:\bsystem\b|\bexec\b|\bpassthru\b|\bshell_exec\b|\bunlink\b)"),
     ("awk script destructive", r"\bawk\s+.*system\s*\("),
-    ("encoded base64 pipe to shell", r"\b(?:base64\s+(?:-d|--decode)|openssl\s+enc\s+-d\s+-base64)\s*\|\s*(?:sh|bash|zsh|python\d?|pwsh|powershell)\b"),
+    ("encoded base64 pipe to shell", r"\b(?:base64\s+(?:-d|--decode)|openssl\s+enc\s+-d\s+-base64)\s*(?:<<<\s*\S+\s*|<\s*\S+\s*)?\|\s*(?:sh|bash|zsh|python\d?|pwsh|powershell)\b"),
     ("ripgrep command injection", r"\brg\b.*--(?:pre|pre-glob)\b"),
     ("find exec injection", r"\bfind\b.*-(?:exec|execdir|ok|okdir)\b"),
     ("fd exec injection", r"\b(?:fd|fdfind)\b.*-(?:x|X|-exec|-exec-batch)\b"),
@@ -185,6 +185,9 @@ ASK_RULES: tuple[tuple[str, str], ...] = (
      _DEL + r".{0,40}?\b(?:files?|directories|directory|dirs?|folders?|branch\w*|tags?|data|records?|users?|accounts?|logs?|containers?|images?|issues?|resources?|caches?|modules?|projects?)\b"),
     ("rm / del", r"\b(?:rm|rmdir|unlink|remove-item)\s+\S|\bdel\s+(?:/[a-z]\b|\*)"),
     ("overwrite", r"\boverwrit\w*|\bmv\s+\S|\bmove-item\b"),
+    ("docker prune", r"\bdocker\s+(?:system|volume|image|container|builder|network)\s+prune\b"),
+    ("truncate file", r"\btruncate\s+(?:-\S+\s+)*-s\s*\S+"),
+    ("environment dump", r"(?:^|[;&|\n]\s*)(?:printenv|env|export\s+-p|(?:get-childitem|gci|ls|dir)\s+env:)\s*(?:$|[;&|])"),
     ("remote git / history",
      r"\bgit\s+(?:push|pull|rebase|merge|submodule|tag(?!\s+--(?:list|-l)|\s+-l\b)|cherry-pick|revert|commit\s+--amend|stash\s+(?:drop|clear)|branch\s+-[dDmM]|checkout\s+--|restore\s+\.|reset)\b"
      r"|\bpush\s+(?:the\s+)?(?:\S+\s+)?(?:branch\s+)?to\s+\S+"),
@@ -588,7 +591,16 @@ def unwrap_command_wrappers(text: str, max_depth: int = 5) -> list[str]:
                     _add(seg, depth)
 
         # J. Script file execution peeking (e.g. bash script.sh, sh ./test.sh, python run.py, ./script.sh)
-        for cand in tokens:
+        # Only files that are actually executed are peeked: arguments of a shell/interpreter
+        # or the command itself when it looks like a script. Mentioning a file name
+        # (cat SKILL.md, a JSON argument, a plan item) must not pull its content into the rules.
+        if prog in _SHELL_NAMES or prog in _LANG_RUNNERS or prog in ("powershell", "pwsh", "cmd", "source", "."):
+            peek_tokens = tokens[1:]
+        elif os.path.splitext(tokens[0])[1].lower() in (".sh", ".bash", ".py", ".ps1", ".bat", ".cmd", ".rb", ".pl", ".js"):
+            peek_tokens = tokens[:1]
+        else:
+            peek_tokens = []
+        for cand in peek_tokens:
             clean_sc = cand.strip("'\"`")
             if clean_sc and not clean_sc.startswith("-") and ("." in clean_sc or "/" in clean_sc or "\\" in clean_sc):
                 try:
