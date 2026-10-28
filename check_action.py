@@ -208,6 +208,7 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     *_tamper_file_rules(_GUARDRAIL_FILES),
     ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
     ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
+    ("hardcoded secret in file", r"\bwrite\s+hardcoded\s+secret\b"),
 )
 
 # Confirmation required rules
@@ -878,10 +879,17 @@ _AUDIT_CONFIG: dict = {
     "hash_chaining": True,
 }
 
+# Egress allowlist: empty = disabled. When set, outbound requests to these domains (and their
+# subdomains) need no confirmation and requests to any other host ask for it.
+_NETWORK_CONFIG: dict = {
+    "allowed_domains": [],
+}
+
 # Built-in values every (re)load starts from, so a key removed from policy.yaml really goes away
 _CONFIG_DEFAULTS: tuple[tuple[dict, dict], ...] = tuple(
     (cfg, copy.deepcopy(cfg))
-    for cfg in (_BRANCH_PROTECTION, _CREDENTIALS_PROTECTION, _RISK_CONFIG, _DRY_RUN_CONFIG, _MEMORY_CONFIG, _AUDIT_CONFIG)
+    for cfg in (_BRANCH_PROTECTION, _CREDENTIALS_PROTECTION, _RISK_CONFIG, _DRY_RUN_CONFIG, _MEMORY_CONFIG,
+                _AUDIT_CONFIG, _NETWORK_CONFIG)
 )
 
 
@@ -948,6 +956,10 @@ def get_memory_config() -> dict:
 
 def get_audit_config() -> dict:
     return _AUDIT_CONFIG
+
+
+def get_network_config() -> dict:
+    return _NETWORK_CONFIG
 
 
 def get_policy_settings() -> dict:
@@ -1024,7 +1036,8 @@ def _merge_workspace_policy(data: dict) -> None:
     """Merge an untrusted workspace policy.yaml: it may add block/ask rules and tighten limits, nothing else.
 
     Ignored on purpose: custom_proceed_rules, proceed path rules, audit_logging (cannot disable or
-    redirect the audit log), settings (backend/endpoints) and anything that would loosen a threshold.
+    redirect the audit log), settings (backend/endpoints), network (cannot allowlist a domain) and
+    anything that would loosen a threshold.
     """
     _CUSTOM_BLOCK.extend(_compile_custom_rules(data, "custom_block_rules", "custom_block"))
     _CUSTOM_ASK.extend(_compile_custom_rules(data, "custom_ask_rules", "custom_ask"))
@@ -1105,6 +1118,9 @@ def _apply_trusted_policy(data: dict) -> None:
         _MEMORY_CONFIG.update(data["memory_boundaries"])
     if "audit_logging" in data and isinstance(data["audit_logging"], dict):
         _AUDIT_CONFIG.update(data["audit_logging"])
+    if isinstance(data.get("network"), dict):
+        domains = data["network"].get("allowed_domains") or []
+        _NETWORK_CONFIG["allowed_domains"] = [str(d).strip().lower() for d in domains if str(d).strip()]
     _POLICY_SETTINGS = data.get("settings", {}) or {}
 
 
@@ -1136,8 +1152,9 @@ def load_policy(file_path: str | Path | None = None) -> dict:
     _WORKSPACE_POLICY_PATH = None
     _reset_config_defaults()
 
-    data =(_read_policy(p) if p and p.is_file() else None) or {}
+    data = (_read_policy(p) if p and p.is_file() else None) or {}
     _apply_trusted_policy(data)
+    _POLICY_TESTS[:] = [dict(t, source=str(p)) for t in (data.get("tests") or []) if isinstance(t, dict)]
 
     # An explicitly chosen policy file is used alone
     workspace_p = _find_workspace_policy_file(p) if not file_path else None
@@ -1146,10 +1163,52 @@ def load_policy(file_path: str | Path | None = None) -> dict:
         if ws_data:
             _merge_workspace_policy(ws_data)
             _WORKSPACE_POLICY_PATH = workspace_p
+            _POLICY_TESTS.extend(dict(t, source=str(workspace_p)) for t in (ws_data.get("tests") or []) if isinstance(t, dict))
 
     _apply_env_overrides()
     _POLICY_LOADED = True
     return data
+
+
+_POLICY_TESTS: list[dict] = []  # `tests:` cases from the loaded policy files
+_DECISION_ALIASES = {
+    "proceed": "proceed", "allow": "proceed", "safe": "proceed",
+    "ask_user": "ask_user", "ask": "ask_user", "confirm": "ask_user",
+    "block": "block", "deny": "block",
+}
+
+
+def run_policy_tests(policy_file: str | Path | None = None) -> list[dict]:
+    """Run the policy's `tests:` cases (action -> expected decision) with the deterministic rules backend."""
+    if policy_file is not None:
+        reload_policy(policy_file)
+    elif not _POLICY_LOADED:
+        load_policy()
+    results: list[dict] = []
+    for case in list(_POLICY_TESTS):
+        action = str(case.get("action") or "").strip()
+        expect = _DECISION_ALIASES.get(str(case.get("expect") or "").strip().lower())
+        if not action or not expect:
+            results.append({"action": action, "expect": str(case.get("expect")), "got": "invalid test case",
+                            "ok": False, "rules": [], "source": case.get("source", "")})
+            continue
+        dec = decide(action, backend_name="rules")
+        results.append({"action": action, "expect": expect, "got": dec.decision, "ok": dec.decision == expect,
+                        "rules": list(dec.rules.matched), "source": case.get("source", "")})
+    return results
+
+
+def format_policy_test_report(results: list[dict]) -> str:
+    if not results:
+        return "No policy tests found: add a `tests:` list (action + expect) to policy.yaml."
+    failed = [r for r in results if not r["ok"]]
+    lines = [f"Policy tests: {len(results) - len(failed)}/{len(results)} passed"]
+    for r in failed:
+        rules = ", ".join(m.split(":", 1)[-1] for m in r["rules"]) or "no rule matched"
+        lines.append(f"  [FAIL] `{r['action']}`: expected {r['expect']}, got {r['got']} ({rules})")
+    if not failed:
+        lines.append("  [ok] every action gets the expected decision")
+    return "\n".join(lines)
 
 
 def reload_policy(file_path: str | Path | None = None) -> dict:
@@ -1217,8 +1276,58 @@ def allow_custom_rule(
         return False, f"Failed to update {target}: {exc}"
 
 
+_URL_HOST_RE = re.compile(r"\b(?:https?|wss?|ftp)://(?:[^\s/@'\"]+@)?([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)", re.IGNORECASE)
+
+
+def is_allowed_host(host: str) -> bool:
+    """True if host is an allowlisted domain or one of its subdomains."""
+    h = (host or "").strip().lower().rstrip(".")
+    for dom in _NETWORK_CONFIG.get("allowed_domains") or []:
+        d = str(dom).strip().lower().lstrip("*").lstrip(".")
+        if d and (h == d or h.endswith("." + d)):
+            return True
+    return False
+
+
+def egress_violations(description: str) -> list[str]:
+    """Hosts an outbound action would reach that are not allowlisted ([] when the allowlist is off)."""
+    if not _NETWORK_CONFIG.get("allowed_domains"):
+        return []
+    net_rx = dict(_CAPABILITY_PATTERNS)["cap:net_outbound"]
+    if not net_rx.search(description) and not net_rx.search(normalize(description)):
+        return []
+    hosts: list[str] = []
+    for h in _URL_HOST_RE.findall(description):
+        h = h.lower()
+        if h not in hosts and not is_allowed_host(h):
+            hosts.append(h)
+    return hosts
+
+
+def _apply_egress_policy(description: str, result: RuleResult) -> RuleResult:
+    """Domain allowlist: outbound requests to listed domains need no confirmation, any other host asks."""
+    if result.decision == "block" or not _NETWORK_CONFIG.get("allowed_domains"):
+        return result
+    if not _URL_HOST_RE.search(description):
+        return result
+    blocked = egress_violations(description)
+    if blocked:
+        tag = f"ask_user:egress to non-allowlisted host ({', '.join(blocked[:3])})"
+        return RuleResult("ask_user", [*(result.matched if result.decision == "ask_user" else []), tag])
+    # Every host is allowlisted: the generic "network command" confirmation is no longer needed
+    remaining = [m for m in result.matched if m != "ask_user:remote download / execution"]
+    if result.decision == "ask_user" and not remaining and dict(_CAPABILITY_PATTERNS)["cap:net_outbound"].search(description):
+        return RuleResult("proceed", ["proceed:egress allowlisted"])
+    return result
+
+
 def evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     """Evaluate deterministic rules, path rules, and policy.yaml with recursive unwrapping."""
+    result = _evaluate_rules(description, _chain_depth)
+    return _apply_egress_policy(description, result) if _chain_depth == 0 else result
+
+
+def _evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     if not _POLICY_LOADED:
         load_policy()
 
@@ -1254,7 +1363,11 @@ def evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     all_blocks = list(_COMPILED_BLOCK) + _CUSTOM_BLOCK
     if _cwd_is_guardrail_dir():
         all_blocks += list(_COMPILED_TAMPER_HERE)
-    blocked_matches: list[str] = []
+    # A live credential spelled out in a command, file content or message leaks it (logs, history, commits)
+    blocked_matches: list[str] = [
+        f"block:hardcoded secret value ({name})"
+        for name in find_secret_values("\n".join([description, *decoded_payloads]))
+    ]
     for layer in unwrapped_layers:
         for name, rx in all_blocks:
             match_found = rx.search(description) if name == "git branch force delete" else rx.search(layer)
@@ -2040,6 +2153,53 @@ def is_secret_path(path: str) -> bool:
     return False
 
 
+# Credentials recognizable by their value: well-known prefixes only, no generic "password=" heuristics
+SECRET_VALUE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("aws access key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    ("github token", r"\bgh[pousr]_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}"),
+    ("anthropic api key", r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
+    ("openai api key", r"\bsk-(?!ant-)(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{32,}"),
+    ("slack token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
+    ("stripe live key", r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}"),
+    ("google api key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    ("npm token", r"\bnpm_[A-Za-z0-9]{36}\b"),
+    ("private key block", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----"),
+)
+_COMPILED_SECRET_VALUES = tuple((name, re.compile(rx)) for name, rx in SECRET_VALUE_PATTERNS)
+# Documentation keys and fixtures (AKIAIOSFODNN7EXAMPLE, sk-xxxx...) are not credentials
+_PLACEHOLDER_SECRET_RE = re.compile(r"example|dummy|fake|sample|placeholder|xxxx|your[_-]|test", re.IGNORECASE)
+
+
+def _secret_value_matches(text: str):
+    for name, rx in _COMPILED_SECRET_VALUES:
+        for m in rx.finditer(text or ""):
+            if name == "private key block" or not _PLACEHOLDER_SECRET_RE.search(m.group(0)):
+                yield name, m
+
+
+def find_secret_values(text: str) -> list[str]:
+    """Names of the credential formats found in text (e.g. ['aws access key'])."""
+    names: list[str] = []
+    for name, _ in _secret_value_matches(text):
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def redact_secrets(text: str) -> str:
+    """Mask credential values so they never reach logs or session memory."""
+    if not text:
+        return text
+    out = text
+    next_start = len(text) + 1
+    for name, m in sorted(_secret_value_matches(text), key=lambda nm: nm[1].start(), reverse=True):
+        if m.end() > next_start:  # overlaps a span already masked
+            continue
+        out = out[:m.start()] + f"[REDACTED:{name}]" + out[m.end():]
+        next_start = m.start()
+    return out
+
+
 _CAPABILITY_PATTERNS: list[tuple[str, re.Pattern]] = [
     (
         "cap:secret_access",
@@ -2493,6 +2653,7 @@ def main(argv: list[str] | None = None) -> int:
     if not raw_args:
         _log('Usage: check_action.py "<action description>" [--backend <clm|d1|jev|rules>] [--explain] [--json]')
         _log('       check_action.py --start | --stop | --status | --mcp | --reload | --why | --doctor')
+        _log('       check_action.py --report [DAYS] | --test-policy [--policy <path>] | --undo [list]')
         _log('       check_action.py --allow "<regex>" [--name "<rule name>"] [--policy <path>]')
         return 2
 
@@ -2550,6 +2711,26 @@ def main(argv: list[str] | None = None) -> int:
     if first_arg in ("--doctor", "doctor"):
         import guardrail_hook
         print(guardrail_hook.format_doctor_report())
+        return 0
+
+    if first_arg in ("--report", "report"):
+        import guardrail_hook
+        try:
+            days = float(raw_args[1]) if len(raw_args) > 1 else 7.0
+        except ValueError:
+            days = 7.0
+        print(guardrail_hook.format_report(days))
+        return 0
+
+    if first_arg in ("--test-policy", "test-policy"):
+        policy_file = raw_args[raw_args.index("--policy") + 1] if "--policy" in raw_args[:-1] else None
+        results = run_policy_tests(policy_file)
+        print(format_policy_test_report(results))
+        return 0 if all(r["ok"] for r in results) else 1
+
+    if first_arg in ("--undo", "undo"):
+        import guardrail_hook
+        print(guardrail_hook.format_undo(" ".join(raw_args[1:])))
         return 0
 
     if first_arg in ("--allow", "allow"):

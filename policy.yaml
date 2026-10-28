@@ -207,6 +207,24 @@ audit_logging:
 
 
 # ==============================================================================
+# 10b. OUTBOUND NETWORK ALLOWLIST
+# ==============================================================================
+# Empty list = disabled (current behavior). When domains are listed:
+# - WebFetch, curl, wget, requests... to a listed domain or its subdomains need no confirmation
+# - requests to any other host ask for confirmation
+# A secret read earlier in the session still blocks every outbound request (chained exfiltration).
+# A workspace policy.yaml cannot add domains here.
+# ==============================================================================
+network:
+  allowed_domains: []
+  # allowed_domains:
+  #   - pypi.org
+  #   - files.pythonhosted.org
+  #   - github.com
+  #   - docs.python.org
+
+
+# ==============================================================================
 # 11. GLOBAL SETTINGS - BACKEND SELECTOR
 # ==============================================================================
 # Choose which decision engine to use:
@@ -276,4 +294,32 @@ settings:
   qwen_port: 8090               # HTTP port for Qwen embeddings
   clm_port: 8700                # HTTP port for clm-serve
 
-
+# ==============================================================================
+# 12. POLICY TESTS
+# ==============================================================================
+# Regression cases for this policy: each action must get the expected decision
+# (proceed | ask_user | block) from the deterministic rules backend.
+# Run them with /guardrail test, `python guardrail_hook.py test` or, in CI,
+# `python check_action.py --test-policy` (exit code 1 when a case fails).
+# ==============================================================================
+tests:
+  - action: "git status"
+    expect: proceed
+  - action: "cat README.md | grep install"
+    expect: proceed
+  - action: "pytest -x"
+    expect: proceed
+  - action: "pip install requests"
+    expect: ask_user
+  - action: "ls && npm install left-pad"
+    expect: ask_user
+  - action: "docker run -it ubuntu"
+    expect: ask_user
+  - action: "rm -rf build/"
+    expect: block
+  - action: "git push --force origin main"
+    expect: block
+  - action: "terraform destroy"
+    expect: block
+  - action: "cat .env"
+    expect: block

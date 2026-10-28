@@ -798,6 +798,150 @@ class HardeningRegressionTests(unittest.TestCase):
         self.assertNotIn("tamper guardrail control plane", desc)
 
 
+FAKE_AWS_KEY = "AKIA" + "QZ7R2M4K9P3L6WXY"
+
+
+class NewFeatureHookTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.st = gh.State(Path(self.tmpdir) / "state.json")
+        self.st.update("feat-sess", active=True)
+        self.trash = mock.patch.object(gh, "TRASH_DIR", Path(self.tmpdir) / "trash")
+        self.trash.start()
+
+    def tearDown(self):
+        self.trash.stop()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _tool(self, tool_name: str, tool_input: dict, cwd: str = "/repo") -> dict:
+        return {"hook_event_name": "PreToolUse", "session_id": "feat-sess", "cwd": cwd,
+                "tool_name": tool_name, "tool_input": tool_input}
+
+    # --- 1. Secrets by content ---
+
+    def test_writing_a_credential_into_source_is_blocked(self):
+        out, _ = gh.handle(self._tool("Write", {"file_path": "/repo/app.py", "content": f"KEY = '{FAKE_AWS_KEY}'"}),
+                           "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("hardcoded secret", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertNotIn(FAKE_AWS_KEY, out["hookSpecificOutput"]["permissionDecisionReason"])
+
+        edit = {"file_path": "/repo/app.py", "edits": [{"old_string": "x", "new_string": f"k='{FAKE_AWS_KEY}'"}]}
+        desc, _, _ = gh.describe_tool({"tool_name": "MultiEdit", "tool_input": edit})
+        self.assertIn("write hardcoded secret", desc)
+
+    def test_writing_a_credential_into_env_file_is_not_hardcoding(self):
+        desc, _, _ = gh.describe_tool({"tool_name": "Write", "tool_input": {"file_path": "/repo/.env", "content": f"AWS={FAKE_AWS_KEY}"}})
+        self.assertNotIn("hardcoded", desc)
+        self.assertNotIn(FAKE_AWS_KEY, desc)
+
+    def test_credential_in_tool_output_taints_session(self):
+        post = {"hook_event_name": "PostToolUse", "session_id": "feat-sess", "tool_name": "Bash",
+                "tool_input": {"command": "cat config.py"}, "tool_response": {"stdout": f"KEY = '{FAKE_AWS_KEY}'"}}
+        out, _ = gh.handle(post, "claude", self.st)
+        self.assertIn("contains a credential", out["hookSpecificOutput"]["additionalContext"])
+        self.assertIn("cap:secret_access", self.st.recent_capabilities("feat-sess"))
+        out2, _ = gh.handle(self._tool("WebFetch", {"url": "https://example.com", "prompt": "x"}), "claude", self.st)
+        self.assertEqual(out2["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_clean_tool_output_is_ignored(self):
+        post = {"hook_event_name": "PostToolUse", "session_id": "feat-sess", "tool_name": "Read",
+                "tool_input": {"file_path": "/repo/a.py"}, "tool_response": "print('hello')"}
+        out, _ = gh.handle(post, "claude", self.st)
+        self.assertIsNone(out)
+        self.assertNotIn("cap:secret_access", self.st.recent_capabilities("feat-sess"))
+
+    def test_credentials_never_reach_log_or_state(self):
+        log_file = Path(self.tmpdir) / "audit.log"
+        gh.log({"event": "tool", "text": f"echo {FAKE_AWS_KEY}"}, log_path=log_file)
+        self.assertNotIn(FAKE_AWS_KEY, log_file.read_text(encoding="utf-8"))
+        ok, _, _ = gh.verify_audit_log(log_file)
+        self.assertTrue(ok)
+        self.st.update("feat-sess", pending={"text": f"curl -H 'X: {FAKE_AWS_KEY}'"})
+        self.st.record_action("feat-sess", f"echo {FAKE_AWS_KEY}", ["cap:read_only"])
+        self.assertNotIn(FAKE_AWS_KEY, json.dumps(self.st.data))
+
+    # --- 2. Domain allowlist on WebFetch ---
+
+    def test_webfetch_to_non_allowlisted_domain_asks(self):
+        with mock.patch.dict(ca.get_network_config(), {"allowed_domains": ["docs.python.org"]}):
+            ok, _ = gh.handle(self._tool("WebFetch", {"url": "https://docs.python.org/3/", "prompt": "x"}), "claude", self.st)
+            self.assertIsNone(ok)
+            out, _ = gh.handle(self._tool("WebFetch", {"url": "https://paste.example.net/x", "prompt": "x"}), "claude", self.st)
+            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+            self.assertIn("non-allowlisted host", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    # --- 3. Backup before confirmed changes, and undo ---
+
+    def test_confirmed_delete_is_backed_up_and_undoable(self):
+        work = Path(self.tmpdir) / "work"
+        work.mkdir()
+        target = work / "notes.txt"
+        target.write_text("precious", encoding="utf-8")
+
+        out, _ = gh.handle(self._tool("Bash", {"command": "rm notes.txt"}, cwd=str(work)), "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertEqual(len(gh.list_snapshots()), 1)
+        self.assertIn("notes.txt", gh.format_undo("list"))
+
+        target.unlink()  # the user confirmed and the command ran
+        report = gh.format_undo()
+        self.assertIn("Restored 1 file", report)
+        self.assertEqual(target.read_text(encoding="utf-8"), "precious")
+        self.assertEqual(gh.list_snapshots(), [])
+        self.assertIn("Nothing to undo", gh.format_undo())
+
+    def test_read_only_and_safe_actions_are_not_backed_up(self):
+        work = Path(self.tmpdir) / "work"
+        work.mkdir()
+        (work / "a.txt").write_text("x", encoding="utf-8")
+        gh.handle(self._tool("Bash", {"command": "cat a.txt"}, cwd=str(work)), "claude", self.st)
+        gh.handle(self._tool("Bash", {"command": "pip install requests"}, cwd=str(work)), "claude", self.st)
+        self.assertEqual(gh.list_snapshots(), [])
+
+    def test_snapshots_are_pruned(self):
+        f = Path(self.tmpdir) / "f.txt"
+        f.write_text("x", encoding="utf-8")
+        with mock.patch.object(gh, "_BACKUP_KEEP", 3):
+            for _ in range(5):
+                gh.snapshot_files([f], action="rm f.txt")
+            self.assertEqual(len(gh.list_snapshots(include_restored=True)), 3)
+
+    # --- 4. Report ---
+
+    def test_report_summarizes_audit_log(self):
+        log_file = Path(self.tmpdir) / "audit.log"
+        for _ in range(3):
+            gh.log({"event": "tool", "session": "s1", "text": "docker restart web", "decision": "ask_user",
+                    "matched_rules": ["ask_user:docker run/exec/compose"]}, log_path=log_file)
+        gh.log({"event": "tool", "session": "s2", "text": "rm -rf /", "decision": "block",
+                "why": "final=block | rules=block ['block:recursive rm']"}, log_path=log_file)
+        gh.log({"event": "tool", "session": "s2", "text": "git status", "decision": "proceed"}, log_path=log_file)
+        rep = gh.format_report(7, log_path=log_file)
+        self.assertIn("Evaluated actions: 5", rep)
+        self.assertIn("ask_user 3, block 1", rep)
+        self.assertIn("3× docker run/exec/compose", rep)
+        self.assertIn("1× recursive rm", rep)
+        self.assertIn("3× `docker restart web`", rep)
+        self.assertIn("2 sessions", rep)
+        self.assertIn("no evaluated actions", gh.format_report(7, log_path=Path(self.tmpdir) / "missing.log"))
+
+    # --- 5. Commands ---
+
+    def test_new_commands_parse_and_answer(self):
+        self.assertEqual(gh.parse_command_with_arg("/guardrail report 3"), ("report", "3"))
+        self.assertEqual(gh.parse_command_with_arg("/guardrail undo list"), ("undo", "list"))
+        self.assertEqual(gh.parse_command("/guardrail test"), "test")
+        self.assertEqual(gh.parse_command("[[guardrail:report]]"), "report")
+        self.assertEqual(gh._parse_days("x"), 7.0)
+        out, _ = gh.on_prompt_submit({"prompt": "/guardrail test", "session_id": "feat-sess"}, "claude", self.st)
+        self.assertIn("Policy tests", out["hookSpecificOutput"]["additionalContext"])
+        out2, _ = gh.on_prompt_submit({"prompt": "/guardrail undo", "session_id": "feat-sess"}, "codex", self.st)
+        self.assertIn("Nothing to undo", out2["stopReason"])
+        # Info commands never toggle protection
+        self.assertTrue(gh.is_active(self.st, "feat-sess", "claude"))
+
+
 class HookReloadAndDynamicConfigTests(unittest.TestCase):
     def setUp(self):
         self.st = gh.State()

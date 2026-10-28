@@ -38,7 +38,7 @@ Users activate protection simply by typing:
 *(or `/guardrail on`, or `$guardrail` on Codex).*
 
 Once activated:
-1. Lifecycle hooks (`UserPromptSubmit`, `PreToolUse`) intercept every user request and tool call (`Bash`, `PowerShell`, `Write`, `Edit`, `write_to_file`, `replace_file_content`).
+1. Lifecycle hooks (`UserPromptSubmit`, `PreToolUse`) intercept every user request and tool call (`Bash`, `PowerShell`, `Write`, `Edit`, `write_to_file`, `replace_file_content`); `PostToolUse` scans tool output for credentials.
 2. Safe read-only actions (`ls`, `git status`, test runners) pass silently with zero delay.
 3. Sensitive actions (`ask_user`) prompt for human approval (native interactive dialog on Claude Code and Antigravity, confirmation in chat on Codex, Cursor, Grok).
 4. Prohibited actions (`block`) are halted immediately. Never attempt to bypass a block by rephrasing, splitting, or obfuscating the command.
@@ -56,12 +56,15 @@ Once activated:
 - `/guardrail check <cmd>`: Dry-run evaluate `<cmd>` (verdict, risk score, preview) without running it.
 - `/guardrail why`: Explain the most recent blocked or confirmation-required action from the audit log.
 - `/guardrail doctor`: Run unified diagnostics (policy, audit hash chain, skill sync, daemons).
+- `/guardrail report [days]`: Summarize the audit log (decisions, top rules, actions that keep asking).
+- `/guardrail test`: Run the `tests:` cases of `policy.yaml` (`python check_action.py --test-policy` for CI).
+- `/guardrail undo [list]`: Restore the files backed up before the last confirmed deletion or overwrite.
 
 ---
 
 ## 4. Unit Tests
 
-Run the test suites (173 tests total):
+Run the test suites (195 tests total):
 ```bash
 python -B tests/test_check_action.py
 python -B tests/test_guardrail_hook.py

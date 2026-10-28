@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="tests/"><img src="https://img.shields.io/badge/tests-141%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/tests-195%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-~37.4ms%20(neural)-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
@@ -268,7 +268,7 @@ A common vulnerability in naive command guardrails is **evasion and bypass attac
 
 ### 🔒 Context-Aware Risk Scoring, Scoped Memory Boundaries & Tamper-Evident Audit Log
 
-Evaluating a command string in isolation is insufficient because real-world intent and impact depend on the active repository branch, working directory, exposed credentials, and prior actions in the session. Agent Guardrail enforces five production-grade runtime boundary layers:
+Evaluating a command string in isolation is insufficient because real-world intent and impact depend on the active repository branch, working directory, exposed credentials, and prior actions in the session. Agent Guardrail enforces these production-grade runtime boundary layers:
 
 1. **Context-Aware Evaluation (`ExecutionContext`) & Multi-Step Chained Exfiltration Defense**:
    - **Repository & Branch Awareness**: Automatically inspects `.git/HEAD` in `< 0.1 ms` (zero subprocess overhead) to detect protected branches (`main`, `master`, `production`, `release/*`) and elevates risk when git mutations or file deletions target production branches.
@@ -297,6 +297,21 @@ Evaluating a command string in isolation is insufficient because real-world inte
 5. **Tamper-Evident Append-Only Audit Log (`verify_audit_log`)**:
    - Every decision, capability list, risk score, dry-run preview, and approval lifecycle event is recorded in `~/.guardrail/guardrail.log` as an append-only **SHA-256 hash-chained JSONL ledger** (`seq`, `prev_hash`, `entry_hash`).
    - Built-in cryptographic verification (`verify_audit_log()`) validates sequence continuity from the genesis hash (`0000...`) to the latest entry, immediately detecting any modified payload, deleted log line, or reordered event.
+   - Credential values are masked (`[REDACTED:aws access key]`) before anything reaches the audit log or `state.json`.
+
+6. **Credential Detection by Value**:
+   - Recognizes live credentials by their format (AWS access keys, GitHub/Slack/npm tokens, OpenAI/Anthropic/Google API keys, Stripe live keys, PEM private key blocks); documentation placeholders such as `AKIAIOSFODNN7EXAMPLE` are ignored.
+   - Writing a credential into a source file, shell command or commit message is **blocked** (`.env` and other secret files remain the place for them, with confirmation).
+   - A `PostToolUse` hook scans tool output (`Read`, `Bash`, `Grep`, `WebFetch`, MCP tools): a credential seen by the agent taints the session exactly like a `.env` read, so a later outbound request is blocked as chained exfiltration.
+
+7. **Outbound Domain Allowlist (`network.allowed_domains`)**:
+   - Disabled while the list is empty. Once set, `curl`, `wget`, WebFetch, `requests` and MCP tools reaching a listed domain (or a subdomain) need no confirmation, while any other host asks. Blocks and chained-exfiltration detection are unaffected; a workspace `policy.yaml` cannot add domains.
+
+8. **Backups Before Confirmed Changes & `/guardrail undo`**:
+   - When a deletion or overwrite needs confirmation, the files it names are copied into `~/.guardrail/trash/<timestamp>/` with a manifest (the last 20 backups are kept). `/guardrail undo` restores the newest backup; `/guardrail undo list` shows them.
+
+9. **Policy Regression Tests (`tests:`)**:
+   - `policy.yaml` can carry `action` → `expect` cases; `/guardrail test` (or `python check_action.py --test-policy` in CI) checks that every action still gets the expected decision after a policy change.
 
 ---
 
@@ -442,6 +457,9 @@ From that point forward:
 | `/guardrail check <cmd>` | Dry-run evaluates a command in chat without executing it |
 | `/guardrail why` | Explains the most recent blocked or confirmation-required action from the audit log |
 | `/guardrail doctor` | Runs a unified health check (policy, SHA-256 audit log chain, skill sync, daemons) |
+| `/guardrail report [days]` | Summarizes the audit log: decisions, most frequent rules, actions that keep asking for confirmation |
+| `/guardrail test` | Runs the `tests:` cases of `policy.yaml` (`python check_action.py --test-policy` exits 1 on failure, for CI) |
+| `/guardrail undo [list]` | Restores the files backed up before the last confirmed deletion or overwrite (`list` shows the backups) |
 
 ---
 
@@ -1197,16 +1215,16 @@ We believe in complete transparency regarding security boundaries:
 Contributions are warmly welcome! The codebase includes **141 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, skill synchronization, and protocol handlers:
 
 ```bash
-# 1. Run engine & risk-scoring tests (72 tests: rules, unwrapping, GTFOBins, context, dry-run, risk score, JSON, custom allow):
+# 1. Run engine & risk-scoring tests (102 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook & replay tests (48 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, check/why/doctor, skill sync):
+# 2. Run lifecycle hook & replay tests (72 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, skill sync):
 python tests/test_guardrail_hook.py
 
 # 3. Run MCP server protocol tests (21 tests):
 python tests/test_mcp_server.py
 
-# 4. Run all 141 tests via unittest:
+# 4. Run all 195 tests via unittest:
 python -m unittest discover -s tests -p "test_*.py"
 ```
 

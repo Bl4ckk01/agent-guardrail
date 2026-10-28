@@ -151,6 +151,18 @@ def install_claude(workspace: bool, is_global: bool) -> None:
                         ]
                     }
                 ],
+                # Scans the output of tools that can surface file or remote content for credential values
+                "PostToolUse": [
+                    {
+                        "matcher": "Read|Bash|PowerShell|Grep|NotebookRead|WebFetch|mcp__.*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": 'python "${CLAUDE_PROJECT_DIR}/guardrail_hook.py" hook --host claude',
+                            }
+                        ]
+                    }
+                ],
             }
         }
         merge_json_hooks(claude_settings, claude_hooks_cfg)

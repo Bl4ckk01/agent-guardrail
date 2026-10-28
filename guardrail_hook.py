@@ -5,6 +5,7 @@ Lifecycle guardrail hook for Claude Code and OpenAI Codex / ChatGPT.
 Automatically intercepts prompts and tool calls in the background:
     guardrail_hook.py hook --host claude|codex
     guardrail_hook.py on|off|status|reload [--session ID] [--policy FILE]
+    guardrail_hook.py check "<cmd>" | why | doctor | report [DAYS] | test | undo [list]
 """
 
 from __future__ import annotations
@@ -14,9 +15,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -33,6 +36,7 @@ GUARDRAIL_HOME = Path(os.environ.get("GUARDRAIL_HOME", Path.home() / ".guardrail
 STATE_PATH = GUARDRAIL_HOME / "state.json"
 CONFIG_PATH = GUARDRAIL_HOME / "config.json"
 LOG_PATH = GUARDRAIL_HOME / "guardrail.log"
+TRASH_DIR = GUARDRAIL_HOME / "trash"  # copies of files taken before confirmed deletions/overwrites
 
 BREAKER_SECS = 30
 CONFIRM_WINDOW_SECS = 600
@@ -94,7 +98,7 @@ class State:
 
     def update(self, sid: str, **fields) -> None:
         s = self.session(sid)
-        s.update(fields)
+        s.update(_redact(fields))  # state.json must never hold a credential value
         s["ts"] = time.time()
         self.dirty = True
 
@@ -111,7 +115,7 @@ class State:
             if isinstance(h, dict) and now - float(h.get("ts", 0)) < ttl
         ]
         history.append({
-            "summary": summary[:160],
+            "summary": ca.redact_secrets(summary)[:160],
             "capabilities": list(capabilities),
             "ts": now,
         })
@@ -192,12 +196,25 @@ def _compute_entry_hash(record_without_hash: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _redact(value):
+    """Mask credential values anywhere in a log entry or state record."""
+    import check_action as ca
+    if isinstance(value, str):
+        return ca.redact_secrets(value)
+    if isinstance(value, dict):
+        return {k: _redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    return value
+
+
 def log(entry: dict, log_path: Path | None = None) -> dict | None:
     """Append a tamper-evident, SHA-256 hash-chained JSONL entry to the audit log."""
     import check_action as ca
     audit_cfg = ca.get_audit_config()
     if not audit_cfg.get("enabled", True):
         return None
+    entry = _redact(entry)
     custom_log = audit_cfg.get("log_file")
     target = log_path or (Path(custom_log) if custom_log else LOG_PATH)
     use_chaining = audit_cfg.get("hash_chaining", True)
@@ -286,7 +303,7 @@ def verify_audit_log(log_path: Path | None = None) -> tuple[bool, str, int]:
 # --- Commands & Prompts ---
 
 _EXPLICIT_CMD_RE = re.compile(
-    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload|why|doctor|check)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?(?:\s+(?P<rest>.*))?$",
+    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload|why|doctor|check|report|test|undo)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?(?:\s+(?P<rest>.*))?$",
     re.IGNORECASE | re.DOTALL,
 )
 _PLAIN_CMD_RE = re.compile(
@@ -302,8 +319,13 @@ _ARG_MAP = {
     "reload": "reload", "r": "reload",
     "why": "why",
     "doctor": "doctor", "health": "doctor",
-    "check": "check", "test": "check",
+    "check": "check",
+    "report": "report", "stats": "report",
+    "test": "test", "tests": "test",
+    "undo": "undo", "restore": "undo",
 }
+# Commands that only report or restore: they never change the active state of the session
+_INFO_CMDS = ("reload", "check", "why", "doctor", "report", "test", "undo")
 _CONFIRM_RE = re.compile(
     r"\b(?:yes|y|ok|okay|confirm|confirmed|approve|approved|proceed|go|continue|done)\b",
     re.IGNORECASE,
@@ -473,6 +495,206 @@ def format_doctor_report(log_path: Path | None = None) -> str:
         lines.append("\n" + daemon_manager.format_status_report())
     except Exception:
         pass
+    return "\n".join(lines)
+
+
+def _parse_days(arg: str, default: float = 7.0) -> float:
+    try:
+        days = float(str(arg).strip().split()[0])
+        return days if days > 0 else default
+    except (ValueError, IndexError):
+        return default
+
+
+def format_policy_tests() -> str:
+    import check_action as ca
+    return f"{ICON} " + ca.format_policy_test_report(ca.run_policy_tests())
+
+
+def _read_log_entries(log_path: Path | None = None) -> list[dict]:
+    target = log_path or LOG_PATH
+    entries: list[dict] = []
+    if not target.is_file():
+        return entries
+    try:
+        with target.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    entries.append(obj)
+    except OSError:
+        pass
+    return entries
+
+
+def _entry_rules(entry: dict) -> list[str]:
+    """Matched rule tags of a log entry (explicit field, or parsed from the 'why' explanation)."""
+    if isinstance(entry.get("matched_rules"), list):
+        return [str(r) for r in entry["matched_rules"]]
+    m = re.search(r"rules=\w+ \[(.*?)\]", str(entry.get("why") or ""))
+    return re.findall(r"'([^']+)'", m.group(1)) if m else []
+
+
+def format_report(days: float = 7, log_path: Path | None = None) -> str:
+    """Summarize the audit log: decisions, most frequent rules, actions that keep asking for confirmation."""
+    from collections import Counter
+    cutoff = time.time() - days * 86400
+    decisions: Counter = Counter()
+    rules: Counter = Counter()
+    asked: Counter = Counter()
+    events: Counter = Counter()
+    sessions: set[str] = set()
+    for e in _read_log_entries(log_path):
+        try:
+            ts = time.mktime(time.strptime(str(e.get("ts", "")), "%Y-%m-%dT%H:%M:%S"))
+        except (ValueError, OverflowError):
+            continue
+        if ts < cutoff:
+            continue
+        events[str(e.get("event") or "")] += 1
+        if e.get("session"):
+            sessions.add(str(e["session"]))
+        dec = e.get("decision")
+        if e.get("event") in ("tool", "prompt") and dec in ("proceed", "ask_user", "block"):
+            decisions[dec] += 1
+            if dec != "proceed":
+                rules.update(r for r in _entry_rules(e) if not r.startswith("proceed:"))
+            if dec == "ask_user" and e.get("text"):
+                asked[str(e["text"]).splitlines()[0][:100]] += 1
+
+    total = sum(decisions.values())
+    period = f"last {days:g} day{'s' if days != 1 else ''}"
+    if not total:
+        return f"{ICON} Agent Guardrail Report ({period}): no evaluated actions in the audit log."
+    lines = [
+        f"{ICON} Agent Guardrail Report ({period}, {len(sessions)} session{'s' if len(sessions) != 1 else ''}):",
+        f"  • Evaluated actions: {total} — proceed {decisions['proceed']}, "
+        f"ask_user {decisions['ask_user']}, block {decisions['block']}",
+        f"  • Secret accesses tracked: {events['secret_read_tracked'] + events['secret_output_tracked']}, "
+        f"approvals used: {events['approval_consumed']}, backups taken: {events['backup']}",
+    ]
+    if rules:
+        lines.append("  • Most frequent block/ask rules:")
+        lines += [f"      {n}× {r.split(':', 1)[-1]}" for r, n in rules.most_common(5)]
+    repeated = [(t, n) for t, n in asked.most_common(5) if n > 1]
+    if repeated:
+        lines.append("  • Actions that keep asking for confirmation (candidates for a narrow custom_proceed_rules entry):")
+        lines += [f"      {n}× `{t}`" for t, n in repeated]
+    return "\n".join(lines)
+
+
+# --- Backups & Undo ---
+
+_BACKUP_MAX_FILES = 50
+_BACKUP_MAX_FILE_BYTES = 20 * 1024 * 1024
+_BACKUP_KEEP = 20
+
+
+def _backup_candidates(event: dict, paths: list[str], cwd: str) -> list[Path]:
+    """Existing files an action names: tool paths, plus every argument of a shell command."""
+    import check_action as ca
+    name, inp = _tool_call(event)
+    cands = list(paths)
+    if name.lower() in SHELL_TOOLS:
+        cands += [t for t in ca._split_tokens(_shell_command(inp)) if t and not t.startswith("-")]
+    files: list[Path] = []
+    for c in cands:
+        try:
+            p = Path(os.path.expanduser(c.strip("'\"")))
+            if not p.is_absolute():
+                p = Path(cwd or os.getcwd()) / p
+            if p.is_file() and p.stat().st_size <= _BACKUP_MAX_FILE_BYTES:
+                p = p.resolve()
+                if p not in files:
+                    files.append(p)
+        except (OSError, ValueError):
+            continue
+    return files[:_BACKUP_MAX_FILES]
+
+
+def snapshot_files(files: list[Path], session: str = "", tool: str = "", action: str = "") -> Path | None:
+    """Copy files into a new trash snapshot (with a manifest) so /guardrail undo can restore them."""
+    if not files:
+        return None
+    import check_action as ca
+    snap = TRASH_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    manifest = {
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "session": session, "tool": tool,
+        "action": ca.redact_secrets(action)[:300], "files": [],
+    }
+    try:
+        (snap / "files").mkdir(parents=True, exist_ok=True)
+        for i, f in enumerate(files):
+            stored = f"{i}__{f.name}"
+            shutil.copy2(f, snap / "files" / stored)
+            manifest["files"].append({"original": str(f), "stored": stored})
+        (snap / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        shutil.rmtree(snap, ignore_errors=True)
+        return None
+    for old in list_snapshots(include_restored=True)[_BACKUP_KEEP:]:
+        shutil.rmtree(old, ignore_errors=True)
+    return snap
+
+
+def list_snapshots(include_restored: bool = False) -> list[Path]:
+    """Trash snapshots, newest first."""
+    if not TRASH_DIR.is_dir():
+        return []
+    snaps = []
+    for d in TRASH_DIR.iterdir():
+        mf = d / "manifest.json"
+        if not mf.is_file():
+            continue
+        if not include_restored:
+            try:
+                if json.loads(mf.read_text(encoding="utf-8")).get("restored_at"):
+                    continue
+            except (OSError, ValueError):
+                continue
+        snaps.append(d)
+    return sorted(snaps, key=lambda d: d.name, reverse=True)
+
+
+def format_undo(arg: str = "") -> str:
+    """Restore the newest not-yet-restored snapshot (`undo`), or list snapshots (`undo list`)."""
+    snaps = list_snapshots()
+    if arg.strip().lower() == "list":
+        if not snaps:
+            return f"{ICON} No backups to restore in {TRASH_DIR}."
+        lines = [f"{ICON} Backups available (newest first, `/guardrail undo` restores the first):"]
+        for d in snaps[:10]:
+            mf = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
+            names = ", ".join(Path(f["original"]).name for f in mf.get("files", []))
+            lines.append(f"  • {mf.get('created')} — {names} (before: `{mf.get('action', '')[:80]}`)")
+        return "\n".join(lines)
+    if not snaps:
+        return f"{ICON} Nothing to undo: no backups in {TRASH_DIR}."
+    snap = snaps[0]
+    mf_path = snap / "manifest.json"
+    manifest = json.loads(mf_path.read_text(encoding="utf-8"))
+    restored, failed = [], []
+    for f in manifest.get("files", []):
+        dst = Path(f["original"])
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(snap / "files" / f["stored"], dst)
+            restored.append(str(dst))
+        except OSError as exc:
+            failed.append(f"{dst} ({exc})")
+    manifest["restored_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    mf_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    log({"event": "undo", "snapshot": snap.name, "restored": restored, "failed": failed})
+    lines = [f"{ICON} Restored {len(restored)} file(s) from the backup taken {manifest.get('created')} "
+             f"before `{manifest.get('action', '')[:80]}`:"]
+    lines += [f"  • {p}" for p in restored]
+    lines += [f"  • FAILED: {p}" for p in failed]
     return "\n".join(lines)
 
 
@@ -699,7 +921,23 @@ def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
             or inp.get("text")
             or ""
         )
-        if isinstance(content, str) and content.strip():
+        if not isinstance(content, str):
+            content = ""
+        import check_action as ca
+        # Everything the tool will write, including multi-edit chunks (old_string is what gets removed)
+        written = [content] + [
+            str(chunk.get(k) or "")
+            for key in ("edits", "ReplacementChunks")
+            for chunk in (inp.get(key) or []) if isinstance(chunk, dict)
+            for k in ("new_string", "ReplacementContent")
+        ]
+        secret_names = ca.find_secret_values("\n".join(written))
+        if secret_names:
+            if not ca.is_secret_path(path):
+                return f"write hardcoded secret ({', '.join(secret_names)}) into file {path}", False, [path]
+            # .env & co. are where credentials belong: evaluate the write, without the value itself
+            content = ca.redact_secrets(content)
+        if content.strip():
             content_snippet = content[:2000].replace("\r", "")
             return f"{verb} {path}\n[content]:\n{content_snippet}", False, [path]
         return f"{verb} {path}", False, [path]
@@ -823,8 +1061,14 @@ def on_prompt_submit(event: dict, host: str, state: State):
             daemon_msg = format_why_report()
         elif cmd == "doctor":
             daemon_msg = format_doctor_report()
+        elif cmd == "report":
+            daemon_msg = format_report(_parse_days(cmd_arg))
+        elif cmd == "test":
+            daemon_msg = format_policy_tests()
+        elif cmd == "undo":
+            daemon_msg = format_undo(cmd_arg)
 
-        active = is_active(state, sid, host) if cmd in ("status", "reload", "check", "why", "doctor") else (cmd in ("on", "start"))
+        active = is_active(state, sid, host) if cmd in ("status", *_INFO_CMDS) else (cmd in ("on", "start"))
         log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
 
         status_rep = ""
@@ -855,7 +1099,7 @@ def on_prompt_submit(event: dict, host: str, state: State):
                         "additionalContext": f"{status_text(active)}{status_rep}",
                     }
                 }, 0
-            if cmd in ("reload", "check", "why", "doctor"):
+            if cmd in _INFO_CMDS:
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "UserPromptSubmit",
@@ -882,7 +1126,7 @@ def on_prompt_submit(event: dict, host: str, state: State):
                 "stopReason": f"{status_text(active)}{status_rep}",
                 "reason": f"{status_text(active)}{status_rep}",
             }, 0
-        if cmd in ("reload", "check", "why", "doctor"):
+        if cmd in _INFO_CMDS:
             return {
                 "decision": "block",
                 "continue": False,
@@ -1001,7 +1245,7 @@ def on_prompt_expansion(event: dict, host: str, state: State):
     if cmd in ("on", "off"):
         state.update(sid, active=(cmd == "on"), pending=None, approved_turn=None, approval_grant=None)
         state.update("_default", active=(cmd == "on"), pending=None, approved_turn=None, approval_grant=None)
-    active = is_active(state, sid, host) if cmd in ("status", "reload", "check", "why", "doctor") else (cmd == "on")
+    active = is_active(state, sid, host) if cmd in ("status", *_INFO_CMDS) else (cmd == "on")
     log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
     if cmd in ("off", "status"):
         return {"decision": "block", "reason": status_text(active)}, 0
@@ -1025,6 +1269,12 @@ def on_prompt_expansion(event: dict, host: str, state: State):
         return {"decision": "block", "reason": format_why_report()}, 0
     if cmd == "doctor":
         return {"decision": "block", "reason": format_doctor_report()}, 0
+    if cmd == "report":
+        return {"decision": "block", "reason": format_report(_parse_days(rest_arg))}, 0
+    if cmd == "test":
+        return {"decision": "block", "reason": format_policy_tests()}, 0
+    if cmd == "undo":
+        return {"decision": "block", "reason": format_undo(rest_arg)}, 0
     return {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptExpansion",
@@ -1092,6 +1342,12 @@ def on_pre_tool(event: dict, host: str, state: State):
                 capabilities=net_caps, risk_score=0.95,
                 risk_factors=["cap:net_outbound", "context:chained_secret_exfiltration"],
             )
+        elif ca.egress_violations(desc):
+            hosts = ", ".join(ca.egress_violations(desc)[:3])
+            forced = ca.Decision(
+                "ask_user", "rules", ca.RuleResult("ask_user", [f"ask_user:egress to non-allowlisted host ({hosts})"]),
+                capabilities=net_caps, risk_score=0.55, risk_factors=["cap:net_outbound"],
+            )
         else:
             state.record_action(sid, desc[:160], net_caps)
             log({
@@ -1141,8 +1397,19 @@ def on_pre_tool(event: dict, host: str, state: State):
     log({
         "host": host, "event": "tool", "session": sid, "tool": tool_ident,
         "text": desc[:300], "decision": final, "risk_score": result.risk_score,
-        "capabilities": result.capabilities, "dry_run": preview, "why": result.explain(),
+        "capabilities": result.capabilities, "matched_rules": list(result.rules.matched),
+        "dry_run": preview, "why": result.explain(),
     })
+
+    def _backup_before_confirmed_change() -> None:
+        # Safety net for a hasty "yes": copy the files a confirmed delete/overwrite would touch
+        tool_low = str(tool_ident).lower()
+        if not ({"cap:fs_delete", "cap:fs_write"} & set(result.capabilities)
+                or tool_low in EDIT_TOOLS | DELETE_TOOLS or tool_low == "apply_patch"):
+            return
+        snap = snapshot_files(_backup_candidates(event, paths, cwd), sid, str(tool_ident), desc)
+        if snap is not None:
+            log({"host": host, "event": "backup", "session": sid, "tool": tool_ident, "snapshot": snap.name})
 
     short = desc.splitlines()[0][:160]
     if final == "block":
@@ -1154,6 +1421,9 @@ def on_pre_tool(event: dict, host: str, state: State):
 
     if final == "ask_user":
         preview_suffix = f" [Dry-Run Preview: {preview}]" if preview else ""
+        if host in ("claude", "antigravity", "agy", "gemini"):
+            # The native dialog decides after this hook returns: back up now, a copy is harmless if denied
+            _backup_before_confirmed_change()
         if host == "claude":
             return pre_tool_output(
                 host, "ask",
@@ -1193,6 +1463,7 @@ def on_pre_tool(event: dict, host: str, state: State):
                 # Consume single-use approval grant immediately so it never becomes standing authorization
                 state.update(sid, approval_grant=None, approved_turn=None, approved_at=None, pending=None)
                 state.record_action(sid, short, result.capabilities)
+                _backup_before_confirmed_change()
                 log({
                     "host": host, "event": "approval_consumed", "session": sid,
                     "tool": tool_ident, "fingerprint": curr_fp, "text": short,
@@ -1230,10 +1501,48 @@ def on_pre_tool(event: dict, host: str, state: State):
     return None, 0
 
 
+_MAX_SCANNED_OUTPUT = 2_000_000
+
+
+def on_post_tool(event: dict, host: str, state: State):
+    """Scan tool output for credential values: a secret seen by the agent taints the session like a .env read."""
+    sid = str(event.get("session_id") or event.get("conversationId") or "_default")
+    if not is_active(state, sid, host):
+        return None, 0
+    import check_action as ca
+
+    response = next(
+        (event[k] for k in ("tool_response", "tool_output", "toolResult", "output") if event.get(k) is not None),
+        None,
+    )
+    if response is None:
+        return None, 0
+    text = response if isinstance(response, str) else json.dumps(response, ensure_ascii=False, default=str)
+    names = ca.find_secret_values(text[:_MAX_SCANNED_OUTPUT])
+    if not names:
+        return None, 0
+
+    tool_name, _ = _tool_call(event)
+    summary = f"secret value ({', '.join(names)}) in output of {tool_name or 'tool'}"
+    state.record_action(sid, summary, ["cap:secret_access"])
+    log({"host": host, "event": "secret_output_tracked", "session": sid, "tool": tool_name, "text": summary})
+    if host == "claude":
+        return {"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": (
+                f"{ICON} GUARDRAIL: the output of {tool_name or 'this tool'} contains a credential ({', '.join(names)}). "
+                "Do not copy, print, commit or send it anywhere. Outbound requests from this session are now "
+                "treated as potential exfiltration and blocked."
+            ),
+        }}, 0
+    return None, 0
+
+
 HANDLERS = {
     "UserPromptSubmit": on_prompt_submit,
     "UserPromptExpansion": on_prompt_expansion,
     "PreToolUse": on_pre_tool,
+    "PostToolUse": on_post_tool,
 }
 
 
@@ -1309,8 +1618,22 @@ def main(argv: list[str]) -> int:
         print(f"{ICON} Policy reloaded from {loaded}: {res}")
         return 0
 
-    if argv[0] in ("check", "test"):
+    if argv[0] == "check":
         print(format_check_report(" ".join(argv[1:])))
+        return 0
+
+    if argv[0] in ("report", "stats"):
+        print(format_report(_parse_days(argv[1] if len(argv) > 1 else "")))
+        return 0
+
+    if argv[0] in ("test", "tests"):
+        import check_action as ca
+        results = ca.run_policy_tests()
+        print(ca.format_policy_test_report(results))
+        return 0 if all(r["ok"] for r in results) else 1
+
+    if argv[0] in ("undo", "restore"):
+        print(format_undo(" ".join(argv[1:])))
         return 0
 
     if argv[0] == "why":

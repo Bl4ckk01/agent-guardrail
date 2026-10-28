@@ -20,6 +20,17 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Bash|PowerShell|Grep|NotebookRead|WebFetch|mcp__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/guardrail_hook.py\" hook --host claude"
+          }
+        ]
+      }
     ]
   }
 }
