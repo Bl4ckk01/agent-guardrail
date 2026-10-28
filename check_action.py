@@ -87,6 +87,12 @@ _CRITICAL_TARGET = (
     r"|\b(?:main|master)\s+branch|branch\s+(?:main|master)\b|(?:the\s+)?(?:whole|entire)\s+repo\w*"
     r"|\bdisk\b|\bpartition\b|home\s+directory|(?:the\s+)?(?:whole|entire|all)\s+(?:s3\s+)?buckets?\b|docker\s+volumes?)"
 )
+# Guardrail control plane: code, policy, session state/config and the agents' hook settings
+_GUARDRAIL_FILES = (
+    r"(?:\bpolicy\.ya?ml\b|\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\binstall\.py\b|\bmcp_server\.py\b"
+    r"|\.guardrail\b|\.claude[/\\]+settings(?:\.local)?\.json\b|\.codex[/\\]+hooks\.json\b|\.agents[/\\]+hooks\.json\b|\.cursorrules\b)"
+)
+_WRITE_MODE = r"['\"]?(?:[wax]\+?b?|[wax]b\+?|r\+b?|rb\+)['\"]?\s*[,)]"
 
 # Categorical block rules (< 0.1ms)
 BLOCK_RULES: tuple[tuple[str, str], ...] = (
@@ -167,7 +173,18 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("secret exfiltration curl wget", r"\b(?:curl|wget)\b.*(?:-d|--data(?:-binary)?|-F|--post-file)\s*@(?:/etc/|\.env|\$env:|\S*id_rsa|\S*id_ed25519)"),
     ("shell startup file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*~?/?(?:\.bashrc|\.bash_profile|\.zshrc|\.profile|/etc/profile|/etc/environment|\$profile)\b"),
     ("crontab file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*/etc/cron"),
-    ("guardrail self tampering file", r"\b(?:rm|del|erase|unlink|remove-item|drop|truncate|format)\b.*(?:\bpolicy\.ya?ml\b|\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\binstall\.py\b|\bmcp_server\.py\b|\.guardrail\b|\.claude/settings\.json\b|\.codex/hooks\.json\b|\.agents/hooks\.json\b|\.cursorrules\b)"),
+    ("guardrail self tampering file", r"\b(?:rm|del|erase|unlink|remove-item|drop|truncate|format)\b.*" + _GUARDRAIL_FILES),
+    ("guardrail self tampering write",
+     # Shell redirection, tee and PowerShell writers aimed at a control-plane file
+     r"(?:>{1,2}\|?|\btee\b(?:\s+-\S+)*|\b(?:set-content|add-content|out-file|clear-content|new-item|sc|ac)\b[^;&|\n]*?|\bsed\s+(?:-\S+\s+)*?-i\S*[^;&|\n]*?)"
+     r"\s*['\"]?[^\s;&|'\"]*" + _GUARDRAIL_FILES
+     # Copy/move/link with a control-plane file as destination (last argument)
+     + r"|\b(?:cp|mv|ln|copy|move|copy-item|move-item|cpi|mi|rename-item|ren)\b[^;&|\n]*?\s['\"]?[^\s;&|'\"]*" + _GUARDRAIL_FILES + r"['\"]?\s*(?:$|[;&|\n])"
+     # Script writers: open(path, 'w'), Path(path).write_text(), fs.writeFileSync(), [IO.File]::WriteAllText()
+     + r"|\bopen\s*\([^)]*" + _GUARDRAIL_FILES + r"[^)]*?[,=]\s*" + _WRITE_MODE
+     + r"|" + _GUARDRAIL_FILES + r"['\"]?\s*\)\s*\.\s*(?:write_text|write_bytes|open\s*\([^)]*?[wax])"
+     + r"|\b(?:writefilesync|writefile|appendfilesync|appendfile)\s*\([^)]*?" + _GUARDRAIL_FILES
+     + r"|\[(?:system\.)?io\.file\]::(?:write|append)\w*\s*\([^)]*?" + _GUARDRAIL_FILES),
     ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
     ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
 )
@@ -260,6 +277,14 @@ PROCEED_RULES: tuple[tuple[str, str], ...] = (
     ("sort json nlp", r"\b(?:sort)\s+.{0,30}?\b(?:keys)\b|\balphabetical(?:ly)?\b"),
     ("tag list nlp", r"\b(?:show|list)\b.{0,30}?\b(?:tags?)\b"),
     ("local rsync", r"\brsync\s+(?:-\S+\s+)*[^\s:@]+/[^\s:@]*\s+[^\s:@]+/?$"),
+    ("change directory", r"^\s*(?:cd|pushd|popd|chdir|set-location|sl)(?:\s+[^\s;&|]+)?\s*$"),
+)
+
+# Whitelist entries that are pure inspection: decide() trusts them over the model
+_INSPECTION_WHITELIST = (
+    "proceed:whitelist:read cli",
+    "proceed:whitelist:test lint cli",
+    "proceed:whitelist:change directory",
 )
 
 _COMPILED_BLOCK = tuple((name, re.compile(rx) if name == "git branch force delete" else re.compile(rx, re.IGNORECASE)) for name, rx in BLOCK_RULES)
@@ -618,6 +643,67 @@ def unwrap_command_wrappers(text: str, max_depth: int = 5) -> list[str]:
     return discovered
 
 
+def split_command_chain(text: str) -> list[str]:
+    """Split a command line on top-level chain operators (&&, ||, ;, |, &, newline), honouring quotes."""
+    segments: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    i, n = 0, len(text or "")
+    while i < n:
+        ch = text[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            elif ch == "\\" and quote == '"' and i + 1 < n:
+                buf.append(text[i + 1])
+                i += 1
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            buf.append(text[i:i + 2])
+            i += 2
+            continue
+        prev = text[i - 1] if i else ""
+        nxt = text[i + 1] if i + 1 < n else ""
+        if text[i:i + 2] in ("&&", "||"):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        # Redirections (2>&1, &>file, >|file) are not chain links
+        if ch in ";\n\r" or (ch == "|" and prev != ">") or (ch == "&" and prev not in "<>" and nxt != ">"):
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [s.strip() for s in segments if s.strip()]
+
+
+# The hook appends the agent's free-text note as "(description: ...)": commentary, not a chain link.
+# Only plain notes are skipped; anything with expansions or redirections is still evaluated.
+_DESCRIPTION_NOTE_RE = re.compile(r"^\(description: [^$`()<>\\\n]*\)$", re.IGNORECASE)
+
+
+def chain_segments(description: str) -> list[str]:
+    """Links of a chained command across raw, normalized and de-obfuscated forms ([] for a single command)."""
+    base = normalize(description)
+    segments: list[str] = []
+    for src in (description, base, deobfuscate_shell_syntax(base)):
+        parts = [p for p in split_command_chain(src) if not _DESCRIPTION_NOTE_RE.match(p)]
+        if len(parts) > 1:
+            segments.extend(p for p in parts if p not in segments)
+    return segments
+
+
 @dataclass
 class RuleResult:
     decision: str
@@ -740,16 +826,17 @@ _AUDIT_CONFIG: dict = {
 
 
 def _find_policy_file(specified: str | Path | None = None) -> Path | None:
-    """Find policy.yaml using priority: specified arg -> GUARDRAIL_POLICY_FILE -> ./policy.yaml -> script dir -> ~/.guardrail."""
+    """Find the trusted policy.yaml: specified arg -> GUARDRAIL_POLICY_FILE -> script dir -> ~/.guardrail.
+
+    A policy.yaml in the current directory is workspace content the agent may control:
+    see _find_workspace_policy_file(), which may only tighten the trusted policy.
+    """
     if specified:
         p = Path(specified)
         return p if p.is_file() else None
     env_p = os.environ.get("GUARDRAIL_POLICY_FILE")
     if env_p and Path(env_p).is_file():
         return Path(env_p)
-    cwd_p = Path.cwd() / "policy.yaml"
-    if cwd_p.is_file():
-        return cwd_p
     script_p = Path(__file__).resolve().parent / "policy.yaml"
     if script_p.is_file():
         return script_p
@@ -757,6 +844,19 @@ def _find_policy_file(specified: str | Path | None = None) -> Path | None:
     if home_p.is_file():
         return home_p
     return None
+
+
+def _find_workspace_policy_file(trusted: Path | None) -> Path | None:
+    """policy.yaml in the current directory, unless it is the trusted policy itself."""
+    cwd_p = Path.cwd() / "policy.yaml"
+    if not cwd_p.is_file():
+        return None
+    try:
+        if trusted is not None and cwd_p.resolve() == trusted.resolve():
+            return None
+    except OSError:
+        pass
+    return cwd_p
 
 
 def get_branch_protection() -> dict:
@@ -788,60 +888,59 @@ def get_policy_settings() -> dict:
 
 
 _LOADED_POLICY_PATH: Path | None = None
+_WORKSPACE_POLICY_PATH: Path | None = None
 
 
 def get_loaded_policy_path() -> Path | None:
     return _LOADED_POLICY_PATH
 
 
-def load_policy(file_path: str | Path | None = None) -> dict:
-    """Load customized rules, branches, credentials, risk weights, and settings from policy.yaml."""
-    global _POLICY_LOADED, _LOADED_POLICY_PATH, _CUSTOM_BLOCK, _CUSTOM_ASK, _CUSTOM_PROCEED, _PATH_RULES, _POLICY_SETTINGS
-    global _BRANCH_PROTECTION, _CREDENTIALS_PROTECTION, _RISK_CONFIG, _DRY_RUN_CONFIG, _MEMORY_CONFIG, _AUDIT_CONFIG
+def get_workspace_policy_path() -> Path | None:
+    """Workspace policy.yaml merged on top of the trusted one (tighten-only), if any."""
+    return _WORKSPACE_POLICY_PATH
 
-    p = _find_policy_file(file_path)
-    _LOADED_POLICY_PATH = p
-    if not p or not p.is_file():
-        _POLICY_LOADED = True
-        return {}
 
+def _read_policy(p: Path) -> dict | None:
     try:
         import yaml
         with open(p, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
     except Exception as exc:
         if _debug_enabled():
             _log(f"[guardrail:policy] Error reading {p}: {exc}")
-        _POLICY_LOADED = True
-        return {}
+        return None
 
-    _CUSTOM_BLOCK = [
-        (r.get("name", "custom_block"), re.compile(r.get("pattern", ""), re.IGNORECASE))
-        for r in data.get("custom_block_rules", []) if r.get("pattern")
-    ]
-    _CUSTOM_ASK = [
-        (r.get("name", "custom_ask"), re.compile(r.get("pattern", ""), re.IGNORECASE))
-        for r in data.get("custom_ask_rules", []) if r.get("pattern")
-    ]
-    _CUSTOM_PROCEED = [
-        (r.get("name", "custom_proceed"), re.compile(r.get("pattern", ""), re.IGNORECASE))
-        for r in data.get("custom_proceed_rules", []) if r.get("pattern")
-    ]
 
-    raw_path_rules = data.get("path_rules", []) or data.get("custom_path_rules", [])
-    _PATH_RULES = []
-    for pr in raw_path_rules:
-        if not pr.get("path"):
+def _compile_custom_rules(data: dict, key: str, default_name: str) -> list[tuple[str, re.Pattern]]:
+    rules: list[tuple[str, re.Pattern]] = []
+    for r in data.get(key, []) or []:
+        if not isinstance(r, dict) or not r.get("pattern"):
+            continue
+        try:
+            rules.append((r.get("name", default_name), re.compile(r["pattern"], re.IGNORECASE)))
+        except re.error as exc:
+            if _debug_enabled():
+                _log(f"[guardrail:policy] Invalid pattern in {key}: {exc}")
+    return rules
+
+
+def _compile_path_rules(data: dict, allowed_decisions: tuple[str, ...] = VALID_DECISIONS) -> list[PathRule]:
+    rules: list[PathRule] = []
+    for pr in data.get("path_rules", []) or data.get("custom_path_rules", []) or []:
+        if not isinstance(pr, dict) or not pr.get("path"):
             continue
         p_name = pr.get("name", f"path:{pr.get('path')}")
         p_decision = str(pr.get("decision", "ask_user")).lower()
         if p_decision not in VALID_DECISIONS:
             p_decision = "ask_user"
+        if p_decision not in allowed_decisions:
+            continue
         p_commands = pr.get("commands", [])
         if isinstance(p_commands, str):
             p_commands = [p_commands]
         try:
-            _PATH_RULES.append(PathRule(
+            rules.append(PathRule(
                 name=p_name,
                 path=pr.get("path", ""),
                 decision=p_decision,
@@ -851,6 +950,76 @@ def load_policy(file_path: str | Path | None = None) -> dict:
         except Exception as exc:
             if _debug_enabled():
                 _log(f"[guardrail:policy] Error compiling path rule '{p_name}': {exc}")
+    return rules
+
+
+def _merge_workspace_policy(data: dict) -> None:
+    """Merge an untrusted workspace policy.yaml: it may add block/ask rules and tighten limits, nothing else.
+
+    Ignored on purpose: custom_proceed_rules, proceed path rules, audit_logging (cannot disable or
+    redirect the audit log), settings (backend/endpoints) and anything that would loosen a threshold.
+    """
+    _CUSTOM_BLOCK.extend(_compile_custom_rules(data, "custom_block_rules", "custom_block"))
+    _CUSTOM_ASK.extend(_compile_custom_rules(data, "custom_ask_rules", "custom_ask"))
+    _PATH_RULES.extend(_compile_path_rules(data, allowed_decisions=("block", "ask_user")))
+
+    bp = data.get("branch_protection")
+    if isinstance(bp, dict):
+        branches = list(_BRANCH_PROTECTION.get("protected_branches") or [])
+        branches.extend(b for b in (bp.get("protected_branches") or []) if b not in branches)
+        _BRANCH_PROTECTION["protected_branches"] = branches
+        if bp.get("require_confirmation") is True:
+            _BRANCH_PROTECTION["require_confirmation"] = True
+
+    cp = data.get("credentials_protection")
+    if isinstance(cp, dict):
+        for k in ("sensitive_env_keys", "sensitive_files"):
+            merged = list(_CREDENTIALS_PROTECTION.get(k) or [])
+            merged.extend(v for v in (cp.get(k) or []) if v not in merged)
+            _CREDENTIALS_PROTECTION[k] = merged
+
+    def _num(v) -> float | None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    rs = data.get("risk_scoring")
+    if isinstance(rs, dict):
+        for cap, w in (rs.get("weights") or {}).items():
+            w_f = _num(w)
+            if w_f is not None and w_f > float(_RISK_CONFIG["weights"].get(cap, 0.0)):
+                _RISK_CONFIG["weights"][cap] = w_f
+        for k in ("block_threshold", "ask_threshold"):
+            v = _num(rs.get(k))
+            if v is not None and v < float(_RISK_CONFIG.get(k, 1.0)):
+                _RISK_CONFIG[k] = v
+        if rs.get("chained_exfiltration") is True:
+            _RISK_CONFIG["chained_exfiltration"] = True
+
+    mb = data.get("memory_boundaries")
+    if isinstance(mb, dict):
+        v = _num(mb.get("confirm_window_secs"))
+        if v is not None and 0 < v < float(_MEMORY_CONFIG.get("confirm_window_secs", 600)):
+            _MEMORY_CONFIG["confirm_window_secs"] = v
+        for k in ("action_history_ttl_secs", "max_action_history"):
+            v = _num(mb.get(k))
+            if v is not None and v > float(_MEMORY_CONFIG.get(k, 0)):
+                _MEMORY_CONFIG[k] = int(v) if k == "max_action_history" else v
+        if mb.get("strict_fingerprint") is True:
+            _MEMORY_CONFIG["strict_fingerprint"] = True
+
+    dr = data.get("dry_run")
+    if isinstance(dr, dict) and dr.get("enabled") is True:
+        _DRY_RUN_CONFIG["enabled"] = True
+
+
+def _apply_trusted_policy(data: dict) -> None:
+    global _CUSTOM_BLOCK, _CUSTOM_ASK, _CUSTOM_PROCEED, _PATH_RULES, _POLICY_SETTINGS
+    _CUSTOM_BLOCK = _compile_custom_rules(data, "custom_block_rules", "custom_block")
+    _CUSTOM_ASK = _compile_custom_rules(data, "custom_ask_rules", "custom_ask")
+    _CUSTOM_PROCEED = _compile_custom_rules(data, "custom_proceed_rules", "custom_proceed")
+    _PATH_RULES = _compile_path_rules(data)
 
     if "branch_protection" in data and isinstance(data["branch_protection"], dict):
         _BRANCH_PROTECTION.update(data["branch_protection"])
@@ -869,8 +1038,10 @@ def load_policy(file_path: str | Path | None = None) -> dict:
         _MEMORY_CONFIG.update(data["memory_boundaries"])
     if "audit_logging" in data and isinstance(data["audit_logging"], dict):
         _AUDIT_CONFIG.update(data["audit_logging"])
+    _POLICY_SETTINGS = data.get("settings", {}) or {}
 
-    # Environment variable overrides
+
+def _apply_env_overrides() -> None:
     if "GUARDRAIL_CONFIRM_WINDOW_SECS" in os.environ:
         try:
             _MEMORY_CONFIG["confirm_window_secs"] = float(os.environ["GUARDRAIL_CONFIRM_WINDOW_SECS"])
@@ -888,7 +1059,27 @@ def load_policy(file_path: str | Path | None = None) -> dict:
     if "GUARDRAIL_CHAINED_EXFILTRATION" in os.environ:
         _RISK_CONFIG["chained_exfiltration"] = os.environ["GUARDRAIL_CHAINED_EXFILTRATION"].lower() in ("1", "true", "yes", "on")
 
-    _POLICY_SETTINGS = data.get("settings", {})
+
+def load_policy(file_path: str | Path | None = None) -> dict:
+    """Load the trusted policy.yaml, then let a workspace policy.yaml tighten (never loosen) it."""
+    global _POLICY_LOADED, _LOADED_POLICY_PATH, _WORKSPACE_POLICY_PATH
+
+    p = _find_policy_file(file_path)
+    _LOADED_POLICY_PATH = p
+    _WORKSPACE_POLICY_PATH = None
+
+    data = (_read_policy(p) if p and p.is_file() else None) or {}
+    _apply_trusted_policy(data)
+
+    # An explicitly chosen policy file is used alone
+    workspace_p = _find_workspace_policy_file(p) if not file_path else None
+    if workspace_p is not None:
+        ws_data = _read_policy(workspace_p)
+        if ws_data:
+            _merge_workspace_policy(ws_data)
+            _WORKSPACE_POLICY_PATH = workspace_p
+
+    _apply_env_overrides()
     _POLICY_LOADED = True
     return data
 
@@ -958,7 +1149,7 @@ def allow_custom_rule(
         return False, f"Failed to update {target}: {exc}"
 
 
-def evaluate_rules(description: str) -> RuleResult:
+def evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     """Evaluate deterministic rules, path rules, and policy.yaml with recursive unwrapping."""
     if not _POLICY_LOADED:
         load_policy()
@@ -1028,6 +1219,26 @@ def evaluate_rules(description: str) -> RuleResult:
 
     if path_asks:
         return RuleResult("ask_user", path_asks)
+
+    # Chained commands: each link is judged on its own. One link asking for confirmation makes the
+    # whole chain ask; the chain is whitelisted only if every link is whitelisted by itself.
+    segments = chain_segments(description) if _chain_depth < 2 else []
+    if segments:
+        seg_results = [evaluate_rules(seg, _chain_depth + 1) for seg in segments]
+        for level in ("block", "ask_user"):
+            tags: list[str] = []
+            for r in seg_results:
+                if r.decision == level:
+                    tags.extend(t for t in r.matched if t not in tags)
+            if tags or any(r.decision == level for r in seg_results):
+                return RuleResult(level, tags)
+        if all(r.matched for r in seg_results):
+            tags = []
+            for r in seg_results:
+                tags.extend(t for t in r.matched if t not in tags)
+            return RuleResult("proceed", tags)
+        # Some links match no rule at all: not whitelisted, the backend judges the whole chain
+        return RuleResult("proceed", [])
 
     # Check whitelist (proceed rules) across outer text
     all_proceed_rules = list(_COMPILED_PROCEED) + _CUSTOM_PROCEED
@@ -1718,6 +1929,42 @@ def inspect_execution_context(
     )
 
 
+_SECRET_FILE_NAMES = {
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "credentials", "credentials.json", ".npmrc", ".pypirc",
+    ".netrc", ".pgpass", "secrets.yaml", "secrets.yml", "secrets.json", "master.key", "shadow",
+}
+_SECRET_FILE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks")
+_SAFE_ENV_VARIANTS = ("example", "sample", "template", "dist")
+
+
+def is_secret_path(path: str) -> bool:
+    """True when a path (or glob pattern) names a secret file: .env, SSH private keys, *.pem, credentials..."""
+    import fnmatch
+    raw = (path or "").strip().strip("'\"")
+    if not raw:
+        return False
+    canon = "/" + raw.replace("\\", "/").lower().rstrip("/")
+    name = canon.rsplit("/", 1)[-1]
+    if name.endswith(".pub"):
+        return False
+    if "/.aws/credentials" in canon or canon.endswith("/etc/shadow"):
+        return True
+    if "/.ssh/" in canon and name.startswith("id_"):
+        return True
+    if name.startswith(".env"):
+        variant = name[len(".env"):].lstrip(".")
+        return variant not in _SAFE_ENV_VARIANTS
+    if name.endswith(".env"):
+        return True
+    if name in _SECRET_FILE_NAMES or name.endswith(_SECRET_FILE_SUFFIXES):
+        return True
+    for pat in _CREDENTIALS_PROTECTION.get("sensitive_files") or []:
+        pat_l = str(pat).lower()
+        if fnmatch.fnmatchcase(name, pat_l) and not any(name.endswith(f".{v}") for v in _SAFE_ENV_VARIANTS):
+            return True
+    return False
+
+
 _CAPABILITY_PATTERNS: list[tuple[str, re.Pattern]] = [
     (
         "cap:secret_access",
@@ -1732,7 +1979,7 @@ _CAPABILITY_PATTERNS: list[tuple[str, re.Pattern]] = [
         "cap:net_outbound",
         re.compile(
             r"\b(?:curl|wget|invoke-webrequest|invoke-restmethod|iwr|irm|nc|ncat|netcat|socat|"
-            r"ssh|scp|sftp|rsync|ftp|telnet|nslookup|dig)\b|"
+            r"ssh|scp|sftp|rsync|ftp|telnet|nslookup|dig|webfetch|web_fetch|read_url_content)\b|"
             r"\b(?:urllib\.request|requests\.(?:get|post|put|request)|http\.client|socket\.connect|fetch\s*\()|"
             r"/dev/(?:tcp|udp)/",
             re.IGNORECASE,
@@ -2126,8 +2373,11 @@ def decide(
         )
 
     if rules.decision == "proceed" and rules.matched:
-        # Coreutils read CLI commands (wc, cat, ls, grep, etc.) and safe test/lint tools are inspection: prevent embedding hallucinations from blocking them
-        if any(w in rules.matched for w in ("proceed:whitelist:read cli", "proceed:whitelist:test lint cli")) and not re.search(_SECRET, normalize(description)):
+        # Coreutils read CLI commands (wc, cat, ls, grep, etc.) and safe test/lint tools are inspection: prevent embedding hallucinations from blocking them.
+        # In a chain this holds only when every link is itself an inspection command.
+        units = [evaluate_rules(seg) for seg in chain_segments(description)] or [rules]
+        is_inspection = all(any(w in u.matched for w in _INSPECTION_WHITELIST) for u in units)
+        if is_inspection and not re.search(_SECRET, normalize(description)):
             final_decision = "proceed"
         else:
             final_decision = "block" if model.decision == "block" else "proceed"

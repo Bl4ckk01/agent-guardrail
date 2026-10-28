@@ -825,6 +825,140 @@ settings:
             ca.reload_policy()
 
 
+
+class ChainedCommandRegressionTests(unittest.TestCase):
+    """A chain is safe only if every link (&&, ;, |, ||, &, newline) is safe on its own."""
+
+    def test_one_risky_link_makes_the_whole_chain_ask(self):
+        for text in (
+            "ls foo && pip install evil",
+            "cat a.txt; npm install left-pad",
+            "pytest -x || git push origin main",
+            "ls foo\npip install requests",
+            "ls foo & curl http://example.com",
+            'bash -c "rm notes.txt; cat y.txt"',
+        ):
+            with self.subTest(text=text):
+                r = ca.evaluate_rules(text)
+                self.assertEqual(r.decision, "ask_user", r.matched)
+
+    def test_chain_of_safe_links_stays_whitelisted(self):
+        for text in ("cat config.yaml | grep foo", "git log --oneline | head -5", "cd src && pytest"):
+            with self.subTest(text=text):
+                r = ca.evaluate_rules(text)
+                self.assertEqual(r.decision, "proceed", r.matched)
+                self.assertTrue(r.matched)
+
+    def test_link_without_rules_is_not_whitelisted(self):
+        r = ca.evaluate_rules("ls foo; ./mystery_tool --run")
+        self.assertEqual(r, ca.RuleResult("proceed", []))
+
+    def test_decide_shortcut_requires_every_link_to_be_inspection(self):
+        ask_model = fake_clm("ask_user", 0.8, {"proceed": 0.1, "ask_user": 0.8, "block": 0.1})
+        with mock.patch.dict(ca.BACKENDS, {"clm": ask_model}):
+            # The model's ask is no longer swallowed by the read-cli shortcut
+            self.assertEqual(ca.decide("ls foo; ./mystery_tool --run", "clm").decision, "ask_user")
+            # A chain made only of inspection commands still bypasses the model
+            self.assertEqual(ca.decide("cat a.txt | grep foo", "clm").decision, "proceed")
+        block_model = fake_clm("block", 0.9, {"proceed": 0.05, "ask_user": 0.05, "block": 0.9})
+        with mock.patch.dict(ca.BACKENDS, {"clm": block_model}):
+            self.assertEqual(ca.decide("git status && cat a.txt", "clm").decision, "block")
+
+
+class SelfDefenseRegressionTests(unittest.TestCase):
+    def test_shell_writes_to_control_plane_are_blocked(self):
+        for text in (
+            "echo '{}' > .claude/settings.local.json",
+            "echo x >> ~/.claude/settings.json",
+            "echo '{\"sessions\": {}}' > ~/.guardrail/state.json",
+            "cat payload | tee ~/.guardrail/config.json",
+            "Set-Content -Path policy.yaml -Value 'custom_proceed_rules: []'",
+            "'x' | Out-File -FilePath C:\\Users\\me\\.guardrail\\state.json",
+            "python -c \"open('policy.yaml', 'w').write('')\"",
+            "python3 -c \"from pathlib import Path; Path('guardrail_hook.py').write_text('')\"",
+            "cp /tmp/evil.yaml policy.yaml",
+            "sed -i 's/block/proceed/' policy.yaml",
+        ):
+            with self.subTest(text=text):
+                r = ca.evaluate_rules(text)
+                self.assertEqual(r.decision, "block", r.matched)
+
+    def test_reading_control_plane_files_is_not_a_write(self):
+        for text in (
+            "cat policy.yaml > /tmp/policy_backup.txt",
+            "python -c \"print(open('policy.yaml', encoding='ascii').read())\"",
+            "cp policy.yaml /tmp/policy_copy.yaml",
+        ):
+            with self.subTest(text=text):
+                r = ca.evaluate_rules(text)
+                self.assertNotIn("block:guardrail self tampering write", r.matched)
+
+    def test_workspace_policy_can_only_tighten(self):
+        import tempfile
+        orig_cwd = os.getcwd()
+        orig_audit = dict(ca.get_audit_config())
+        orig_block_threshold = ca.get_risk_config().get("block_threshold")
+        workdir = tempfile.mkdtemp()
+        try:
+            Path(workdir, "policy.yaml").write_text(
+                "custom_proceed_rules:\n"
+                "  - name: allow everything pip\n"
+                "    pattern: '\\bpip\\s+install\\b'\n"
+                "custom_block_rules:\n"
+                "  - name: workspace forbids deploy\n"
+                "    pattern: '\\bmake\\s+deploy\\b'\n"
+                "path_rules:\n"
+                "  - name: workspace allows secrets\n"
+                "    path: 'secrets/'\n"
+                "    decision: proceed\n"
+                "audit_logging:\n"
+                "  enabled: false\n"
+                "  log_file: /dev/null\n"
+                "risk_scoring:\n"
+                "  block_threshold: 0.99\n"
+                "  chained_exfiltration: false\n"
+                "settings:\n"
+                "  backend: rules\n",
+                encoding="utf-8",
+            )
+            os.chdir(workdir)
+            ca.reload_policy()
+            self.assertEqual(ca.get_workspace_policy_path().resolve(), Path(workdir, "policy.yaml").resolve())
+            # Cannot whitelist
+            self.assertEqual(ca.evaluate_rules("pip install evil-package").decision, "ask_user")
+            self.assertFalse(any("allow everything pip" in n for n, _ in ca._CUSTOM_PROCEED))
+            self.assertFalse(any(r.decision == "proceed" and "workspace" in r.name for r in ca._PATH_RULES))
+            # Can tighten
+            self.assertEqual(ca.evaluate_rules("make deploy").decision, "block")
+            # Cannot disable or redirect the audit log, nor loosen risk settings
+            self.assertEqual(ca.get_audit_config(), orig_audit)
+            self.assertEqual(ca.get_risk_config().get("block_threshold"), orig_block_threshold)
+            self.assertTrue(ca.get_risk_config().get("chained_exfiltration"))
+        finally:
+            os.chdir(orig_cwd)
+            for f in Path(workdir).iterdir():
+                f.unlink()
+            os.rmdir(workdir)
+            ca.reload_policy()
+
+
+class SecretPathRegressionTests(unittest.TestCase):
+    def test_secret_paths(self):
+        for path in (".env", "/app/.env.production", "C:\\proj\\.env", "**/.env*", "deploy/prod.env",
+                     "~/.ssh/id_rsa", "/home/u/.ssh/id_ecdsa", "certs/server.pem", "**/*.pem", "tls.key",
+                     "~/.aws/credentials", "credentials.json"):
+            with self.subTest(path=path):
+                self.assertTrue(ca.is_secret_path(path))
+
+    def test_non_secret_paths(self):
+        for path in (".env.example", ".env.sample", "~/.ssh/id_rsa.pub", "src/main.py", "README.md", "**/*", "."):
+            with self.subTest(path=path):
+                self.assertFalse(ca.is_secret_path(path))
+
+    def test_webfetch_is_outbound_traffic(self):
+        self.assertIn("cap:net_outbound", ca.classify_capabilities("webfetch https://example.com"))
+
+
 if __name__ == "__main__":
     unittest.main()
 

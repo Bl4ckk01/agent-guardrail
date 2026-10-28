@@ -777,12 +777,13 @@ Agent Guardrail is **100% declaratively configurable**. Every safety boundary, r
 
 ### Policy Discovery Order
 
-When evaluating actions or starting hooks, the policy engine searches for `policy.yaml` in the following priority order:
-1. **Explicit parameter**: Passed via `--policy <path>` CLI flag or function argument.
+When evaluating actions or starting hooks, the policy engine loads the **trusted** `policy.yaml` from the first of these locations:
+1. **Explicit parameter**: Passed via `--policy <path>` CLI flag or function argument (used alone, no workspace overlay).
 2. **Environment variable**: Defined by `GUARDRAIL_POLICY_FILE=/path/to/custom_policy.yaml`.
-3. **Current Working Directory**: `./policy.yaml` in the project root.
-4. **Script Directory**: `policy.yaml` located alongside `check_action.py`.
-5. **Global User Home**: `~/.guardrail/policy.yaml` for system-wide defaults.
+3. **Script Directory**: `policy.yaml` located alongside `check_action.py`.
+4. **Global User Home**: `~/.guardrail/policy.yaml` for system-wide defaults.
+
+A `./policy.yaml` in the current working directory is workspace content the agent could control, so it is merged on top of the trusted policy in **tighten-only** mode: it may add `custom_block_rules`, `custom_ask_rules`, block/ask `path_rules`, protected branches, sensitive keys/files, higher risk weights and lower thresholds. Its `custom_proceed_rules`, proceed path rules, `audit_logging` and `settings` sections are ignored, and it cannot loosen any threshold or switch off chained-exfiltration detection.
 
 ---
 

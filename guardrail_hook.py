@@ -159,8 +159,9 @@ class State:
 
 
 def compute_action_fingerprint(description: str, tool_name: str = "", cwd: str = "") -> str:
-    """Compute a deterministic SHA-256 scope fingerprint binding command, tool, and working directory."""
-    first_line = " ".join((description or "").strip().splitlines()[0].lower().split()) if (description or "").strip() else ""
+    """Compute a deterministic SHA-256 scope fingerprint binding the whole command, tool, and working directory."""
+    # Whitespace-normalized but otherwise exact: every line and character of the action is bound
+    norm_action = " ".join((description or "").split())
     norm_tool = (tool_name or "").strip().lower()
     norm_cwd = ""
     if cwd:
@@ -168,7 +169,7 @@ def compute_action_fingerprint(description: str, tool_name: str = "", cwd: str =
             norm_cwd = os.path.normcase(os.path.abspath(cwd)).replace("\\", "/")
         except Exception:
             norm_cwd = cwd.strip().lower().replace("\\", "/")
-    payload = f"{norm_tool}|{norm_cwd}|{first_line}"
+    payload = f"{norm_tool}|{norm_cwd}|{norm_action}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -492,6 +493,10 @@ SHELL_TOOLS = {
 }
 EDIT_TOOLS = {"write", "edit", "multiedit", "notebookedit", "fileedit", "writefile", "replace_file_content", "write_to_file"}
 DELETE_TOOLS = {"filedelete", "deletefile", "delete_file"}
+# Tools that send a request out of the machine: outbound traffic for exfiltration tracking
+NET_FETCH_TOOLS = {"webfetch", "web_fetch", "read_url_content", "fetch_url"}
+# Argument keys that name the files a read/search tool touches
+_READ_TARGET_KEYS = ("file_path", "path", "notebook_path", "AbsolutePath", "TargetFile", "SearchPath", "glob", "include", "Includes")
 
 _SAFE_CMDS = {
     "ls", "dir", "pwd", "cd", "cat", "type", "head", "tail", "less", "more", "wc", "grep", "rg",
@@ -587,16 +592,24 @@ def _patch_actions(patch: str) -> list[str]:
 _GUARDRAIL_CONTROL_FILES = (
     "policy.yaml", "policy.yml", "check_action.py", "guardrail_hook.py",
     "daemon_manager.py", "install.py", "mcp_server.py", ".guardrail", ".claude/settings.json",
+    ".claude/settings.local.json", ".guardrail/state.json", ".guardrail/config.json",
     ".codex/hooks.json", ".agents/hooks.json", ".cursorrules", ".cursor/rules/guardrail.mdc",
 )
 
 
 def _is_guardrail_file(path: str) -> bool:
     p_canon = path.replace("\\", "/").lower()
-    return any(gf in p_canon or p_canon.endswith(gf.lstrip("/")) for gf in _GUARDRAIL_CONTROL_FILES)
+    if any(gf in p_canon or p_canon.endswith(gf.lstrip("/")) for gf in _GUARDRAIL_CONTROL_FILES):
+        return True
+    # GUARDRAIL_HOME may live outside ~/.guardrail: its state and config are control plane too
+    try:
+        resolved = os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+        return resolved in {os.path.normcase(str(p)) for p in (STATE_PATH, CONFIG_PATH)}
+    except (TypeError, ValueError):
+        return False
 
 
-def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
+def _tool_call(event: dict) -> tuple[str, dict]:
     if "toolCall" in event and isinstance(event["toolCall"], dict):
         tc = event["toolCall"]
         name = str(tc.get("name") or "")
@@ -604,17 +617,36 @@ def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
     else:
         name = str(event.get("tool_name") or "")
         inp = event.get("tool_input")
+    return name, (inp if isinstance(inp, dict) else {"value": inp})
+
+
+def _shell_command(inp: dict) -> str:
+    command = inp.get("command") or inp.get("CommandLine") or inp.get("cmd") or ""
+    if isinstance(command, list):
+        command = " ".join(map(str, command))
+    return str(command)
+
+
+def action_fingerprint_source(event: dict) -> str:
+    """Full text an approval is bound to: the entire shell command, or every tool argument.
+
+    The agent's free-text description is excluded so rewording it does not void an approval.
+    """
+    name, inp = _tool_call(event)
+    if name.lower() in SHELL_TOOLS:
+        return _shell_command(inp)
+    return json.dumps({k: v for k, v in inp.items() if k != "description"}, ensure_ascii=False, sort_keys=True)
+
+
+def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
+    name, inp = _tool_call(event)
     low = name.lower()
-    inp = inp if isinstance(inp, dict) else {"value": inp}
 
     if low in SKIP_TOOLS:
         return None, False, []
 
     if low in SHELL_TOOLS:
-        command = inp.get("command") or inp.get("CommandLine") or inp.get("cmd") or ""
-        if isinstance(command, list):
-            command = " ".join(map(str, command))
-        command = str(command)
+        command = _shell_command(inp)
         desc = command
         if inp.get("description"):
             desc = f"{command}\n(description: {inp['description']})"
@@ -657,8 +689,9 @@ def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
             return f"{verb} {path}\n[content]:\n{content_snippet}", False, [path]
         return f"{verb} {path}", False, [path]
 
-    if low == "webfetch":
-        return None, False, []
+    if low in NET_FETCH_TOOLS:
+        url = str(inp.get("url") or inp.get("Url") or inp.get("uri") or "")
+        return f"webfetch {url}", False, []
 
     args = json.dumps(inp, ensure_ascii=False)[:800]
     return f"execute tool {name} with arguments {args}", False, []
@@ -787,10 +820,13 @@ def on_prompt_submit(event: dict, host: str, state: State):
         if host == "claude":
             if cmd in ("off", "stop"):
                 return {
-                    "decision": "block",
-                    "continue": False,
-                    "stopReason": f"{combined_msg}{status_text(False)}",
-                    "reason": f"{combined_msg}{status_text(False)}",
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": (
+                            f"{combined_msg}{status_text(False)}\nInform the user that the guardrail is now disabled for this session. "
+                            "Actions will run directly without background guardrail interception until re-enabled with /guardrail on."
+                        ),
+                    }
                 }, 0
             if cmd == "status":
                 return {
@@ -980,15 +1016,19 @@ def on_prompt_expansion(event: dict, host: str, state: State):
     }, 0
 
 
-def _extract_read_target(event: dict) -> str:
-    """Extract target file path from read/inspection tools for trajectory tracking."""
-    if "toolCall" in event and isinstance(event["toolCall"], dict):
-        inp = event["toolCall"].get("args") or {}
-    else:
-        inp = event.get("tool_input") or {}
-    if not isinstance(inp, dict):
-        return ""
-    return str(inp.get("file_path") or inp.get("path") or inp.get("AbsolutePath") or inp.get("TargetFile") or "")
+def _read_targets(event: dict) -> list[str]:
+    """Files or glob patterns a read/search tool (Read, Grep, Glob...) touches."""
+    name, inp = _tool_call(event)
+    keys = list(_READ_TARGET_KEYS)
+    if name.lower() in ("glob", "find_by_name"):
+        keys.append("pattern")  # for Glob the pattern is the file pattern, for Grep it is the regex
+    targets: list[str] = []
+    for k in keys:
+        v = inp.get(k)
+        for item in (v if isinstance(v, list) else [v]):
+            if isinstance(item, str) and item.strip() and item not in targets:
+                targets.append(item)
+    return targets
 
 
 def on_pre_tool(event: dict, host: str, state: State):
@@ -1001,25 +1041,51 @@ def on_pre_tool(event: dict, host: str, state: State):
     import check_action as ca
 
     desc, safe_shell, paths = describe_tool(event)
-    if desc is None:
-        # Even for skipped read tools, track if the session accessed a secret file (e.g., .env, id_rsa)
-        read_target = _extract_read_target(event)
-        if read_target:
-            read_caps = ca.classify_capabilities(read_target)
-            if "cap:secret_access" in read_caps:
-                state.record_action(sid, f"read {read_target}", read_caps)
-                log({
-                    "host": host, "event": "secret_read_tracked", "session": sid,
-                    "text": f"read {read_target}"[:300], "capabilities": read_caps,
-                })
-        if host in ("antigravity", "agy", "gemini"):
-            return {"decision": "allow"}, 0
-        return None, 0
+    tool_ident = event.get("tool_name") or (event.get("toolCall", {}).get("name") if isinstance(event.get("toolCall"), dict) else "")
+    forced = None  # decision fixed by tool semantics rather than by the rules engine
 
-    rules = ca.evaluate_rules(desc)
+    if desc is None:
+        # Read/Grep/Glob are silent, except on secret files (.env, id_rsa, *.pem...): those need confirmation
+        secret_targets = [t for t in _read_targets(event) if ca.is_secret_path(t)]
+        if not secret_targets:
+            if host in ("antigravity", "agy", "gemini"):
+                return {"decision": "allow"}, 0
+            return None, 0
+        desc = "read secret file " + ", ".join(secret_targets)
+        read_caps = ["cap:secret_access"]
+        # Taint the session right away, so a later outbound request is caught as exfiltration
+        state.record_action(sid, desc[:160], read_caps)
+        log({
+            "host": host, "event": "secret_read_tracked", "session": sid,
+            "text": desc[:300], "capabilities": read_caps,
+        })
+        paths = secret_targets
+        forced = ca.Decision(
+            "ask_user", "rules", ca.RuleResult("ask_user", ["ask_user:secret file read"]),
+            capabilities=read_caps, risk_score=0.55, risk_factors=["cap:secret_access"],
+        )
+    elif str(tool_ident).lower() in NET_FETCH_TOOLS:
+        net_caps = ["cap:net_outbound"]
+        if ca.get_risk_config().get("chained_exfiltration", True) and "cap:secret_access" in state.recent_capabilities(sid):
+            forced = ca.Decision(
+                "block", "rules", ca.RuleResult("block", ["block:chained secret exfiltration"]),
+                capabilities=net_caps, risk_score=0.95,
+                risk_factors=["cap:net_outbound", "context:chained_secret_exfiltration"],
+            )
+        else:
+            state.record_action(sid, desc[:160], net_caps)
+            log({
+                "host": host, "event": "tool", "session": sid, "tool": tool_ident,
+                "text": desc[:300], "decision": "proceed", "risk_score": 0.1,
+                "capabilities": net_caps, "why": "outbound fetch, no secret accessed in session",
+            })
+            if host in ("antigravity", "agy", "gemini"):
+                return {"decision": "allow"}, 0
+            return None, 0
+
+    rules = forced.rules if forced else ca.evaluate_rules(desc)
     cwd = str(event.get("cwd") or (event.get("workspacePaths", [""])[0] if event.get("workspacePaths") else ""))
     outside = [p for p in paths if _outside(p, cwd)]
-    tool_ident = event.get("tool_name") or (event.get("toolCall", {}).get("name") if isinstance(event.get("toolCall"), dict) else "")
 
     ctx = ca.inspect_execution_context(
         cwd=cwd,
@@ -1042,7 +1108,7 @@ def on_pre_tool(event: dict, host: str, state: State):
                 return {"decision": "allow"}, 0
             return None, 0
 
-    result = evaluate(desc, state, context=ctx)
+    result = forced or evaluate(desc, state, context=ctx)
     final = result.decision
     reason = _reason(result)
     if outside and final == "proceed":
@@ -1082,7 +1148,7 @@ def on_pre_tool(event: dict, host: str, state: State):
         s = state.session(sid)
         turn = event.get("turn_id")
         now = time.time()
-        curr_fp = compute_action_fingerprint(short, str(tool_ident), cwd)
+        curr_fp = compute_action_fingerprint(action_fingerprint_source(event), str(tool_ident), cwd)
         grant = s.get("approval_grant")
         mem_cfg = ca.get_memory_config()
         confirm_window = float(mem_cfg.get("confirm_window_secs", CONFIRM_WINDOW_SECS))
