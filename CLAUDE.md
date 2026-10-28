@@ -61,7 +61,7 @@ Once activated:
 
 ## 4. Unit Tests
 
-Run the test suites (160 tests total):
+Run the test suites (173 tests total):
 ```bash
 python -B tests/test_check_action.py
 python -B tests/test_guardrail_hook.py

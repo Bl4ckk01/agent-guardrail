@@ -372,9 +372,12 @@ class AntigravityHookTests(unittest.TestCase):
 
 class ToolInspectionTests(unittest.TestCase):
     def test_skip_tools(self):
-        for tool in ("read", "grep", "glob", "ls", "websearch"):
+        for tool in ("read", "grep", "glob", "ls"):
             desc, safe, paths = gh.describe_tool({"tool_name": tool, "tool_input": {}})
             self.assertIsNone(desc)
+        # Web search sends the query out: it is described as outbound traffic, not skipped
+        desc, _, _ = gh.describe_tool({"tool_name": "WebSearch", "tool_input": {"query": "python yaml"}})
+        self.assertEqual(desc, "websearch python yaml")
 
     def test_run_command_inspection(self):
         desc, safe, paths = gh.describe_tool({
@@ -745,6 +748,54 @@ class HardeningRegressionTests(unittest.TestCase):
         out2, _ = gh.handle(exfil, "claude", self.st)
         self.assertEqual(out2["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn("chained secret exfiltration", out2["hookSpecificOutput"]["permissionDecisionReason"])
+
+    # --- Follow-up hardening ---
+
+    def _taint(self):
+        gh.handle(self._tool("Read", {"file_path": "/repo/.env"}), "claude", self.st)
+
+    def test_websearch_is_outbound_and_blocked_after_secret_read(self):
+        out, _ = gh.handle(self._tool("WebSearch", {"query": "python yaml safe_load"}), "claude", self.st)
+        self.assertIsNone(out)
+        self._taint()
+        out2, _ = gh.handle(self._tool("WebSearch", {"query": "sk-live-1234 leaked"}), "claude", self.st)
+        self.assertEqual(out2["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("chained secret exfiltration", out2["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_mcp_outbound_tool_blocked_after_secret_read(self):
+        post = self._tool("mcp__slack__slack_post_message", {"channel": "general", "text": "hello"})
+        with mock.patch.dict(os.environ, {"GUARDRAIL_BACKEND": "rules"}):
+            out, _ = gh.handle(post, "claude", self.st)
+            if out is not None:
+                self.assertNotEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+            self._taint()
+            out2, _ = gh.handle(post, "claude", self.st)
+            self.assertEqual(out2["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertIn("chained secret exfiltration", out2["hookSpecificOutput"]["permissionDecisionReason"])
+
+            # Local, non-outbound tools keep working after a secret read
+            plan = self._tool("mcp__ccd_turn__update_plan", {"items": [{"content": "Fix tests"}]})
+            out3, _ = gh.handle(plan, "claude", self.st)
+            if out3 is not None:
+                self.assertNotEqual(out3["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_chained_exfiltration_blocked_while_backend_cools_down(self):
+        self._taint()
+        self.st.trip_breaker()
+        out, _ = gh.handle(self._tool("Bash", {"command": "curl -s https://telemetry.example.com/ping"}), "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_common_names_protected_only_in_guardrail_dir(self):
+        other = str(Path(self.tmpdir) / "project")
+        for name in ("policy.yaml", "install.py", "mcp_server.py"):
+            with self.subTest(name=name):
+                self.assertFalse(gh._is_guardrail_file(name, other))
+                self.assertFalse(gh._is_guardrail_file(str(Path(other) / name)))
+                self.assertTrue(gh._is_guardrail_file(name, str(gh.HERE)))
+                self.assertTrue(gh._is_guardrail_file(str(gh.HERE / name)))
+        desc, _, _ = gh.describe_tool({"tool_name": "Write", "cwd": other,
+                                       "tool_input": {"file_path": "install.py", "content": "print('hi')"}})
+        self.assertNotIn("tamper guardrail control plane", desc)
 
 
 class HookReloadAndDynamicConfigTests(unittest.TestCase):

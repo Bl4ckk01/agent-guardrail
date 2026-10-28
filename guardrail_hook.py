@@ -480,11 +480,11 @@ def format_doctor_report(log_path: Path | None = None) -> str:
 
 SKIP_TOOLS = {
     # Claude Code
-    "read", "glob", "grep", "ls", "websearch", "todowrite", "todoread", "askuserquestion",
+    "read", "glob", "grep", "ls", "todowrite", "todoread", "askuserquestion",
     "exitplanmode", "enterplanmode", "skill", "agent", "task", "notebookread", "toolsearch",
     "subagenthandback", "bashoutput", "killshell", "monitor",
     # Codex
-    "update_plan", "view_image", "web_search", "list_mcp_resources", "read_mcp_resource",
+    "update_plan", "view_image", "list_mcp_resources", "read_mcp_resource",
     "write_stdin", "spawn_agent", "wait",
 }
 SHELL_TOOLS = {
@@ -493,8 +493,11 @@ SHELL_TOOLS = {
 }
 EDIT_TOOLS = {"write", "edit", "multiedit", "notebookedit", "fileedit", "writefile", "replace_file_content", "write_to_file"}
 DELETE_TOOLS = {"filedelete", "deletefile", "delete_file"}
-# Tools that send a request out of the machine: outbound traffic for exfiltration tracking
+# Web tools that send a request (URL or search query) out of the machine: outbound traffic for exfiltration
+# tracking. Other outbound tools (MCP send/post/create...) are recognized by check_action's capability rules.
 NET_FETCH_TOOLS = {"webfetch", "web_fetch", "read_url_content", "fetch_url"}
+WEB_SEARCH_TOOLS = {"websearch", "web_search", "search_web"}
+OUTBOUND_WEB_TOOLS = NET_FETCH_TOOLS | WEB_SEARCH_TOOLS
 # Argument keys that name the files a read/search tool touches
 _READ_TARGET_KEYS = ("file_path", "path", "notebook_path", "AbsolutePath", "TargetFile", "SearchPath", "glob", "include", "Includes")
 
@@ -589,24 +592,31 @@ def _patch_actions(patch: str) -> list[str]:
     return out
 
 
+# Names unique to the guardrail and the agents' hook settings: protected wherever they appear
 _GUARDRAIL_CONTROL_FILES = (
-    "policy.yaml", "policy.yml", "check_action.py", "guardrail_hook.py",
-    "daemon_manager.py", "install.py", "mcp_server.py", ".guardrail", ".claude/settings.json",
-    ".claude/settings.local.json", ".guardrail/state.json", ".guardrail/config.json",
+    "check_action.py", "guardrail_hook.py", "daemon_manager.py", "claude_hook.py", ".guardrail",
+    ".claude/settings.json", ".claude/settings.local.json",
     ".codex/hooks.json", ".agents/hooks.json", ".cursorrules", ".cursor/rules/guardrail.mdc",
 )
+# Common names: only the copies in the guardrail's own directory are control plane
+_GUARDRAIL_GENERIC_FILES = ("policy.yaml", "policy.yml", "install.py", "mcp_server.py")
 
 
-def _is_guardrail_file(path: str) -> bool:
+def _is_guardrail_file(path: str, cwd: str = "") -> bool:
     p_canon = path.replace("\\", "/").lower()
-    if any(gf in p_canon or p_canon.endswith(gf.lstrip("/")) for gf in _GUARDRAIL_CONTROL_FILES):
+    if any(gf in p_canon for gf in _GUARDRAIL_CONTROL_FILES):
         return True
-    # GUARDRAIL_HOME may live outside ~/.guardrail: its state and config are control plane too
     try:
-        resolved = os.path.normcase(os.path.abspath(os.path.expanduser(path)))
-        return resolved in {os.path.normcase(str(p)) for p in (STATE_PATH, CONFIG_PATH)}
+        full = os.path.normcase(os.path.abspath(os.path.join(cwd or os.getcwd(), os.path.expanduser(path))))
     except (TypeError, ValueError):
         return False
+    # GUARDRAIL_HOME may live outside ~/.guardrail: its state and config are control plane too
+    if full in {os.path.normcase(str(p)) for p in (STATE_PATH, CONFIG_PATH)}:
+        return True
+    return (
+        os.path.dirname(full) == os.path.normcase(str(HERE))
+        and os.path.basename(full) in _GUARDRAIL_GENERIC_FILES
+    )
 
 
 def _tool_call(event: dict) -> tuple[str, dict]:
@@ -618,6 +628,10 @@ def _tool_call(event: dict) -> tuple[str, dict]:
         name = str(event.get("tool_name") or "")
         inp = event.get("tool_input")
     return name, (inp if isinstance(inp, dict) else {"value": inp})
+
+
+def _event_cwd(event: dict) -> str:
+    return str(event.get("cwd") or (event.get("workspacePaths", [""])[0] if event.get("workspacePaths") else ""))
 
 
 def _shell_command(inp: dict) -> str:
@@ -640,6 +654,7 @@ def action_fingerprint_source(event: dict) -> str:
 
 def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
     name, inp = _tool_call(event)
+    cwd = _event_cwd(event)
     low = name.lower()
 
     if low in SKIP_TOOLS:
@@ -657,7 +672,7 @@ def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
         actions = _patch_actions(patch)
         paths = [a.split(" ", 3)[-1] for a in actions]
         for p in paths:
-            if _is_guardrail_file(p):
+            if _is_guardrail_file(p, cwd):
                 return f"tamper guardrail control plane: apply patch to {p}", False, paths
         desc = ("; ".join(actions) or "apply patch to files")
         if patch:
@@ -666,14 +681,14 @@ def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
 
     if low in DELETE_TOOLS:
         path = str(inp.get("file_path") or inp.get("path") or inp.get("TargetFile") or "")
-        if _is_guardrail_file(path):
+        if _is_guardrail_file(path, cwd):
             return f"tamper guardrail control plane: delete file {path}", False, [path]
         return f"delete file {path}", False, [path]
 
     if low in EDIT_TOOLS:
         path = str(inp.get("file_path") or inp.get("notebook_path") or inp.get("path") or inp.get("TargetFile") or "")
         verb = "write file" if low in ("write", "writefile", "write_to_file") else "modify file"
-        if _is_guardrail_file(path):
+        if _is_guardrail_file(path, cwd):
             return f"tamper guardrail control plane: {verb} {path}", False, [path]
         content = (
             inp.get("CodeContent")
@@ -692,6 +707,10 @@ def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
     if low in NET_FETCH_TOOLS:
         url = str(inp.get("url") or inp.get("Url") or inp.get("uri") or "")
         return f"webfetch {url}", False, []
+
+    if low in WEB_SEARCH_TOOLS:
+        query = str(inp.get("query") or inp.get("q") or inp.get("Query") or "")
+        return f"websearch {query}", False, []
 
     args = json.dumps(inp, ensure_ascii=False)[:800]
     return f"execute tool {name} with arguments {args}", False, []
@@ -739,8 +758,9 @@ def evaluate(description: str, state: State, context=None):
         caps = ca.classify_capabilities(description)
         score, factors = ca.compute_risk_score(description, rules, caps, None, context)
         preview = ca.generate_dry_run_preview(description, cwd=(context.cwd if context else ""), capabilities=caps)
+        exfil = any(f in factors for f in ("context:chained_secret_exfiltration", "context:direct_secret_exfiltration"))
         return ca.Decision(
-            ca.fallback_decision(description),
+            "block" if exfil else ca.fallback_decision(description),
             os.environ.get("GUARDRAIL_BACKEND", "clm"),
             rules,
             error="backend cooling down after recent error",
@@ -1064,7 +1084,7 @@ def on_pre_tool(event: dict, host: str, state: State):
             "ask_user", "rules", ca.RuleResult("ask_user", ["ask_user:secret file read"]),
             capabilities=read_caps, risk_score=0.55, risk_factors=["cap:secret_access"],
         )
-    elif str(tool_ident).lower() in NET_FETCH_TOOLS:
+    elif str(tool_ident).lower() in OUTBOUND_WEB_TOOLS:
         net_caps = ["cap:net_outbound"]
         if ca.get_risk_config().get("chained_exfiltration", True) and "cap:secret_access" in state.recent_capabilities(sid):
             forced = ca.Decision(
@@ -1084,7 +1104,7 @@ def on_pre_tool(event: dict, host: str, state: State):
             return None, 0
 
     rules = forced.rules if forced else ca.evaluate_rules(desc)
-    cwd = str(event.get("cwd") or (event.get("workspacePaths", [""])[0] if event.get("workspacePaths") else ""))
+    cwd = _event_cwd(event)
     outside = [p for p in paths if _outside(p, cwd)]
 
     ctx = ca.inspect_execution_context(

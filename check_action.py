@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import re
@@ -87,12 +88,43 @@ _CRITICAL_TARGET = (
     r"|\b(?:main|master)\s+branch|branch\s+(?:main|master)\b|(?:the\s+)?(?:whole|entire)\s+repo\w*"
     r"|\bdisk\b|\bpartition\b|home\s+directory|(?:the\s+)?(?:whole|entire|all)\s+(?:s3\s+)?buckets?\b|docker\s+volumes?)"
 )
-# Guardrail control plane: code, policy, session state/config and the agents' hook settings
-_GUARDRAIL_FILES = (
-    r"(?:\bpolicy\.ya?ml\b|\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\binstall\.py\b|\bmcp_server\.py\b"
-    r"|\.guardrail\b|\.claude[/\\]+settings(?:\.local)?\.json\b|\.codex[/\\]+hooks\.json\b|\.agents[/\\]+hooks\.json\b|\.cursorrules\b)"
+# Guardrail control plane: code, policy, session state/config and the agents' hook settings.
+# Names unique to the guardrail are protected wherever they appear.
+_GUARDRAIL_DISTINCTIVE_FILES = (
+    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b"
+    r"|\.guardrail\b|\.claude[/\\]+settings(?:\.local)?\.json\b|\.codex[/\\]+hooks\.json\b|\.agents[/\\]+hooks\.json\b|\.cursorrules\b"
 )
+# Common names are only the guardrail's own when they sit in its directory: other projects
+# have their own policy.yaml / install.py / mcp_server.py.
+_GUARDRAIL_GENERIC_FILES = r"\bpolicy\.ya?ml\b|\binstall\.py\b|\bmcp_server\.py\b"
+_GUARDRAIL_DIR = Path(__file__).resolve().parent
+_GUARDRAIL_FILES = (
+    r"(?:" + _GUARDRAIL_DISTINCTIVE_FILES
+    + r"|" + re.escape(_GUARDRAIL_DIR.name) + r"[/\\]+(?:" + _GUARDRAIL_GENERIC_FILES + r"))"
+)
+# Used when the current directory is the guardrail's own: bare relative names point at its files
+_GUARDRAIL_FILES_HERE = r"(?:" + _GUARDRAIL_DISTINCTIVE_FILES + r"|" + _GUARDRAIL_GENERIC_FILES + r")"
 _WRITE_MODE = r"['\"]?(?:[wax]\+?b?|[wax]b\+?|r\+b?|rb\+)['\"]?\s*[,)]"
+# Directories before a file name: a quoted path may contain spaces, a bare one may not
+_PATH_PREFIX = r"(?:\"[^\"\n]*?|'[^'\n]*?|[^\s;&|'\"]*)"
+
+
+def _tamper_file_rules(files: str) -> tuple[tuple[str, str], ...]:
+    """Block rules for deleting or writing (via shell or script) the given control-plane files."""
+    return (
+        ("guardrail self tampering file", r"\b(?:rm|del|erase|unlink|remove-item|drop|truncate|format)\b.*" + files),
+        ("guardrail self tampering write",
+         # Shell redirection, tee and PowerShell writers aimed at a control-plane file
+         r"(?:>{1,2}\|?|\btee\b(?:\s+-\S+)*|\b(?:set-content|add-content|out-file|clear-content|new-item|sc|ac)\b[^;&|\n]*?|\bsed\s+(?:-\S+\s+)*?-i\S*[^;&|\n]*?)"
+         r"\s*" + _PATH_PREFIX + files
+         # Copy/move/link with a control-plane file as destination (last argument)
+         + r"|\b(?:cp|mv|ln|copy|move|copy-item|move-item|cpi|mi|rename-item|ren)\b[^;&|\n]*?\s" + _PATH_PREFIX + files + r"['\"]?\s*(?:$|[;&|\n])"
+         # Script writers: open(path, 'w'), Path(path).write_text(), fs.writeFileSync(), [IO.File]::WriteAllText()
+         + r"|\bopen\s*\([^)]*" + files + r"[^)]*?[,=]\s*" + _WRITE_MODE
+         + r"|" + files + r"['\"]?\s*\)\s*\.\s*(?:write_text|write_bytes|open\s*\([^)]*?[wax])"
+         + r"|\b(?:writefilesync|writefile|appendfilesync|appendfile)\s*\([^)]*?" + files
+         + r"|\[(?:system\.)?io\.file\]::(?:write|append)\w*\s*\([^)]*?" + files),
+    )
 
 # Categorical block rules (< 0.1ms)
 BLOCK_RULES: tuple[tuple[str, str], ...] = (
@@ -173,18 +205,7 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("secret exfiltration curl wget", r"\b(?:curl|wget)\b.*(?:-d|--data(?:-binary)?|-F|--post-file)\s*@(?:/etc/|\.env|\$env:|\S*id_rsa|\S*id_ed25519)"),
     ("shell startup file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*~?/?(?:\.bashrc|\.bash_profile|\.zshrc|\.profile|/etc/profile|/etc/environment|\$profile)\b"),
     ("crontab file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*/etc/cron"),
-    ("guardrail self tampering file", r"\b(?:rm|del|erase|unlink|remove-item|drop|truncate|format)\b.*" + _GUARDRAIL_FILES),
-    ("guardrail self tampering write",
-     # Shell redirection, tee and PowerShell writers aimed at a control-plane file
-     r"(?:>{1,2}\|?|\btee\b(?:\s+-\S+)*|\b(?:set-content|add-content|out-file|clear-content|new-item|sc|ac)\b[^;&|\n]*?|\bsed\s+(?:-\S+\s+)*?-i\S*[^;&|\n]*?)"
-     r"\s*['\"]?[^\s;&|'\"]*" + _GUARDRAIL_FILES
-     # Copy/move/link with a control-plane file as destination (last argument)
-     + r"|\b(?:cp|mv|ln|copy|move|copy-item|move-item|cpi|mi|rename-item|ren)\b[^;&|\n]*?\s['\"]?[^\s;&|'\"]*" + _GUARDRAIL_FILES + r"['\"]?\s*(?:$|[;&|\n])"
-     # Script writers: open(path, 'w'), Path(path).write_text(), fs.writeFileSync(), [IO.File]::WriteAllText()
-     + r"|\bopen\s*\([^)]*" + _GUARDRAIL_FILES + r"[^)]*?[,=]\s*" + _WRITE_MODE
-     + r"|" + _GUARDRAIL_FILES + r"['\"]?\s*\)\s*\.\s*(?:write_text|write_bytes|open\s*\([^)]*?[wax])"
-     + r"|\b(?:writefilesync|writefile|appendfilesync|appendfile)\s*\([^)]*?" + _GUARDRAIL_FILES
-     + r"|\[(?:system\.)?io\.file\]::(?:write|append)\w*\s*\([^)]*?" + _GUARDRAIL_FILES),
+    *_tamper_file_rules(_GUARDRAIL_FILES),
     ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
     ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
 )
@@ -290,6 +311,15 @@ _INSPECTION_WHITELIST = (
 _COMPILED_BLOCK = tuple((name, re.compile(rx) if name == "git branch force delete" else re.compile(rx, re.IGNORECASE)) for name, rx in BLOCK_RULES)
 _COMPILED_ASK = tuple((name, re.compile(rx, re.IGNORECASE)) for name, rx in ASK_RULES)
 _COMPILED_PROCEED = tuple((name, re.compile(rx, re.IGNORECASE)) for name, rx in PROCEED_RULES)
+_COMPILED_TAMPER_HERE = tuple((name, re.compile(rx, re.IGNORECASE)) for name, rx in _tamper_file_rules(_GUARDRAIL_FILES_HERE))
+
+
+def _cwd_is_guardrail_dir() -> bool:
+    try:
+        cwd = Path.cwd().resolve()
+    except OSError:
+        return False
+    return cwd == _GUARDRAIL_DIR or _GUARDRAIL_DIR in cwd.parents
 
 
 # Zero-width & invisible characters to strip unconditionally
@@ -347,8 +377,11 @@ def _canonicalize_path_string(text: str) -> str:
     return t
 
 
-def deobfuscate_shell_syntax(text: str) -> str:
-    """Strip shell obfuscation: quote-splicing, backslash escapes, $IFS, hex/octal escapes, reversed text."""
+def deobfuscate_shell_syntax(text: str, keep_quotes: bool = False) -> str:
+    """Strip shell obfuscation: quote-splicing, backslash escapes, $IFS, hex/octal escapes, reversed text.
+
+    keep_quotes leaves quoting intact so quoted arguments can still be told apart from command separators.
+    """
     if not text:
         return ""
     s = text
@@ -378,9 +411,10 @@ def deobfuscate_shell_syntax(text: str) -> str:
 
     # 4. Collapse quote splicing: remove quotes within word tokens
     # E.g. r""m -> rm, 'r''m' -> rm, "r""m" -> rm, 'r'm -> rm, r'm' -> rm
-    s = re.sub(r'""|\'\'', '', s)
-    s = re.sub(r"(?<=[a-zA-Z0-9_./-])['\"]+|['\"]+(?=[a-zA-Z0-9_./-])", "", s)
-    s = re.sub(r"(^|[\s;&|])['\"]([a-zA-Z0-9_./-]+)['\"](?=[\s;&|]|$)", r"\1\2", s)
+    if not keep_quotes:
+        s = re.sub(r'""|\'\'', '', s)
+        s = re.sub(r"(?<=[a-zA-Z0-9_./-])['\"]+|['\"]+(?=[a-zA-Z0-9_./-])", "", s)
+        s = re.sub(r"(^|[\s;&|])['\"]([a-zA-Z0-9_./-]+)['\"](?=[\s;&|]|$)", r"\1\2", s)
 
     # 5. Simple brace expansion: {rm,-rf,/} -> rm -rf /
     def _expand_braces(m: re.Match) -> str:
@@ -684,7 +718,11 @@ def split_command_chain(text: str) -> list[str]:
             continue
         buf.append(ch)
         i += 1
-    segments.append("".join(buf))
+    if quote:
+        # Unbalanced quote (an apostrophe in prose, a malformed line): quoting cannot be trusted
+        segments = re.split(r"&&|\|\||[;|\n\r]", text)
+    else:
+        segments.append("".join(buf))
     return [s.strip() for s in segments if s.strip()]
 
 
@@ -693,15 +731,31 @@ def split_command_chain(text: str) -> list[str]:
 _DESCRIPTION_NOTE_RE = re.compile(r"^\(description: [^$`()<>\\\n]*\)$", re.IGNORECASE)
 
 
-def chain_segments(description: str) -> list[str]:
-    """Links of a chained command across raw, normalized and de-obfuscated forms ([] for a single command)."""
+def _blank_quoted(text: str) -> str:
+    """Replace the content of balanced quoted strings with an empty pair: 'cat "a; b"' -> 'cat ""'."""
+    return re.sub(r"\"[^\"\n]*\"|'[^'\n]*'", '""', text)
+
+
+def chain_segments(description: str) -> tuple[list[str], list[str]]:
+    """Links of a chained command: ([] , []) for a single command.
+
+    Returns (links, hidden): links of the command line as written (raw and normalized), and links that only
+    appear once escapes are decoded ($'\\x3b', $IFS...). Quotes are honoured in both, so grep "a|b" is one
+    command. Hidden links may escalate a decision but never take a whitelist away.
+    """
     base = normalize(description)
-    segments: list[str] = []
-    for src in (description, base, deobfuscate_shell_syntax(base)):
-        parts = [p for p in split_command_chain(src) if not _DESCRIPTION_NOTE_RE.match(p)]
+
+    def _parts(src: str) -> list[str]:
+        return [p for p in split_command_chain(src) if not _DESCRIPTION_NOTE_RE.match(p)]
+
+    links: list[str] = []
+    for src in (description, base):
+        parts = _parts(src)
         if len(parts) > 1:
-            segments.extend(p for p in parts if p not in segments)
-    return segments
+            links.extend(p for p in parts if p not in links)
+    deobf_parts = _parts(deobfuscate_shell_syntax(base, keep_quotes=True))
+    hidden = [p for p in deobf_parts if p not in links] if len(deobf_parts) > 1 else []
+    return links, hidden
 
 
 @dataclass
@@ -823,6 +877,19 @@ _AUDIT_CONFIG: dict = {
     "log_file": "",
     "hash_chaining": True,
 }
+
+# Built-in values every (re)load starts from, so a key removed from policy.yaml really goes away
+_CONFIG_DEFAULTS: tuple[tuple[dict, dict], ...] = tuple(
+    (cfg, copy.deepcopy(cfg))
+    for cfg in (_BRANCH_PROTECTION, _CREDENTIALS_PROTECTION, _RISK_CONFIG, _DRY_RUN_CONFIG, _MEMORY_CONFIG, _AUDIT_CONFIG)
+)
+
+
+def _reset_config_defaults() -> None:
+    # Reset in place: callers may hold references to these dicts
+    for cfg, default in _CONFIG_DEFAULTS:
+        cfg.clear()
+        cfg.update(copy.deepcopy(default))
 
 
 def _find_policy_file(specified: str | Path | None = None) -> Path | None:
@@ -1067,8 +1134,9 @@ def load_policy(file_path: str | Path | None = None) -> dict:
     p = _find_policy_file(file_path)
     _LOADED_POLICY_PATH = p
     _WORKSPACE_POLICY_PATH = None
+    _reset_config_defaults()
 
-    data = (_read_policy(p) if p and p.is_file() else None) or {}
+    data =(_read_policy(p) if p and p.is_file() else None) or {}
     _apply_trusted_policy(data)
 
     # An explicitly chosen policy file is used alone
@@ -1184,6 +1252,8 @@ def evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     # 5. Evaluate all layers: most severe takes absolute priority
     # Check block rules first across ALL layers
     all_blocks = list(_COMPILED_BLOCK) + _CUSTOM_BLOCK
+    if _cwd_is_guardrail_dir():
+        all_blocks += list(_COMPILED_TAMPER_HERE)
     blocked_matches: list[str] = []
     for layer in unwrapped_layers:
         for name, rx in all_blocks:
@@ -1222,27 +1292,32 @@ def evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
 
     # Chained commands: each link is judged on its own. One link asking for confirmation makes the
     # whole chain ask; the chain is whitelisted only if every link is whitelisted by itself.
-    segments = chain_segments(description) if _chain_depth < 2 else []
-    if segments:
-        seg_results = [evaluate_rules(seg, _chain_depth + 1) for seg in segments]
+    links, hidden = chain_segments(description) if _chain_depth < 2 else ([], [])
+    if links or hidden:
+        link_results = [evaluate_rules(seg, _chain_depth + 1) for seg in links]
+        all_results = link_results + [evaluate_rules(seg, _chain_depth + 1) for seg in hidden]
         for level in ("block", "ask_user"):
-            tags: list[str] = []
-            for r in seg_results:
-                if r.decision == level:
+            hits = [r for r in all_results if r.decision == level]
+            if hits:
+                tags: list[str] = []
+                for r in hits:
                     tags.extend(t for t in r.matched if t not in tags)
-            if tags or any(r.decision == level for r in seg_results):
                 return RuleResult(level, tags)
-        if all(r.matched for r in seg_results):
-            tags = []
-            for r in seg_results:
-                tags.extend(t for t in r.matched if t not in tags)
-            return RuleResult("proceed", tags)
-        # Some links match no rule at all: not whitelisted, the backend judges the whole chain
-        return RuleResult("proceed", [])
+        if links:
+            if all(r.matched for r in link_results):
+                tags = []
+                for r in link_results:
+                    tags.extend(t for t in r.matched if t not in tags)
+                return RuleResult("proceed", tags)
+            # Some links match no rule at all: not whitelisted, the backend judges the whole chain
+            return RuleResult("proceed", [])
+        # Only de-obfuscation split it, and no hidden link is risky: judge it as a single command
 
-    # Check whitelist (proceed rules) across outer text
+    # Check whitelist (proceed rules) across outer text. Quoted arguments are blanked first: a separator
+    # inside quotes (bash -c "rm x; cat y") must not let an inner command whitelist the outer one.
     all_proceed_rules = list(_COMPILED_PROCEED) + _CUSTOM_PROCEED
-    whitelist_matches = [name for name, rx in all_proceed_rules if rx.search(base_text) or rx.search(deobf_text)]
+    whitelist_texts = {_blank_quoted(base_text), _blank_quoted(deobfuscate_shell_syntax(base_text, keep_quotes=True))}
+    whitelist_matches = [name for name, rx in all_proceed_rules if any(rx.search(t) for t in whitelist_texts)]
     path_proceeds = [r.name for r in _PATH_RULES if r.decision == "proceed" and (r.matches(base_text) or r.matches(deobf_text))]
     all_proceeds = [f"proceed:whitelist:{n}" for n in whitelist_matches] + [f"proceed:path:{n}" for n in path_proceeds]
     if all_proceeds:
@@ -1979,7 +2054,13 @@ _CAPABILITY_PATTERNS: list[tuple[str, re.Pattern]] = [
         "cap:net_outbound",
         re.compile(
             r"\b(?:curl|wget|invoke-webrequest|invoke-restmethod|iwr|irm|nc|ncat|netcat|socat|"
-            r"ssh|scp|sftp|rsync|ftp|telnet|nslookup|dig|webfetch|web_fetch|read_url_content)\b|"
+            r"ssh|scp|sftp|rsync|ftp|telnet|nslookup|dig|webfetch|web_fetch|read_url_content|websearch|web_search|search_web)\b|"
+            # Generic/MCP tools that ship data to a third party (described by the hook as "execute tool <name> ...")
+            r"\bexecute tool \S*?(?:send|post|publish|upload|share|comment|reply|message|e?mail|notify|invite|tweet|submit|"
+            r"webhook|fetch|request|http|search|browse|navigate|"
+            r"create_(?:issue|pr|pull_request|page|comment|post|message|gist|file|event|draft)|"
+            r"update_(?:issue|pr|pull_request|page|file|comment|post|gist))|"
+            r"\bexecute tool \S+ with arguments .*?https?://|"
             r"\b(?:urllib\.request|requests\.(?:get|post|put|request)|http\.client|socket\.connect|fetch\s*\()|"
             r"/dev/(?:tcp|udp)/",
             re.IGNORECASE,
@@ -2375,7 +2456,8 @@ def decide(
     if rules.decision == "proceed" and rules.matched:
         # Coreutils read CLI commands (wc, cat, ls, grep, etc.) and safe test/lint tools are inspection: prevent embedding hallucinations from blocking them.
         # In a chain this holds only when every link is itself an inspection command.
-        units = [evaluate_rules(seg) for seg in chain_segments(description)] or [rules]
+        links, hidden = chain_segments(description)
+        units = [evaluate_rules(seg) for seg in links + hidden] or [rules]
         is_inspection = all(any(w in u.matched for w in _INSPECTION_WHITELIST) for u in units)
         if is_inspection and not re.search(_SECRET, normalize(description)):
             final_decision = "proceed"

@@ -959,6 +959,132 @@ class SecretPathRegressionTests(unittest.TestCase):
         self.assertIn("cap:net_outbound", ca.classify_capabilities("webfetch https://example.com"))
 
 
+class FollowUpHardeningTests(unittest.TestCase):
+    # --- Outbound tools beyond WebFetch ---
+
+    def test_outbound_tools_are_net_outbound(self):
+        for desc in (
+            'execute tool mcp__slack__slack_post_message with arguments {"channel": "general", "text": "hi"}',
+            'execute tool mcp__gmail__send_email with arguments {"to": "a@b.c"}',
+            'execute tool mcp__github__create_issue with arguments {"title": "x"}',
+            'execute tool mcp__notion__update_page with arguments {"id": "1"}',
+            'execute tool mcp__docs__lookup with arguments {"source": "https://example.com/x"}',
+            "websearch latest python release",
+        ):
+            with self.subTest(desc=desc):
+                self.assertIn("cap:net_outbound", ca.classify_capabilities(desc))
+
+    def test_local_tools_are_not_net_outbound(self):
+        desc = 'execute tool mcp__ccd_turn__update_plan with arguments {"items": [{"content": "Fix tests"}]}'
+        self.assertNotIn("cap:net_outbound", ca.classify_capabilities(desc))
+
+    def test_mcp_post_after_secret_read_is_blocked(self):
+        ctx = ca.inspect_execution_context(prior_capabilities=["cap:secret_access"], has_credentials=False, repo_branch="")
+        desc = 'execute tool mcp__slack__slack_post_message with arguments {"text": "API_KEY=..."}'
+        dec = ca.decide(desc, backend_name="rules", context=ctx)
+        self.assertEqual(dec.decision, "block")
+        self.assertIn("context:chained_secret_exfiltration", dec.risk_factors)
+
+    # --- Reload starts again from the defaults ---
+
+    def test_reload_restores_values_removed_from_policy(self):
+        import copy
+        import tempfile
+        ca.reload_policy()
+        before = [copy.deepcopy(f()) for f in (ca.get_branch_protection, ca.get_risk_config, ca.get_audit_config, ca.get_memory_config)]
+        tmp_policy = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8")
+        try:
+            tmp_policy.write(
+                "branch_protection:\n  protected_branches: ['only-this']\n"
+                "risk_scoring:\n  block_threshold: 0.5\n"
+                "audit_logging:\n  log_file: /tmp/elsewhere.log\n"
+                "memory_boundaries:\n  confirm_window_secs: 5\n"
+            )
+            tmp_policy.close()
+            ca.reload_policy(tmp_policy.name)
+            self.assertEqual(ca.get_branch_protection()["protected_branches"], ["only-this"])
+            self.assertEqual(ca.get_risk_config()["block_threshold"], 0.5)
+        finally:
+            os.unlink(tmp_policy.name)
+        ca.reload_policy()
+        after = [f() for f in (ca.get_branch_protection, ca.get_risk_config, ca.get_audit_config, ca.get_memory_config)]
+        self.assertEqual(after, before)
+
+    def test_removed_workspace_policy_stops_applying(self):
+        import tempfile
+        ca.reload_policy()
+        default_ask = ca.get_risk_config()["ask_threshold"]
+        orig_cwd = os.getcwd()
+        workdir = tempfile.mkdtemp()
+        try:
+            Path(workdir, "policy.yaml").write_text("risk_scoring:\n  ask_threshold: 0.1\n", encoding="utf-8")
+            os.chdir(workdir)
+            ca.reload_policy()
+            self.assertEqual(ca.get_risk_config()["ask_threshold"], 0.1)
+            os.chdir(orig_cwd)
+            ca.reload_policy()
+            self.assertEqual(ca.get_risk_config()["ask_threshold"], default_ask)
+            self.assertIsNone(ca.get_workspace_policy_path())
+        finally:
+            os.chdir(orig_cwd)
+            Path(workdir, "policy.yaml").unlink()
+            os.rmdir(workdir)
+            ca.reload_policy()
+
+    # --- Common file names are protected only in the guardrail's own directory ---
+
+    def test_common_names_in_other_projects_are_not_control_plane(self):
+        import tempfile
+        orig_cwd = os.getcwd()
+        workdir = tempfile.mkdtemp()
+        try:
+            os.chdir(workdir)
+            for text in ("rm policy.yaml", "echo x > install.py", "cp template.py mcp_server.py"):
+                with self.subTest(text=text):
+                    r = ca.evaluate_rules(text)
+                    self.assertFalse(any("self tampering" in m for m in r.matched), r.matched)
+            # Distinctive names and the guardrail's own files stay protected from anywhere
+            guardrail_policy = str(ca._GUARDRAIL_DIR / "policy.yaml")
+            for text in (
+                "rm check_action.py",
+                f'echo x > "{guardrail_policy}"',
+                f"echo x > ../{ca._GUARDRAIL_DIR.name}/policy.yaml",
+            ):
+                with self.subTest(text=text):
+                    self.assertEqual(ca.evaluate_rules(text).decision, "block")
+        finally:
+            os.chdir(orig_cwd)
+            os.rmdir(workdir)
+
+    def test_common_names_in_guardrail_dir_are_control_plane(self):
+        orig_cwd = os.getcwd()
+        try:
+            os.chdir(ca._GUARDRAIL_DIR)
+            for text in ("rm policy.yaml", "echo x > install.py", "cp template.py mcp_server.py"):
+                with self.subTest(text=text):
+                    self.assertEqual(ca.evaluate_rules(text).decision, "block")
+        finally:
+            os.chdir(orig_cwd)
+
+    # --- Quoted separators are not chain links ---
+
+    def test_quoted_pipe_keeps_whitelist(self):
+        for text in ('grep "a|b" file.txt', 'grep "pip install|npm install" requirements.txt', "grep -E 'x;y' notes.txt"):
+            with self.subTest(text=text):
+                r = ca.evaluate_rules(text)
+                self.assertEqual(r.decision, "proceed", r.matched)
+                self.assertIn("proceed:whitelist:read cli", r.matched)
+
+    def test_hidden_links_still_escalate(self):
+        for text in (
+            "cat file's notes; pip install evil",  # unbalanced apostrophe
+            'bash -c "rm notes.txt; cat y.txt"',
+            "ls foo$'\\x3b' pip install evil",  # ANSI-C escaped ';'
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(ca.evaluate_rules(text).decision, "ask_user")
+
+
 if __name__ == "__main__":
     unittest.main()
 
