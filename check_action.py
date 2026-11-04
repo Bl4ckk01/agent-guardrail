@@ -91,7 +91,7 @@ _CRITICAL_TARGET = (
 # Guardrail control plane: code, policy, session state/config and the agents' hook settings.
 # Names unique to the guardrail are protected wherever they appear.
 _GUARDRAIL_DISTINCTIVE_FILES = (
-    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b"
+    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b|\bpolicy_init\.py\b"
     r"|\.guardrail\b|\.claude[/\\]+settings(?:\.local)?\.json\b|\.codex[/\\]+hooks\.json\b|\.agents[/\\]+hooks\.json\b|\.cursorrules\b"
 )
 # Common names are only the guardrail's own when they sit in its directory: other projects
@@ -206,7 +206,7 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("shell startup file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*~?/?(?:\.bashrc|\.bash_profile|\.zshrc|\.profile|/etc/profile|/etc/environment|\$profile)\b"),
     ("crontab file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*/etc/cron"),
     *_tamper_file_rules(_GUARDRAIL_FILES),
-    ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
+    ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\b(?:guardrail_hook|policy_init)\.py\b.*--apply\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
     ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
     ("hardcoded secret in file", r"\bwrite\s+hardcoded\s+secret\b"),
 )
@@ -732,6 +732,26 @@ def split_command_chain(text: str) -> list[str]:
 _DESCRIPTION_NOTE_RE = re.compile(r"^\(description: [^$`()<>\\\n]*\)$", re.IGNORECASE)
 
 
+_EMBEDDED_CMD_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|[<>]\(([^()]*)\)")
+
+
+def embedded_commands(text: str, max_rounds: int = 6) -> list[str]:
+    """Commands run by substitutions inside a command line: $(...), `...`, <(...), >(...), innermost first."""
+    found: list[str] = []
+    cur = text or ""
+    for _ in range(max_rounds):
+        hits = list(_EMBEDDED_CMD_RE.finditer(cur))
+        if not hits:
+            break
+        for m in hits:
+            inner = next((g for g in m.groups() if g is not None), "").strip()
+            if inner and inner not in found:
+                found.append(inner)
+        # Replace each substitution by a placeholder so the command around it can be read on the next round
+        cur = _EMBEDDED_CMD_RE.sub("SUBST", cur)
+    return found
+
+
 def _blank_quoted(text: str) -> str:
     """Replace the content of balanced quoted strings with an empty pair: 'cat "a; b"' -> 'cat ""'."""
     return re.sub(r"\"[^\"\n]*\"|'[^'\n]*'", '""', text)
@@ -1228,6 +1248,57 @@ def reload_policy(file_path: str | Path | None = None) -> dict:
     }
 
 
+# Unrelated commands that normally ask for confirmation: a pattern matching most of them whitelists far too much
+_BROADNESS_PROBES = (
+    "pip install requests", "docker run -d nginx", "git push origin main",
+    "kubectl apply -f deploy.yaml", "curl https://example.com/data.json", "npm install left-pad",
+)
+
+
+def validate_allow_pattern(pattern: str) -> tuple[bool, str, "re.Pattern | None"]:
+    """Shared sanity checks for human-added 'safe' patterns (policy.yaml --allow and chat /guardrail allow)."""
+    pat = (pattern or "").strip()
+    if not pat:
+        return False, "Pattern cannot be empty.", None
+    if pat in (".*", ".+", "^.*$", "^.+$", "\\s*", "\\S+", ".") or len(pat) < 3:
+        return False, f"Refusing overly broad wildcard pattern: '{pat}'.", None
+    try:
+        compiled = re.compile(pat, re.IGNORECASE)
+    except re.error as exc:
+        return False, f"Invalid regular expression '{pat}': {exc}", None
+    if compiled.search("") or compiled.search("rm -rf /"):
+        return False, f"Pattern '{pat}' is unsafe (matches empty string or destructive commands).", None
+    if sum(1 for probe in _BROADNESS_PROBES if compiled.search(probe)) >= 3:
+        return False, f"Pattern '{pat}' is too broad (it matches unrelated commands that should keep asking).", None
+    return True, "", compiled
+
+
+def temp_allow_covers(description: str, result: RuleResult, patterns: list[str]) -> bool:
+    """True when the user's temporary allow patterns cover EVERY link that currently asks for confirmation.
+
+    Only rule-level confirmations can be waived: blocks never are, and a chain stays 'ask' as soon as one
+    asking link is not covered.
+    """
+    if result.decision != "ask_user" or not patterns:
+        return False
+    compiled = []
+    for p in patterns:
+        ok, _, rx = validate_allow_pattern(p)
+        if ok and rx is not None:
+            compiled.append(rx)
+    if not compiled:
+        return False
+    links, hidden = chain_segments(description)
+    units = links + hidden or [description]
+    for unit in units:
+        r = evaluate_rules(unit)
+        if r.decision == "block":
+            return False
+        if r.decision == "ask_user" and not any(rx.search(unit) for rx in compiled):
+            return False
+    return True
+
+
 def allow_custom_rule(
     pattern: str,
     name: str | None = None,
@@ -1237,17 +1308,10 @@ def allow_custom_rule(
     Append a safe custom proceed regex rule to policy.yaml (for user terminal invocation).
     Rejects overly broad catch-all patterns or invalid regular expressions.
     """
+    ok, msg, _ = validate_allow_pattern(pattern)
+    if not ok:
+        return False, msg
     pat = (pattern or "").strip()
-    if not pat:
-        return False, "Pattern cannot be empty."
-    if pat in (".*", ".+", "^.*$", "^.+$", "\\s*", "\\S+", ".") or len(pat) < 3:
-        return False, f"Refusing overly broad wildcard pattern: '{pat}'."
-    try:
-        compiled = re.compile(pat, re.IGNORECASE)
-    except re.error as exc:
-        return False, f"Invalid regular expression '{pat}': {exc}"
-    if compiled.search("") or compiled.search("rm -rf /"):
-        return False, f"Pattern '{pat}' is unsafe (matches empty string or destructive commands)."
 
     target = _find_policy_file(policy_file)
     if target is None:
@@ -1425,6 +1489,13 @@ def _evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
             # Some links match no rule at all: not whitelisted, the backend judges the whole chain
             return RuleResult("proceed", [])
         # Only de-obfuscation split it, and no hidden link is risky: judge it as a single command
+
+    # A whitelisted outer command must not launder what it runs inside substitutions: ls $(rm notes.txt)
+    for src in (description, base_text, deobf_text):
+        for inner in embedded_commands(src):
+            inner_result = _evaluate_rules(inner, 0)
+            if inner_result.decision in ("block", "ask_user"):
+                return RuleResult(inner_result.decision, list(inner_result.matched))
 
     # Check whitelist (proceed rules) across outer text. Quoted arguments are blanked first: a separator
     # inside quotes (bash -c "rm x; cat y") must not let an inner command whitelist the outer one.

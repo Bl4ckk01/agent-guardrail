@@ -8,6 +8,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+import _isolate  # noqa: E402,F401  (must run before check_action / guardrail_hook are imported)
+
 """
 Unit test suite for guardrail_hook.py.
 Verifies command parsing, state management, Claude Code hooks, Codex hooks,
@@ -18,6 +23,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -940,6 +946,116 @@ class NewFeatureHookTests(unittest.TestCase):
         self.assertIn("Nothing to undo", out2["stopReason"])
         # Info commands never toggle protection
         self.assertTrue(gh.is_active(self.st, "feat-sess", "claude"))
+
+
+class ChatCommandsAndIsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.st = gh.State(Path(self.tmpdir) / "state.json")
+        self.st.update("chat-sess", active=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _say(self, prompt, host="claude"):
+        out, _ = gh.on_prompt_submit({"prompt": prompt, "session_id": "chat-sess"}, host, self.st)
+        if host == "claude":
+            return out["hookSpecificOutput"]["additionalContext"]
+        return out["stopReason"]
+
+    def _tool(self, command, tool="Bash", cwd="/repo"):
+        return {"hook_event_name": "PreToolUse", "session_id": "chat-sess", "cwd": cwd,
+                "tool_name": tool, "tool_input": {"command": command}}
+
+    def _decision(self, command):
+        out, _ = gh.handle(self._tool(command), "claude", self.st)
+        return None if out is None else out["hookSpecificOutput"]["permissionDecision"]
+
+    # --- tests never touch the user's real guardrail home ---
+
+    def test_tests_run_against_an_isolated_guardrail_home(self):
+        real = Path.home() / ".guardrail"
+        self.assertNotEqual(gh.GUARDRAIL_HOME.resolve(), real.resolve())
+        self.assertIn("guardrail-tests-", str(gh.LOG_PATH))
+        self.assertTrue(str(gh.STATE_PATH).startswith(str(gh.GUARDRAIL_HOME)))
+        self.assertTrue(str(gh.TRASH_DIR).startswith(str(gh.GUARDRAIL_HOME)))
+
+    # --- /guardrail allow ---
+
+    def test_allow_waives_only_the_named_confirmation(self):
+        self.assertEqual(self._decision("pip install requests"), "ask")
+        msg = self._say(r"/guardrail allow \bpip\s+install\s+requests\b --for 30m")
+        self.assertIn("waived", msg)
+        self.assertIsNone(self._decision("pip install requests"))
+        self.assertEqual(self._decision("pip install other-package"), "ask")
+        self.assertEqual(self._decision("pip install requests && npm install left-pad"), "ask")
+        self.assertEqual(self._decision("ls $(npm install left-pad)"), "ask")
+
+    def test_allow_never_waives_blocks(self):
+        self._say(r"/guardrail allow \brm\b.*\bbuild\b")
+        out, _ = gh.handle(self._tool("rm -rf build/"), "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_allow_expires_and_can_be_cleared(self):
+        self._say(r"/guardrail allow \bpip\s+install\s+requests\b --for 30m")
+        now = time.time()
+        with mock.patch("time.time", return_value=now + 31 * 60):
+            self.assertEqual(self._decision("pip install requests"), "ask")
+            self.assertEqual(self.st.temp_allow_patterns("chat-sess"), [])
+        self._say(r"/guardrail allow \bpip\s+install\s+requests\b --for 30m")
+        self.assertIn("min left", self._say("/guardrail allow list"))
+        self.assertIn("Removed 1", self._say("/guardrail allow clear"))
+        self.assertEqual(self._decision("pip install requests"), "ask")
+        self.assertIn("No temporary allow rules", self._say("/guardrail allow"))
+
+    def test_allow_duration_parsing_and_cap(self):
+        self.assertEqual(gh.parse_allow_args(r"\bfoo\b --for 2h"), ("add", r"\bfoo\b", 120.0))
+        self.assertEqual(gh.parse_allow_args(r"\bfoo\b --for 45"), ("add", r"\bfoo\b", 45.0))
+        self.assertEqual(gh.parse_allow_args(r"\bfoo\b"), ("add", r"\bfoo\b", 60.0))
+        self.assertEqual(gh.parse_allow_args(r"\bfoo\b --for session"), ("add", r"\bfoo\b", 1440.0))
+        self.assertEqual(gh.parse_allow_args(r"\bfoo\b --for 999h")[2], 1440.0)
+        self.assertEqual(gh.parse_allow_args(r"\bfoo\b --for 0m")[0], "error")
+        self.assertEqual(gh.parse_allow_args("list")[0], "list")
+        self.assertEqual(gh.parse_allow_args("clear")[0], "clear")
+
+    def test_allow_rejects_broad_or_invalid_patterns(self):
+        for pat in (".*", r"\w+", "(", r"rm\s+-rf"):
+            with self.subTest(pat=pat):
+                self.assertIn("Not added", self._say(f"/guardrail allow {pat}"))
+        self.assertEqual(self.st.temp_allow_patterns("chat-sess"), [])
+
+    def test_allow_is_scoped_to_its_session(self):
+        self._say(r"/guardrail allow \bpip\s+install\s+requests\b")
+        other = {"hook_event_name": "PreToolUse", "session_id": "other-sess", "cwd": "/repo",
+                 "tool_name": "Bash", "tool_input": {"command": "pip install requests"}}
+        self.st.update("other-sess", active=True)
+        out, _ = gh.handle(other, "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_allow_works_from_codex_and_skill_expansion(self):
+        self.assertIn("waived", self._say(r"/guardrail allow \bpip\s+install\s+requests\b", host="codex"))
+        out, _ = gh.on_prompt_expansion(
+            {"command_name": "guardrail", "command_args": r"allow \bnpm\s+install\s+left-pad\b --for 10m", "session_id": "chat-sess"},
+            "codex", self.st)
+        self.assertIn("waived", out["reason"])
+        self.assertEqual(len(self.st.temp_allow_patterns("chat-sess")), 2)
+
+    def test_agent_cannot_apply_policy_init(self):
+        out, _ = gh.handle(self._tool('python guardrail_hook.py init "." --apply'), "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertTrue(gh._is_guardrail_file("policy_init.py"))
+
+    # --- /guardrail init ---
+
+    def test_init_command_reports_without_applying(self):
+        proj = Path(self.tmpdir) / "proj"
+        proj.mkdir()
+        (proj / "package.json").write_text(json.dumps({"scripts": {"validate": "tsc --noEmit"}}), encoding="utf-8")
+        msg = self._say(f"/guardrail init {proj}")
+        self.assertIn("npm run validate", msg)
+        self.assertIn("--apply", msg)
+        self.assertIn("no known project files", self._say(f"/guardrail init {self.tmpdir}"))
+        self.assertEqual(gh.parse_command_with_arg("/guardrail init ."), ("init", "."))
 
 
 class HookReloadAndDynamicConfigTests(unittest.TestCase):

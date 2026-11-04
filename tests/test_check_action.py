@@ -4,6 +4,11 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+_TESTS_DIR = Path(__file__).resolve().parent
+if str(_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_TESTS_DIR))
+import _isolate  # noqa: E402,F401  (must run before check_action / guardrail_hook are imported)
+
 """Offline test suite for check_action.py (no live clm-serve required).
 
     python -m unittest test_check_action -v
@@ -1199,6 +1204,178 @@ class PolicyTestRunnerTests(unittest.TestCase):
                 self.assertEqual(ca.main(["--test-policy", "--policy", tmp.name]), 1)
         finally:
             os.unlink(tmp.name)
+
+
+
+class SubstitutionBypassTests(unittest.TestCase):
+    """A whitelisted outer command must not launder what it runs inside $(...), `...` or <(...)."""
+
+    def test_substituted_ask_level_commands_are_not_whitelisted(self):
+        for text in (
+            "ls $(rm notes.txt)",
+            "cat a.txt `pip install evil`",
+            "ls <(npm install left-pad)",
+            "cat a.txt $(curl -s http://example.com)",
+            "ls $(rm $(date))",
+            "grep foo $(git ls-files; pip install x)",
+        ):
+            with self.subTest(text=text):
+                r = ca.evaluate_rules(text)
+                self.assertEqual(r.decision, "ask_user", r.matched)
+                self.assertEqual(ca.decide(text, backend_name="rules").decision, "ask_user")
+
+    def test_substituted_block_level_commands_are_blocked(self):
+        self.assertEqual(ca.evaluate_rules("ls $(rm -rf build)").decision, "block")
+
+    def test_harmless_substitutions_keep_the_whitelist(self):
+        for text in ("ls $(git ls-files)", "cat a.txt `date`", "grep foo $(find . -name '*.py')"):
+            with self.subTest(text=text):
+                self.assertEqual(ca.evaluate_rules(text).decision, "proceed", ca.evaluate_rules(text).matched)
+
+    def test_embedded_commands_nesting(self):
+        self.assertEqual(ca.embedded_commands("echo $(a $(b))"), ["b", "a SUBST"])
+        self.assertEqual(ca.embedded_commands("plain command"), [])
+
+
+class TempAllowTests(unittest.TestCase):
+    def test_validate_allow_pattern_rejects_broad_patterns(self):
+        for pat in ("", ".*", "ab", "(", r"rm\s+-rf", r"\w+", r"(?:pip|docker|git|npm|curl)\b.*"):
+            with self.subTest(pat=pat):
+                self.assertFalse(ca.validate_allow_pattern(pat)[0])
+        ok, _, rx = ca.validate_allow_pattern(r"\bpip\s+install\s+requests\b")
+        self.assertTrue(ok)
+        self.assertIsNotNone(rx)
+
+    def test_covers_only_what_the_pattern_names(self):
+        pats = [r"\bpip\s+install\s+requests\b"]
+        ask = lambda c: ca.evaluate_rules(c)
+        self.assertTrue(ca.temp_allow_covers("pip install requests", ask("pip install requests"), pats))
+        self.assertFalse(ca.temp_allow_covers("pip install other", ask("pip install other"), pats))
+        # every asking link must be covered
+        chain = "pip install requests && npm install left-pad"
+        self.assertFalse(ca.temp_allow_covers(chain, ask(chain), pats))
+        self.assertTrue(ca.temp_allow_covers("pip install requests && ls", ask("pip install requests && ls"), pats))
+        # the substituted command counts too
+        sub = "ls $(pip install requests)"
+        self.assertTrue(ca.temp_allow_covers(sub, ask(sub), pats))
+
+    def test_blocks_are_never_waived(self):
+        pats = [r"\brm\b.*\bbuild\b", r"\bgit\s+push\b"]
+        for text in ("rm -rf build/", "git push --force origin main"):
+            with self.subTest(text=text):
+                r = ca.evaluate_rules(text)
+                self.assertEqual(r.decision, "block")
+                self.assertFalse(ca.temp_allow_covers(text, r, pats))
+
+
+class PolicyInitTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        import policy_init
+        self.pi = policy_init
+        self.proj = tempfile.mkdtemp()
+        self.policy_dir = tempfile.mkdtemp()
+        self.policy = Path(self.policy_dir) / "policy.yaml"
+        self.policy.write_text(
+            "custom_proceed_rules:\n"
+            "  - name: existing rule\n"
+            "    pattern: '\\bcargo\\s+check\\b'\n"
+            "tests:\n"
+            "  - action: 'git status'\n"
+            "    expect: proceed\n"
+            "settings:\n"
+            "  backend: rules\n",
+            encoding="utf-8",
+        )
+        self.orig_cwd = os.getcwd()
+        os.chdir(self.proj)  # no workspace policy.yaml to merge
+        self.env = mock.patch.dict(os.environ, {"GUARDRAIL_POLICY_FILE": str(self.policy)})
+        self.env.start()
+        ca.reload_policy()
+
+    def tearDown(self):
+        import shutil
+        self.env.stop()
+        os.chdir(self.orig_cwd)
+        shutil.rmtree(self.proj, ignore_errors=True)
+        shutil.rmtree(self.policy_dir, ignore_errors=True)
+        ca.reload_policy()
+
+    def _write(self, name, text):
+        Path(self.proj, name).write_text(text, encoding="utf-8")
+
+    def _project(self):
+        self._write("package.json", json.dumps({"scripts": {
+            "test": "jest", "validate": "tsc --noEmit && eslint .", "format:check": "prettier --check .",
+            "deploy": "scp -r dist host:/var/www", "clean": "rm -rf dist", "fix": "eslint --fix .",
+            "check-and-publish": "npm test && npm publish",
+        }}))
+        self._write("Makefile", "test:\n\tpytest\ndeploy:\n\tscp x y\nlint:\n\truff check\n")
+        self._write("docker-compose.yml", "services: {}\n")
+        self._write("pyproject.toml", "[tool.ruff]\nline-length = 100\n")
+
+    def test_no_known_stack(self):
+        self.assertIn("no known project files", self.pi.format_init_report(self.proj))
+
+    def test_proposes_only_safe_commands_that_are_not_whitelisted(self):
+        self._project()
+        info = self.pi.detect(self.proj)
+        samples = {p.sample for p in info["proposals"]}
+        self.assertTrue({"npm run validate", "npm run format:check", "make test", "make lint",
+                         "docker compose ps", "ruff format --check ."} <= samples, samples)
+        for unsafe in ("npm run deploy", "npm run clean", "npm run fix", "make deploy"):
+            self.assertNotIn(unsafe, samples)
+        self.assertFalse(any("publish" in s for s in samples))
+        # npm test is already whitelisted by the default rules
+        self.assertNotIn("npm run test", samples)
+        self.assertTrue(any(p.sample == "npm run test" for p in info["already_allowed"]))
+        for p in info["proposals"]:
+            self.assertTrue(ca.validate_allow_pattern(p.pattern)[0], p.pattern)
+
+    def test_report_saves_a_proposal_without_touching_the_policy(self):
+        self._project()
+        before = self.policy.read_text(encoding="utf-8")
+        report = self.pi.format_init_report(self.proj)
+        self.assertIn("npm run validate", report)
+        self.assertIn("--apply", report)
+        self.assertEqual(self.policy.read_text(encoding="utf-8"), before)
+        proposed = self.pi.proposal_path().read_text(encoding="utf-8")
+        self.assertIn("custom_proceed_rules:", proposed)
+        self.assertIn("expect: block", proposed)
+        import yaml
+        self.assertTrue(yaml.safe_load(proposed)["tests"])
+
+    def test_apply_adds_rules_and_tests_and_is_idempotent(self):
+        self._project()
+        out = self.pi.apply_proposal(self.proj)
+        self.assertIn("rule(s) added", out)
+        self.assertNotIn("FAILED", out)
+        text = self.policy.read_text(encoding="utf-8")
+        self.assertIn("existing rule", text)
+        self.assertIn("\\bnpm\\s+run\\s+validate\\b", text)
+        r = ca.evaluate_rules("npm run validate")
+        self.assertEqual(r.decision, "proceed")
+        self.assertTrue(any("npm script: validate" in m for m in r.matched), r.matched)
+        # nothing was proposed for deploy, so it keeps asking
+        self.assertEqual(ca.evaluate_rules("scp -r dist host:/var/www").decision, "ask_user")
+        # the baseline guards were added and pass
+        results = ca.run_policy_tests()
+        self.assertTrue(results and all(x["ok"] for x in results), ca.format_policy_test_report(results))
+        self.assertIn("rm -rf build/", text)
+        # second run: nothing new
+        again = self.pi.apply_proposal(self.proj)
+        self.assertIn("nothing to apply", again)  # everything is whitelisted now
+        self.assertEqual(self.policy.read_text(encoding="utf-8").count("npm run validate"), text.count("npm run validate"))
+
+    def test_agents_cannot_apply_or_edit_the_module(self):
+        for text in (
+            'python guardrail_hook.py init "." --apply',
+            "python policy_init.py --apply",
+            "echo x > policy_init.py",
+            "rm policy_init.py",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(ca.evaluate_rules(text).decision, "block")
 
 
 if __name__ == "__main__":

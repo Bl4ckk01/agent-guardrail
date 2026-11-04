@@ -5,7 +5,7 @@ Lifecycle guardrail hook for Claude Code and OpenAI Codex / ChatGPT.
 Automatically intercepts prompts and tool calls in the background:
     guardrail_hook.py hook --host claude|codex
     guardrail_hook.py on|off|status|reload [--session ID] [--policy FILE]
-    guardrail_hook.py check "<cmd>" | why | doctor | report [DAYS] | test | undo [list]
+    guardrail_hook.py check "<cmd>" | why | doctor | report [DAYS] | test | undo [list] | init [DIR] [--apply]
 """
 
 from __future__ import annotations
@@ -43,6 +43,9 @@ CONFIRM_WINDOW_SECS = 600
 SESSION_TTL_SECS = 7 * 24 * 3600
 ACTION_HISTORY_TTL_SECS = 1800
 MAX_ACTION_HISTORY = 20
+TEMP_ALLOW_DEFAULT_MINUTES = 60
+TEMP_ALLOW_MAX_MINUTES = 24 * 60
+TEMP_ALLOW_MAX = 10
 _GENESIS_HASH = "0" * 64
 
 ICON = "\U0001F6E1\uFE0F"
@@ -149,6 +152,33 @@ class State:
             for h in (s.get("action_history") or [])
             if isinstance(h, dict) and now - float(h.get("ts", 0)) < ttl
         ]
+
+    # --- Temporary allow rules (/guardrail allow): user-granted, session-scoped, expiring ---
+
+    def add_temp_allow(self, sid: str, pattern: str, minutes: float) -> float:
+        now = time.time()
+        expires = now + minutes * 60
+        s = self.session(sid)
+        live = [t for t in (s.get("temp_allow") or []) if isinstance(t, dict) and float(t.get("expires_at", 0)) > now]
+        live = [t for t in live if t.get("pattern") != pattern] + [{"pattern": pattern, "expires_at": expires}]
+        s["temp_allow"] = live[-TEMP_ALLOW_MAX:]
+        s["ts"] = now
+        self.dirty = True
+        return expires
+
+    def temp_allow_entries(self, sid: str) -> list[dict]:
+        now = time.time()
+        return [t for t in (self.session(sid).get("temp_allow") or [])
+                if isinstance(t, dict) and float(t.get("expires_at", 0)) > now]
+
+    def temp_allow_patterns(self, sid: str) -> list[str]:
+        return [str(t["pattern"]) for t in self.temp_allow_entries(sid) if t.get("pattern")]
+
+    def clear_temp_allow(self, sid: str) -> int:
+        n = len(self.temp_allow_entries(sid))
+        self.session(sid)["temp_allow"] = []
+        self.dirty = True
+        return n
 
     def breaker_open(self) -> bool:
         return time.time() - float(self.data.get("backend_failed_at", 0)) < BREAKER_SECS
@@ -303,7 +333,7 @@ def verify_audit_log(log_path: Path | None = None) -> tuple[bool, str, int]:
 # --- Commands & Prompts ---
 
 _EXPLICIT_CMD_RE = re.compile(
-    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload|why|doctor|check|report|test|undo)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?(?:\s+(?P<rest>.*))?$",
+    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload|why|doctor|check|report|test|undo|allow|init)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?(?:\s+(?P<rest>.*))?$",
     re.IGNORECASE | re.DOTALL,
 )
 _PLAIN_CMD_RE = re.compile(
@@ -323,9 +353,11 @@ _ARG_MAP = {
     "report": "report", "stats": "report",
     "test": "test", "tests": "test",
     "undo": "undo", "restore": "undo",
+    "allow": "allow",
+    "init": "init", "suggest": "init",
 }
 # Commands that only report or restore: they never change the active state of the session
-_INFO_CMDS = ("reload", "check", "why", "doctor", "report", "test", "undo")
+_INFO_CMDS = ("reload", "check", "why", "doctor", "report", "test", "undo", "allow", "init")
 _CONFIRM_RE = re.compile(
     r"\b(?:yes|y|ok|okay|confirm|confirmed|approve|approved|proceed|go|continue|done)\b",
     re.IGNORECASE,
@@ -509,6 +541,65 @@ def _parse_days(arg: str, default: float = 7.0) -> float:
 def format_policy_tests() -> str:
     import check_action as ca
     return f"{ICON} " + ca.format_policy_test_report(ca.run_policy_tests())
+
+
+_ALLOW_FOR_RE = re.compile(r"\s+--for\s+(?:(?P<n>\d+(?:\.\d+)?)\s*(?P<u>m|min|mins|minutes?|h|hr|hrs|hours?)?|(?P<s>session))\s*$", re.IGNORECASE)
+
+
+def parse_allow_args(arg: str) -> tuple[str, str, float | None]:
+    """'<regex> [--for 30m|2h|session]' -> (action, pattern, minutes); action is list, clear, add or error."""
+    text = (arg or "").strip()
+    if text.lower() in ("", "list", "ls"):
+        return "list", "", None
+    if text.lower() in ("clear", "revoke", "reset", "off"):
+        return "clear", "", None
+    minutes = float(TEMP_ALLOW_DEFAULT_MINUTES)
+    m = _ALLOW_FOR_RE.search(text)
+    if m:
+        text = text[:m.start()].strip()
+        if m.group("s"):
+            minutes = float(TEMP_ALLOW_MAX_MINUTES)
+        else:
+            minutes = float(m.group("n")) * (60 if (m.group("u") or "m").lower().startswith("h") else 1)
+    if minutes <= 0:
+        return "error", "", None
+    return "add", text, min(minutes, float(TEMP_ALLOW_MAX_MINUTES))
+
+
+def format_allow(state: State, sid: str, arg: str) -> str:
+    """Handle `/guardrail allow`: waive confirmations (never blocks) for a pattern, for a limited time."""
+    import check_action as ca
+    action, pattern, minutes = parse_allow_args(arg)
+    if action == "list":
+        entries = state.temp_allow_entries(sid)
+        if not entries:
+            return (f"{ICON} No temporary allow rules in this session. "
+                    "Usage: `/guardrail allow <regex> [--for 30m|2h|session]` (default 60m, max 24h).")
+        lines = [f"{ICON} Temporary allow rules (this session only):"]
+        for t in entries:
+            left = max(0, int((float(t["expires_at"]) - time.time()) / 60))
+            lines.append(f"  • `{t['pattern']}` — {left} min left")
+        lines.append("Blocked actions are never affected. `/guardrail allow clear` removes them all.")
+        return "\n".join(lines)
+    if action == "clear":
+        n = state.clear_temp_allow(sid)
+        log({"event": "temp_allow_cleared", "session": sid, "count": n})
+        return f"{ICON} Removed {n} temporary allow rule{'s' if n != 1 else ''}."
+    if action == "error":
+        return f"{ICON} Invalid duration. Usage: `/guardrail allow <regex> [--for 30m|2h|session]`."
+    ok, msg, _ = ca.validate_allow_pattern(pattern)
+    if not ok:
+        return f"{ICON} Not added: {msg}"
+    expires = state.add_temp_allow(sid, pattern, minutes)
+    log({"event": "temp_allow_added", "session": sid, "pattern": pattern, "minutes": minutes})
+    until = time.strftime("%H:%M", time.localtime(expires))
+    return (f"{ICON} Confirmations for actions matching `{pattern}` are waived until {until} "
+            f"({minutes:g} min) in this session. Blocks still apply, and every link of a chained command must be covered.")
+
+
+def format_init(root: str = "") -> str:
+    import policy_init
+    return f"{ICON} " + policy_init.format_init_report(root or os.getcwd())
 
 
 def _read_log_entries(log_path: Path | None = None) -> list[dict]:
@@ -816,7 +907,7 @@ def _patch_actions(patch: str) -> list[str]:
 
 # Names unique to the guardrail and the agents' hook settings: protected wherever they appear
 _GUARDRAIL_CONTROL_FILES = (
-    "check_action.py", "guardrail_hook.py", "daemon_manager.py", "claude_hook.py", ".guardrail",
+    "check_action.py", "guardrail_hook.py", "daemon_manager.py", "claude_hook.py", "policy_init.py", ".guardrail",
     ".claude/settings.json", ".claude/settings.local.json",
     ".codex/hooks.json", ".agents/hooks.json", ".cursorrules", ".cursor/rules/guardrail.mdc",
 )
@@ -1067,6 +1158,10 @@ def on_prompt_submit(event: dict, host: str, state: State):
             daemon_msg = format_policy_tests()
         elif cmd == "undo":
             daemon_msg = format_undo(cmd_arg)
+        elif cmd == "allow":
+            daemon_msg = format_allow(state, sid, cmd_arg)
+        elif cmd == "init":
+            daemon_msg = format_init(cmd_arg)
 
         active = is_active(state, sid, host) if cmd in ("status", *_INFO_CMDS) else (cmd in ("on", "start"))
         log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
@@ -1275,6 +1370,10 @@ def on_prompt_expansion(event: dict, host: str, state: State):
         return {"decision": "block", "reason": format_policy_tests()}, 0
     if cmd == "undo":
         return {"decision": "block", "reason": format_undo(rest_arg)}, 0
+    if cmd == "allow":
+        return {"decision": "block", "reason": format_allow(state, sid, rest_arg)}, 0
+    if cmd == "init":
+        return {"decision": "block", "reason": format_init(rest_arg)}, 0
     return {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptExpansion",
@@ -1387,6 +1486,12 @@ def on_pre_tool(event: dict, host: str, state: State):
     result = forced or evaluate(desc, state, context=ctx)
     final = result.decision
     reason = _reason(result)
+    if forced is None and final == "ask_user" and result.rules.decision == "ask_user":
+        # The user waived this kind of confirmation from the chat (/guardrail allow): never a block
+        temp_patterns = state.temp_allow_patterns(sid)
+        if temp_patterns and ca.temp_allow_covers(desc, result.rules, temp_patterns):
+            final, reason = "proceed", "allowed by /guardrail allow"
+            log({"host": host, "event": "temp_allow_used", "session": sid, "tool": tool_ident, "text": desc[:300]})
     if outside and final == "proceed":
         final, reason = "ask_user", "file outside project directory: " + ", ".join(outside)
 
@@ -1631,6 +1736,14 @@ def main(argv: list[str]) -> int:
         results = ca.run_policy_tests()
         print(ca.format_policy_test_report(results))
         return 0 if all(r["ok"] for r in results) else 1
+
+    if argv[0] in ("init", "suggest"):
+        import policy_init
+        apply = "--apply" in argv
+        paths = [a for a in argv[1:] if not a.startswith("-")]
+        root = paths[0] if paths else os.getcwd()
+        print(policy_init.apply_proposal(root) if apply else policy_init.format_init_report(root))
+        return 0
 
     if argv[0] in ("undo", "restore"):
         print(format_undo(" ".join(argv[1:])))

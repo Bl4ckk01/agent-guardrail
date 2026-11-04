@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="tests/"><img src="https://img.shields.io/badge/tests-195%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/tests-217%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-~37.4ms%20(neural)-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
@@ -313,6 +313,14 @@ Evaluating a command string in isolation is insufficient because real-world inte
 9. **Policy Regression Tests (`tests:`)**:
    - `policy.yaml` can carry `action` → `expect` cases; `/guardrail test` (or `python check_action.py --test-policy` in CI) checks that every action still gets the expected decision after a policy change.
 
+
+10. **Chat-Based Temporary Allow (`/guardrail allow`)**:
+   - Only you can waive a confirmation: the command comes from your own prompt (`UserPromptSubmit`), never from a tool call, and `check_action.py --allow` / `init --apply` stay blocked for agents.
+   - Rules live in the session state with an expiry (default 60 min, max 24 h). They only turn rule-level confirmations into `proceed`: blocks, secret-file reads and exfiltration checks are untouched, and in a chained command (or a `$(...)` substitution) **every** asking link must be covered. Patterns go through the same breadth checks as `--allow`.
+
+11. **Stack-Aware Policy Proposals (`/guardrail init`)**:
+   - Reads the project's scripts and config and proposes narrow `custom_proceed_rules` for routine check/lint/test/build commands that are not whitelisted yet, plus matching `tests:` cases. Scripts that delete, install, deploy, publish or touch the network are never proposed.
+   - The proposal is saved to `~/.guardrail/policy.proposed.yaml` and nothing is applied from chat: `python guardrail_hook.py init --apply` (human terminal) writes it into the trusted `policy.yaml` and runs the policy tests.
 ---
 
 ### Supported Backend Engines
@@ -460,6 +468,8 @@ From that point forward:
 | `/guardrail report [days]` | Summarizes the audit log: decisions, most frequent rules, actions that keep asking for confirmation |
 | `/guardrail test` | Runs the `tests:` cases of `policy.yaml` (`python check_action.py --test-policy` exits 1 on failure, for CI) |
 | `/guardrail undo [list]` | Restores the files backed up before the last confirmed deletion or overwrite (`list` shows the backups) |
+| `/guardrail allow <regex> [--for 30m\|2h\|session]` | Waives confirmations (never blocks) for matching commands in this session only; default 60 min, max 24 h. `allow list` / `allow clear` manage them |
+| `/guardrail init` | Detects the project stack (package.json, pyproject.toml, Cargo.toml, go.mod, Makefile, compose) and proposes narrow safe rules + policy tests; adopt them with `python guardrail_hook.py init --apply` in your own terminal |
 
 ---
 
@@ -1215,16 +1225,16 @@ We believe in complete transparency regarding security boundaries:
 Contributions are warmly welcome! The codebase includes **141 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, skill synchronization, and protocol handlers:
 
 ```bash
-# 1. Run engine & risk-scoring tests (102 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests):
+# 1. Run engine & risk-scoring tests (114 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook & replay tests (72 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, skill sync):
+# 2. Run lifecycle hook & replay tests (82 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, skill sync):
 python tests/test_guardrail_hook.py
 
 # 3. Run MCP server protocol tests (21 tests):
 python tests/test_mcp_server.py
 
-# 4. Run all 195 tests via unittest:
+# 4. Run all 217 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
 python -m unittest discover -s tests -p "test_*.py"
 ```
 
