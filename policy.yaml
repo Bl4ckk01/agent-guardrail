@@ -225,6 +225,20 @@ network:
 
 
 # ==============================================================================
+# 10c. SESSION MODES (/guardrail mode strict|normal|relaxed)
+# ==============================================================================
+# The mode is chosen per session by the user, in chat. This section only sets what `relaxed` waives:
+# - relaxed_waive: rule names whose confirmation is skipped in relaxed mode (see /guardrail why for names).
+#   Secret access, outbound network and system-admin actions are never waived, and blocks never are.
+# - strict has no settings: anything that can change state asks, even whitelisted commands.
+# A workspace policy.yaml cannot change this section.
+# ==============================================================================
+modes:
+  relaxed_waive:
+    - "dependency install"
+
+
+# ==============================================================================
 # 11. GLOBAL SETTINGS - BACKEND SELECTOR
 # ==============================================================================
 # Choose which decision engine to use:
@@ -322,4 +336,10 @@ tests:
   - action: "terraform destroy"
     expect: block
   - action: "cat .env"
+    expect: block
+  - action: "ls $(rm notes.txt)"
+    expect: ask_user
+  - action: "git commit -m fix --no-verify"
+    expect: ask_user
+  - action: "git config core.hooksPath /tmp/hooks"
     expect: block

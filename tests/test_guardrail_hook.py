@@ -1058,6 +1058,168 @@ class ChatCommandsAndIsolationTests(unittest.TestCase):
         self.assertEqual(gh.parse_command_with_arg("/guardrail init ."), ("init", "."))
 
 
+class SessionModesAndReadOnlyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.st = gh.State(Path(self.tmpdir) / "state.json")
+        self.st.update("mode-sess", active=True)
+        self.trash = mock.patch.object(gh, "TRASH_DIR", Path(self.tmpdir) / "trash")
+        self.trash.start()
+        self.env = mock.patch.dict(os.environ)
+        self.env.start()
+        os.environ.pop("GUARDRAIL_MODE", None)
+
+    def tearDown(self):
+        self.env.stop()
+        self.trash.stop()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _say(self, prompt, host="claude"):
+        out, _ = gh.on_prompt_submit({"prompt": prompt, "session_id": "mode-sess"}, host, self.st)
+        if host == "claude":
+            return out["hookSpecificOutput"]["additionalContext"]
+        return out["stopReason"]
+
+    def _event(self, tool, tool_input, cwd="/repo"):
+        return {"hook_event_name": "PreToolUse", "session_id": "mode-sess", "cwd": cwd,
+                "tool_name": tool, "tool_input": tool_input}
+
+    def _decision(self, command, tool="Bash", cwd="/repo"):
+        inp = {"command": command} if tool == "Bash" else command
+        out, _ = gh.handle(self._event(tool, inp, cwd), "claude", self.st)
+        return None if out is None else out["hookSpecificOutput"]["permissionDecision"]
+
+    # --- /guardrail mode ---
+
+    def test_mode_command_and_scope(self):
+        self.assertEqual(self.st.get_mode("mode-sess"), "normal")
+        self.assertIn("Mode: normal", self._say("/guardrail mode"))
+        self.assertIn("set to strict", self._say("/guardrail mode strict"))
+        self.assertEqual(self.st.get_mode("mode-sess"), "strict")
+        self.assertEqual(self.st.get_mode("another-session"), "normal")
+        self.assertIn("Unknown mode", self._say("/guardrail mode paranoid"))
+        self.assertEqual(self.st.get_mode("mode-sess"), "strict")
+        self.assertIn("Mode: strict", self._say("/guardrail status"))
+        self.assertIn("set to relaxed", self._say("/guardrail mode relaxed", host="codex"))
+        out, _ = gh.on_prompt_expansion(
+            {"command_name": "guardrail", "command_args": "mode normal", "session_id": "mode-sess"}, "codex", self.st)
+        self.assertIn("set to normal", out["reason"])
+        self.assertEqual(self.st.get_mode("mode-sess"), "normal")
+
+    def test_environment_sets_the_default_mode(self):
+        os.environ["GUARDRAIL_MODE"] = "strict"
+        self.assertEqual(self.st.get_mode("fresh-session"), "strict")
+        os.environ["GUARDRAIL_MODE"] = "nonsense"
+        self.assertEqual(self.st.get_mode("fresh-session"), "normal")
+        self.st.set_mode("mode-sess", "relaxed")
+        self.assertEqual(self.st.get_mode("mode-sess"), "relaxed")
+
+    def test_strict_mode_asks_for_state_changes_only(self):
+        self.assertIsNone(self._decision("git commit -m x"))
+        self.st.set_mode("mode-sess", "strict")
+        self.assertEqual(self._decision("git commit -m x"), "ask")
+        self.assertEqual(self._decision("mkdir build"), "ask")
+        self.assertIsNone(self._decision("pytest -x"))
+        self.assertIsNone(self._decision("git status"))
+        out = self._decision({"file_path": "/repo/app.py", "content": "x = 1\n"}, tool="Write")
+        self.assertEqual(out, "ask")
+        self.assertEqual(self._decision({"url": "https://docs.python.org/3/", "prompt": "x"}, tool="WebFetch"), "ask")
+        self.assertEqual(self._decision("rm -rf build/"), "deny")  # blocks stay blocks
+
+    def test_strict_mode_ignores_temporary_allow(self):
+        self._say(r"/guardrail allow \bpip\s+install\s+requests\b")
+        self.assertIsNone(self._decision("pip install requests"))
+        self.st.set_mode("mode-sess", "strict")
+        self.assertEqual(self._decision("pip install requests"), "ask")
+
+    def test_relaxed_mode_waives_only_listed_confirmations(self):
+        self.assertEqual(self._decision("pip install requests"), "ask")
+        self.st.set_mode("mode-sess", "relaxed")
+        self.assertIsNone(self._decision("pip install requests"))
+        self.assertEqual(self._decision("pip install requests && rm notes.txt"), "ask")
+        self.assertEqual(self._decision("git push origin feature"), "ask")
+        self.assertEqual(self._decision("sudo pip install requests"), "ask")
+        self.assertEqual(self._decision("rm -rf build/"), "deny")
+
+    def test_waived_deletion_is_backed_up_and_undoable(self):
+        work = Path(self.tmpdir) / "work"
+        work.mkdir()
+        target = work / "notes.txt"
+        target.write_text("precious", encoding="utf-8")
+        self.st.set_mode("mode-sess", "relaxed")
+        with mock.patch.dict(ca.get_mode_config(), {"relaxed_waive": ["rm / del"]}):
+            self.assertIsNone(self._decision("rm notes.txt", cwd=str(work)))
+        self.assertEqual(len(gh.list_snapshots()), 1)
+        target.unlink()
+        self.assertIn("Restored 1 file", gh.format_undo())
+        self.assertEqual(target.read_text(encoding="utf-8"), "precious")
+
+    # --- /guardrail readonly ---
+
+    def test_readonly_refuses_changes_and_allows_inspection(self):
+        self.assertIn("Read-only mode ON", self._say("/guardrail readonly"))
+        for command in ("rm notes.txt", "echo hi > out.txt", "git commit -m x", "pip install requests",
+                        "ls $(rm x)", "python -c \"open('x','w')\"", "mkdir build"):
+            with self.subTest(command=command):
+                out, _ = gh.handle(self._event("Bash", {"command": command}), "claude", self.st)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertIn("read-only mode is ON", out["hookSpecificOutput"]["permissionDecisionReason"])
+        for command in ("git status", "ls > /dev/null", "pytest -x", "cat README.md | head", "git log --oneline"):
+            with self.subTest(command=command):
+                self.assertIsNone(self._decision(command))
+        self.assertIsNone(self._decision({"file_path": "/repo/app.py"}, tool="Read"))
+        self.assertIsNone(self._decision({"url": "https://docs.python.org/3/", "prompt": "x"}, tool="WebFetch"))
+
+    def test_readonly_refuses_file_edit_tools(self):
+        self._say("/guardrail readonly on")
+        for tool, inp in (("Write", {"file_path": "/repo/a.py", "content": "x"}),
+                          ("Edit", {"file_path": "/repo/a.py", "old_string": "a", "new_string": "b"}),
+                          ("apply_patch", {"command": "*** Begin Patch\n*** Add File: a.py\n+x\n*** End Patch"})):
+            with self.subTest(tool=tool):
+                out, _ = gh.handle(self._event(tool, inp), "claude", self.st)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_readonly_off_restores_normal_behaviour_and_is_session_scoped(self):
+        self._say("/guardrail readonly")
+        self.assertTrue(self.st.is_readonly("mode-sess"))
+        self.assertFalse(self.st.is_readonly("another-session"))
+        self.assertIn("ON", self._say("/guardrail readonly status"))
+        self.assertIn("Read-only: ON", self._say("/guardrail status"))
+        self.assertIn("Read-only mode OFF", self._say("/guardrail readonly off"))
+        self.assertEqual(self._decision("rm notes.txt"), "ask")  # the usual confirmation again
+        self.assertIn("Usage", self._say("/guardrail readonly maybe"))
+
+    def test_readonly_works_on_codex_and_skill_expansion(self):
+        self.assertIn("Read-only mode ON", self._say("/guardrail readonly", host="codex"))
+        out, _ = gh.on_prompt_expansion(
+            {"command_name": "guardrail", "command_args": "readonly off", "session_id": "mode-sess"}, "codex", self.st)
+        self.assertIn("OFF", out["reason"])
+
+    def test_agents_cannot_flip_modes_through_the_control_plane(self):
+        for path in (".git/hooks/pre-commit", "readonly_mode.py", "git_hooks.py"):
+            with self.subTest(path=path):
+                self.assertTrue(gh._is_guardrail_file(path))
+        out, _ = gh.handle(self._event("Bash", {"command": "git commit -m x --no-verify"}), "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    # --- /guardrail report session ---
+
+    def test_report_can_be_limited_to_the_current_session(self):
+        log_file = Path(self.tmpdir) / "audit.log"
+        gh.log({"event": "tool", "session": "mode-sess", "text": "docker restart web", "decision": "ask_user"}, log_path=log_file)
+        gh.log({"event": "tool", "session": "other", "text": "rm -rf /", "decision": "block"}, log_path=log_file)
+        gh.log({"event": "tool", "session": "other", "text": "git status", "decision": "proceed"}, log_path=log_file)
+        everything = gh.format_report(7, log_path=log_file)
+        mine = gh.format_report(7, log_path=log_file, session="mode-sess")
+        self.assertIn("Evaluated actions: 3", everything)
+        self.assertIn("Evaluated actions: 1", mine)
+        self.assertIn("this session only", mine)
+        self.assertEqual(gh._report_args("session", "mode-sess"), (7.0, "mode-sess"))
+        self.assertEqual(gh._report_args("30 session", "mode-sess"), (30.0, "mode-sess"))
+        self.assertEqual(gh._report_args("14", "mode-sess"), (14.0, None))
+        self.assertEqual(gh._report_args("this", ""), (7.0, "_default"))
+
+
 class HookReloadAndDynamicConfigTests(unittest.TestCase):
     def setUp(self):
         self.st = gh.State()

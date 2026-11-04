@@ -437,6 +437,10 @@ def main() -> int:
     parser.add_argument("--mcp", action="store_true", help="Configure MCP Server for Cursor, Claude Desktop, and Antigravity")
     parser.add_argument("--global", dest="is_global", action="store_true", help="Also install globally into user home directories (~/)")
     parser.add_argument("--check", action="store_true", help="Run health and connectivity diagnostics only")
+    parser.add_argument("--git-hook", dest="git_hook", nargs="?", const=".", metavar="REPO",
+                        help="Install the pre-commit credential scan in a git repository (default: current directory)")
+    parser.add_argument("--remove-git-hook", dest="remove_git_hook", nargs="?", const=".", metavar="REPO",
+                        help="Remove the agent-guardrail block from a repository's pre-commit hook")
     args = parser.parse_args()
 
     print("🛡️  Agent Guardrail Universal Setup (5 Platforms Supported)\n")
@@ -444,6 +448,17 @@ def main() -> int:
     if args.check:
         run_checks()
         return 0
+
+    if args.git_hook or args.remove_git_hook:
+        import git_hooks
+        repo = os.path.abspath(args.git_hook or args.remove_git_hook)
+        if args.remove_git_hook:
+            ok, msg = git_hooks.uninstall_pre_commit(repo)
+        else:
+            ok, msg = git_hooks.install_pre_commit(repo)
+        print(f"  {'✔' if ok else '✘'} {msg}")
+        if not any([args.all, args.claude, args.codex, args.antigravity, args.cursor, args.grok, args.mcp]):
+            return 0 if ok else 1
 
     if args.mcp:
         import mcp_server

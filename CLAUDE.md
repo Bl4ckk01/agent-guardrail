@@ -56,17 +56,20 @@ Once activated:
 - `/guardrail check <cmd>`: Dry-run evaluate `<cmd>` (verdict, risk score, preview) without running it.
 - `/guardrail why`: Explain the most recent blocked or confirmation-required action from the audit log.
 - `/guardrail doctor`: Run unified diagnostics (policy, audit hash chain, skill sync, daemons).
-- `/guardrail report [days]`: Summarize the audit log (decisions, top rules, actions that keep asking).
+- `/guardrail report [days] [session]`: Summarize the audit log (decisions, top rules, actions that keep asking); `session` = current session only.
 - `/guardrail test`: Run the `tests:` cases of `policy.yaml` (`python check_action.py --test-policy` for CI).
 - `/guardrail undo [list]`: Restore the files backed up before the last confirmed deletion or overwrite.
 - `/guardrail allow <regex> [--for 30m|2h|session]`: Waive confirmations (never blocks) for matching commands in this session; `allow list` / `allow clear`.
 - `/guardrail init`: Propose narrow safe rules + policy tests for the detected project stack (`python guardrail_hook.py init --apply` in a terminal adopts them).
+- `/guardrail mode strict|normal|relaxed`: Session mode (`strict` asks before anything that changes state, `relaxed` waives the `modes.relaxed_waive` confirmations).
+- `/guardrail readonly [on|off|status]`: Refuse every action that changes something for this session.
+- `python install.py --git-hook [repo]`: Install the pre-commit credential scan (`--remove-git-hook` removes it).
 
 ---
 
 ## 4. Unit Tests
 
-Run the test suites (217 tests total):
+Run the test suites (252 tests total):
 ```bash
 python -B tests/test_check_action.py
 python -B tests/test_guardrail_hook.py

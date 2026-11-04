@@ -91,7 +91,7 @@ _CRITICAL_TARGET = (
 # Guardrail control plane: code, policy, session state/config and the agents' hook settings.
 # Names unique to the guardrail are protected wherever they appear.
 _GUARDRAIL_DISTINCTIVE_FILES = (
-    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b|\bpolicy_init\.py\b"
+    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b|\bpolicy_init\.py\b|\breadonly_mode\.py\b|\bgit_hooks\.py\b|\.git[/\\]+hooks[/\\]"
     r"|\.guardrail\b|\.claude[/\\]+settings(?:\.local)?\.json\b|\.codex[/\\]+hooks\.json\b|\.agents[/\\]+hooks\.json\b|\.cursorrules\b"
 )
 # Common names are only the guardrail's own when they sit in its directory: other projects
@@ -192,6 +192,7 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("fd exec injection", r"\b(?:fd|fdfind)\b.*-(?:x|X|-exec|-exec-batch)\b"),
     ("git config command injection", r"\bgit\b.*-c\s+(?:core\.(?:fsmonitor|pager)|diff\.external|sequence\.editor)"),
     ("git exec-path hijacking", r"\bgit\b.*--exec-path\b"),
+    ("git hooks tampering", r"\bgit\b[^;&|\n]*(?:-c\s+core\.hookspath|config\b[^;&|\n]*core\.hookspath)"),
     ("git config ssh command injection", r"\bgit\b.*config\s+(?:core\.sshCommand|ssh\.variant)\b"),
     ("tar to-command injection", r"\btar\b.*--(?:to-command|checkpoint-action=exec)\b"),
     ("go test/run exec injection", r"\bgo\s+(?:test|run)\b.*-exec\b"),
@@ -206,7 +207,7 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("shell startup file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*~?/?(?:\.bashrc|\.bash_profile|\.zshrc|\.profile|/etc/profile|/etc/environment|\$profile)\b"),
     ("crontab file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*/etc/cron"),
     *_tamper_file_rules(_GUARDRAIL_FILES),
-    ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\b(?:guardrail_hook|policy_init)\.py\b.*--apply\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
+    ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\b(?:guardrail_hook|policy_init)\.py\b.*--apply\b|\bgit_hooks\.py\b.*\b(?:install|uninstall)\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
     ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
     ("hardcoded secret in file", r"\bwrite\s+hardcoded\s+secret\b"),
 )
@@ -226,6 +227,7 @@ ASK_RULES: tuple[tuple[str, str], ...] = (
     ("overwrite", r"\boverwrit\w*|\bmv\s+\S|\bmove-item\b"),
     ("docker prune", r"\bdocker\s+(?:system|volume|image|container|builder|network)\s+prune\b"),
     ("truncate file", r"\btruncate\s+(?:-\S+\s+)*-s\s*\S+"),
+    ("git hook bypass", r"\bgit\s+(?:commit|push|merge|rebase|am|cherry-pick|revert)\b[^;&|\n]*\s--no-verify\b"),
     ("environment dump", r"(?:^|[;&|\n]\s*)(?:printenv|env|export\s+-p|(?:get-childitem|gci|ls|dir)\s+env:)\s*(?:$|[;&|])"),
     ("remote git / history",
      r"\bgit\s+(?:push|pull|rebase|merge|submodule|tag(?!\s+--(?:list|-l)|\s+-l\b)|cherry-pick|revert|commit\s+--amend|stash\s+(?:drop|clear)|branch\s+-[dDmM]|checkout\s+--|restore\s+\.|reset)\b"
@@ -899,6 +901,13 @@ _AUDIT_CONFIG: dict = {
     "hash_chaining": True,
 }
 
+# Session modes (/guardrail mode). Trusted policy.yaml only: a workspace policy cannot change them.
+_MODE_CONFIG: dict = {
+    # Rule-level confirmations that `relaxed` mode waives. Secret access, outbound network and system admin
+    # actions are never waived, whatever is listed here.
+    "relaxed_waive": ["dependency install"],
+}
+
 # Egress allowlist: empty = disabled. When set, outbound requests to these domains (and their
 # subdomains) need no confirmation and requests to any other host ask for it.
 _NETWORK_CONFIG: dict = {
@@ -909,7 +918,7 @@ _NETWORK_CONFIG: dict = {
 _CONFIG_DEFAULTS: tuple[tuple[dict, dict], ...] = tuple(
     (cfg, copy.deepcopy(cfg))
     for cfg in (_BRANCH_PROTECTION, _CREDENTIALS_PROTECTION, _RISK_CONFIG, _DRY_RUN_CONFIG, _MEMORY_CONFIG,
-                _AUDIT_CONFIG, _NETWORK_CONFIG)
+                _AUDIT_CONFIG, _NETWORK_CONFIG, _MODE_CONFIG)
 )
 
 
@@ -980,6 +989,10 @@ def get_audit_config() -> dict:
 
 def get_network_config() -> dict:
     return _NETWORK_CONFIG
+
+
+def get_mode_config() -> dict:
+    return _MODE_CONFIG
 
 
 def get_policy_settings() -> dict:
@@ -1138,6 +1151,10 @@ def _apply_trusted_policy(data: dict) -> None:
         _MEMORY_CONFIG.update(data["memory_boundaries"])
     if "audit_logging" in data and isinstance(data["audit_logging"], dict):
         _AUDIT_CONFIG.update(data["audit_logging"])
+    if isinstance(data.get("modes"), dict):
+        waive = data["modes"].get("relaxed_waive")
+        if isinstance(waive, list):
+            _MODE_CONFIG["relaxed_waive"] = [str(w).strip() for w in waive if str(w).strip()]
     if isinstance(data.get("network"), dict):
         domains = data["network"].get("allowed_domains") or []
         _NETWORK_CONFIG["allowed_domains"] = [str(d).strip().lower() for d in domains if str(d).strip()]
@@ -1271,6 +1288,33 @@ def validate_allow_pattern(pattern: str) -> tuple[bool, str, "re.Pattern | None"
     if sum(1 for probe in _BROADNESS_PROBES if compiled.search(probe)) >= 3:
         return False, f"Pattern '{pat}' is too broad (it matches unrelated commands that should keep asking).", None
     return True, "", compiled
+
+
+MODES = ("strict", "normal", "relaxed")
+# What `strict` mode refuses to let through silently, even for whitelisted or unmatched commands
+_STRICT_CAPS = ("cap:fs_write", "cap:fs_delete", "cap:git_mutation", "cap:pkg_install", "cap:sys_admin",
+                "cap:code_exec", "cap:net_outbound")
+_RELAXED_NEVER_CAPS = ("cap:secret_access", "cap:net_outbound", "cap:sys_admin")
+
+
+def apply_mode(mode: str, decision: str, rules: RuleResult, capabilities: list[str]) -> tuple[str, str]:
+    """Adjust a decision for the session mode: (decision, reason); the reason is empty when nothing changed.
+
+    strict:  a proceed becomes ask_user when the action can change state (files, git, packages, system, code, network).
+    relaxed: a rule-level confirmation is waived when every rule behind it is listed in modes.relaxed_waive
+             (default: dependency install) and the action touches no secret, network or system capability.
+    normal:  unchanged. Blocks are never touched.
+    """
+    if mode == "strict" and decision == "proceed":
+        hit = [c.split(":", 1)[1] for c in capabilities if c in _STRICT_CAPS]
+        if hit:
+            return "ask_user", "strict mode: " + ", ".join(hit)
+    elif mode == "relaxed" and decision == "ask_user" and rules.decision == "ask_user":
+        tags = [m[len("ask_user:"):] for m in rules.matched if m.startswith("ask_user:")]
+        waivable = set(_MODE_CONFIG.get("relaxed_waive") or [])
+        if tags and all(t in waivable for t in tags) and not any(c in _RELAXED_NEVER_CAPS for c in capabilities):
+            return "proceed", "relaxed mode: " + ", ".join(tags)
+    return decision, ""
 
 
 def temp_allow_covers(description: str, result: RuleResult, patterns: list[str]) -> bool:
@@ -2309,7 +2353,7 @@ _CAPABILITY_PATTERNS: list[tuple[str, re.Pattern]] = [
     (
         "cap:fs_write",
         re.compile(
-            r"\b(?:write\s+file|modify\s+file|create\s+file|apply\s+patch|touch|mkdir|md|mv|cp|"
+            r"\b(?:write\s+file|modify\s+file|create\s+file|apply\s+patch|touch|mkdir|(?<![\w./\\-])(?:md|mv|cp)|"
             r"move-item|copy-item|new-item|set-content|out-file|add-content|tee)\b|"
             r"\bsed\s+-i\b|(?<![0-9&])>>?(?![>&])",
             re.IGNORECASE,

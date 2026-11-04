@@ -1378,6 +1378,253 @@ class PolicyInitTests(unittest.TestCase):
                 self.assertEqual(ca.evaluate_rules(text).decision, "block")
 
 
+
+class SessionModeTests(unittest.TestCase):
+    def tearDown(self):
+        ca.reload_policy()
+
+    def _res(self, text):
+        d = ca.decide(text, backend_name="rules")
+        return d.decision, d.rules, d.capabilities
+
+    def test_normal_mode_changes_nothing(self):
+        for text in ("git commit -m x", "pip install requests", "pytest -x"):
+            dec, rules, caps = self._res(text)
+            self.assertEqual(ca.apply_mode("normal", dec, rules, caps), (dec, ""))
+
+    def test_strict_asks_for_anything_that_changes_state(self):
+        for text in ("git commit -m x", "cat a > b", "mkdir build", "python -c \"print(1)\"", "curl -s https://example.com"):
+            with self.subTest(text=text):
+                dec, rules, caps = self._res(text)
+                new, why = ca.apply_mode("strict", "proceed", rules, caps)
+                self.assertEqual(new, "ask_user", (text, caps))
+                self.assertIn("strict mode", why)
+
+    def test_strict_leaves_read_only_and_blocks_alone(self):
+        for text in ("pytest -x", "git status", "cat README.md | grep foo", "ls docs/guide.md"):
+            with self.subTest(text=text):
+                dec, rules, caps = self._res(text)
+                self.assertEqual(ca.apply_mode("strict", dec, rules, caps)[0], "proceed", caps)
+        self.assertEqual(ca.apply_mode("strict", "block", ca.RuleResult("block", ["block:x"]), ["cap:fs_write"])[0], "block")
+
+    def test_relaxed_waives_only_listed_rules(self):
+        dec, rules, caps = self._res("pip install requests")
+        self.assertEqual(dec, "ask_user")
+        self.assertEqual(ca.apply_mode("relaxed", dec, rules, caps)[0], "proceed")
+        # a chain waives nothing unless every asking rule is listed
+        dec, rules, caps = self._res("pip install requests && rm notes.txt")
+        self.assertEqual(ca.apply_mode("relaxed", dec, rules, caps)[0], "ask_user")
+        # not listed
+        dec, rules, caps = self._res("git push origin feature")
+        self.assertEqual(ca.apply_mode("relaxed", dec, rules, caps)[0], "ask_user")
+
+    def test_relaxed_never_waives_secret_network_or_system_actions(self):
+        dec, rules, _ = self._res("pip install requests")
+        for cap in ("cap:secret_access", "cap:net_outbound", "cap:sys_admin"):
+            with self.subTest(cap=cap):
+                self.assertEqual(ca.apply_mode("relaxed", dec, rules, ["cap:pkg_install", cap])[0], "ask_user")
+        with mock.patch.dict(ca.get_mode_config(), {"relaxed_waive": ["docker run/exec/compose"]}):
+            dec, rules, caps = self._res("docker run -d nginx")
+            self.assertEqual(ca.apply_mode("relaxed", dec, rules, caps)[0], "ask_user")
+
+    def test_relaxed_waive_list_comes_from_the_trusted_policy_only(self):
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8")
+        orig_cwd = os.getcwd()
+        workdir = tempfile.mkdtemp()
+        try:
+            tmp.write("modes:\n  relaxed_waive: ['dependency install', 'overwrite']\n")
+            tmp.close()
+            ca.reload_policy(tmp.name)
+            self.assertEqual(ca.get_mode_config()["relaxed_waive"], ["dependency install", "overwrite"])
+            # a workspace policy cannot widen it
+            Path(workdir, "policy.yaml").write_text("modes:\n  relaxed_waive: ['rm / del', 'system / privileges']\n", encoding="utf-8")
+            os.chdir(workdir)
+            with mock.patch.dict(os.environ, {"GUARDRAIL_POLICY_FILE": tmp.name}):
+                ca.reload_policy()
+                self.assertEqual(ca.get_mode_config()["relaxed_waive"], ["dependency install", "overwrite"])
+        finally:
+            os.chdir(orig_cwd)
+            os.unlink(tmp.name)
+            Path(workdir, "policy.yaml").unlink()
+            os.rmdir(workdir)
+            ca.reload_policy()
+        self.assertEqual(ca.get_mode_config()["relaxed_waive"], ["dependency install"])
+
+    def test_markdown_file_names_are_not_write_commands(self):
+        self.assertNotIn("cap:fs_write", ca.classify_capabilities("cat README.md"))
+        self.assertNotIn("cap:fs_write", ca.classify_capabilities("grep foo docs/guide.md"))
+        for text in ("mv a b", "cp a b", "md newdir"):
+            with self.subTest(text=text):
+                self.assertIn("cap:fs_write", ca.classify_capabilities(text))
+
+
+class GitHookRuleTests(unittest.TestCase):
+    def test_bypassing_hooks_asks(self):
+        for text in ("git commit -m x --no-verify", "git push --no-verify origin feature"):
+            with self.subTest(text=text):
+                r = ca.evaluate_rules(text)
+                self.assertEqual(r.decision, "ask_user", r.matched)
+                self.assertIn("ask_user:git hook bypass", r.matched)
+        self.assertEqual(ca.evaluate_rules("git commit -m 'update docs'").decision, "proceed")
+
+    def test_redirecting_hooks_is_blocked(self):
+        for text in ("git -c core.hooksPath=/tmp/x commit -m y", "git config core.hooksPath /tmp/h",
+                     "git config --global core.hookspath /tmp/h"):
+            with self.subTest(text=text):
+                self.assertEqual(ca.evaluate_rules(text).decision, "block")
+
+    def test_hook_files_and_modules_are_control_plane(self):
+        for text in ("echo exit 0 > .git/hooks/pre-commit", "rm .git/hooks/pre-commit", "rm git_hooks.py",
+                     "echo x > readonly_mode.py", "python git_hooks.py install"):
+            with self.subTest(text=text):
+                self.assertEqual(ca.evaluate_rules(text).decision, "block")
+
+
+class ReadOnlyDetectionTests(unittest.TestCase):
+    READ = (
+        "ls -la", "cat README.md", "git status", "git log --oneline | head -5", "git diff HEAD~1", "git branch -a",
+        "git stash list", "git config --get user.name", "grep -rn 'rm -rf' src/", 'grep "a|b" file.txt',
+        "pytest -x tests/", "npm test", "npm run lint", "python -m pytest", "python script.py", "docker ps",
+        "docker compose ps", "kubectl get pods", "ls > /dev/null", "ls 2>&1 | tail -3", "find . -name '*.py'",
+        "curl -s https://example.com/api", "systemctl status nginx", "cd src && ls", "echo hello", "pip list",
+        "python -B tests/test_check_action.py 2>&1 | tail -5", "cat a.txt | wc -l", "terraform plan",
+        "sed -n 1,5p f.txt", "tar -tf archive.tar", "go test ./...", "cargo check", "git remote -v", "git tag -l",
+    )
+    WRITE = (
+        "rm notes.txt", "touch a.txt", "echo hi > out.txt", "cat a >> b", "mkdir build", "mv a b", "cp a b",
+        "git add .", "git commit -m x", "git push", "git checkout main", "git branch newbranch", "git stash",
+        "git config user.name x", "pip install requests", "npm install", "yarn", "uv pip install x",
+        "sed -i s/a/b/ f", "curl -o f.zip https://x", "curl -O https://x/f", "wget https://x/f", "docker run nginx",
+        "docker compose up -d", "kubectl apply -f x.yaml", "systemctl restart nginx", "ls && rm x", "ls $(rm x)",
+        "bash -c 'rm x'", "sudo rm x", "env FOO=1 rm x", "python -c \"open('x','w')\"", "tee out.txt",
+        "tar -xf a.tar", "Set-Content -Path a -Value b", "python -m pip install x", "cargo add serde",
+        "git tag v1", "git reset --hard", "terraform apply", "kill 123",
+    )
+
+    def setUp(self):
+        import readonly_mode
+        self.ro = readonly_mode
+
+    def test_read_only_commands_pass(self):
+        for text in self.READ:
+            with self.subTest(text=text):
+                self.assertEqual(self.ro.readonly_violations(text), [])
+
+    def test_mutating_commands_are_caught(self):
+        for text in self.WRITE:
+            with self.subTest(text=text):
+                self.assertTrue(self.ro.readonly_violations(text), text)
+
+    def test_quoted_text_is_not_a_command(self):
+        self.assertEqual(self.ro.readonly_violations('echo "rm -rf / ; touch x > y"'), [])
+        self.assertEqual(self.ro.readonly_violations("grep 'git push' notes.txt"), [])
+
+    def test_violation_reasons_are_named(self):
+        self.assertIn("git commit", self.ro.readonly_violations("git commit -m x"))
+        self.assertIn("output redirection", self.ro.readonly_violations("echo hi > out.txt"))
+        self.assertIn("rm", self.ro.readonly_violations("ls $(rm x)"))
+
+
+@unittest.skipUnless(__import__("shutil").which("git"), "git is not installed")
+class GitPreCommitScanTests(unittest.TestCase):
+    def setUp(self):
+        import subprocess
+        import tempfile
+        import git_hooks
+        self.gh = git_hooks
+        self.subprocess = subprocess
+        self.repo = Path(tempfile.mkdtemp())
+        self._git("init", "-q")
+        self._git("config", "user.email", "t@example.com")
+        self._git("config", "user.name", "tester")
+        self._git("config", "commit.gpgsign", "false")
+        self.key = "AKIA" + "QZ7R2M4K9P3L6WXY"
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.repo, ignore_errors=True)
+
+    def _git(self, *args, check=True):
+        return self.subprocess.run(["git", *args], cwd=self.repo, capture_output=True, check=check, text=True,
+                                   encoding="utf-8", errors="replace")
+
+    def _stage(self, name, text):
+        (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo / name).write_text(text, encoding="utf-8")
+        self._git("add", name)
+
+    def test_clean_changes_pass(self):
+        self._stage("app.py", "print('hello')\n")
+        self.assertEqual(self.gh.scan_staged(self.repo), (0, ""))
+
+    def test_credential_in_added_line_is_reported_without_its_value(self):
+        self._stage("src/app.py", f"import os\n\nKEY = '{self.key}'\n")
+        code, report = self.gh.scan_staged(self.repo)
+        self.assertEqual(code, 1)
+        self.assertIn("src/app.py:3: aws access key", report)
+        self.assertNotIn(self.key, report)
+
+    def test_only_added_lines_count(self):
+        self._stage("old.py", f"KEY = '{self.key}'  # guardrail:ignore\n")
+        self.assertEqual(self.gh.scan_staged(self.repo)[0], 0)
+        self._git("commit", "-q", "-m", "base")
+        # the old line is context now; a change elsewhere must not re-trigger it
+        (self.repo / "old.py").write_text(f"x = 1\nKEY = '{self.key}'  # guardrail:ignore\n", encoding="utf-8")
+        self._git("add", "old.py")
+        self.assertEqual(self.gh.scan_staged(self.repo)[0], 0)
+
+    def test_secret_files_are_flagged_but_templates_are_not(self):
+        self._stage(".env", "DEBUG=1\n")
+        self._stage(".env.example", "DEBUG=1\n")
+        code, report = self.gh.scan_staged(self.repo)
+        self.assertEqual(code, 1)
+        self.assertIn(".env: secret file", report)
+        self.assertNotIn(".env.example", report)
+
+    def test_documentation_placeholders_do_not_trigger(self):
+        self._stage("README.md", "Use AKIAIOSFODNN7EXAMPLE as a placeholder.\n")
+        self.assertEqual(self.gh.scan_staged(self.repo)[0], 0)
+
+    def test_not_a_repository_never_blocks(self):
+        import tempfile
+        code, report = self.gh.scan_staged(tempfile.gettempdir() + "/definitely-not-a-repo-xyz")
+        self.assertEqual(code, 0)
+
+    def test_install_is_idempotent_and_keeps_existing_hooks(self):
+        hook = self.gh.hooks_dir(self.repo) / "pre-commit"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text("#!/bin/sh\necho existing-check\n", encoding="utf-8")
+        ok, _ = self.gh.install_pre_commit(self.repo)
+        self.assertTrue(ok)
+        self.gh.install_pre_commit(self.repo)
+        text = hook.read_text(encoding="utf-8")
+        self.assertEqual(text.count(self.gh.MARKER_BEGIN), 1)
+        self.assertIn("echo existing-check", text)
+        self.assertIn("scan-staged", text)
+        self.assertNotIn("\r", text)
+        ok, _ = self.gh.uninstall_pre_commit(self.repo)
+        self.assertTrue(ok)
+        self.assertEqual(hook.read_text(encoding="utf-8").strip(), "#!/bin/sh\necho existing-check")
+
+    def test_installed_hook_blocks_a_real_commit(self):
+        ok, msg = self.gh.install_pre_commit(self.repo)
+        self.assertTrue(ok, msg)
+        self._stage("secrets.py", f"KEY = '{self.key}'\n")
+        bad = self._git("commit", "-m", "leak", check=False)
+        self.assertNotEqual(bad.returncode, 0, bad.stdout + bad.stderr)
+        self.assertIn("credential finding", bad.stderr + bad.stdout)
+        self.assertNotIn(self.key, bad.stderr + bad.stdout)
+        # --no-verify is the documented escape hatch
+        self.assertEqual(self._git("commit", "-q", "--no-verify", "-m", "leak", check=False).returncode, 0)
+        self._stage("fine.py", "x = 1\n")
+        self.assertEqual(self._git("commit", "-q", "-m", "fine", check=False).returncode, 0)
+
+    def test_uninstall_without_our_block_reports_it(self):
+        ok, msg = self.gh.uninstall_pre_commit(self.repo)
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="tests/"><img src="https://img.shields.io/badge/tests-217%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/tests-252%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-~37.4ms%20(neural)-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
@@ -321,6 +321,19 @@ Evaluating a command string in isolation is insufficient because real-world inte
 11. **Stack-Aware Policy Proposals (`/guardrail init`)**:
    - Reads the project's scripts and config and proposes narrow `custom_proceed_rules` for routine check/lint/test/build commands that are not whitelisted yet, plus matching `tests:` cases. Scripts that delete, install, deploy, publish or touch the network are never proposed.
    - The proposal is saved to `~/.guardrail/policy.proposed.yaml` and nothing is applied from chat: `python guardrail_hook.py init --apply` (human terminal) writes it into the trusted `policy.yaml` and runs the policy tests.
+
+12. **Session Modes (`/guardrail mode`)**:
+   - `normal` is the default (or set `GUARDRAIL_MODE=strict|relaxed` in your environment). The mode is chosen by you in chat and is scoped to the session.
+   - `strict` is for code you do not trust: a `proceed` becomes a confirmation whenever the action can change state (file writes, deletions, git mutations, package installs, system admin, inline code, network), including WebFetch/WebSearch. Temporary allow rules are ignored.
+   - `relaxed` is for your own projects: confirmations whose rules are all listed in `modes.relaxed_waive` of `policy.yaml` (default `dependency install`) are skipped, with a backup taken first. Secret access, outbound network and system-admin actions are never waived, and blocks never are. A workspace `policy.yaml` cannot change the list.
+
+13. **Read-Only Sessions (`/guardrail readonly`)**:
+   - Refuses file-edit tools and shell commands that change something: `rm`/`mv`/`cp`/`mkdir`/`touch`, output redirections (`> file`, with `/dev/null` and `2>&1` allowed), `sed -i`, mutating `git` sub-commands (`add`, `commit`, `checkout`, `push`, `stash`...), package installs, `docker run`/`compose up`, `kubectl apply`, `systemctl restart`, `curl -o`, `wget`, `python -c`... It looks at every link of a chain and at what `bash -c`, `sudo` and `$(...)` run.
+   - It is best-effort: it cannot see what a script does once it runs (`python build.py`, `make`). Reads, searches, `git status/log/diff`, tests, `docker ps` and `kubectl get` keep working.
+
+14. **Git Pre-Commit Credential Scan (`install.py --git-hook`)**:
+   - `python install.py --git-hook [repo]` adds a `pre-commit` hook (existing hook content is kept; `--remove-git-hook` undoes it) that blocks commits adding credentials or secret files (`.env`, `*.pem`, `id_rsa`...). It covers commits made by hand or by any tool, not only by the agent. Findings show `file:line` and the kind, never the value.
+   - A line that is not a real credential can carry `guardrail:ignore`; `git commit --no-verify` skips the hook, so an agent doing it (or editing `.git/hooks/`, or setting `core.hooksPath`) is asked or blocked.
 ---
 
 ### Supported Backend Engines
@@ -465,11 +478,13 @@ From that point forward:
 | `/guardrail check <cmd>` | Dry-run evaluates a command in chat without executing it |
 | `/guardrail why` | Explains the most recent blocked or confirmation-required action from the audit log |
 | `/guardrail doctor` | Runs a unified health check (policy, SHA-256 audit log chain, skill sync, daemons) |
-| `/guardrail report [days]` | Summarizes the audit log: decisions, most frequent rules, actions that keep asking for confirmation |
+| `/guardrail report [days] [session]` | Summarizes the audit log: decisions, most frequent rules, actions that keep asking for confirmation; `session` limits it to the current session |
 | `/guardrail test` | Runs the `tests:` cases of `policy.yaml` (`python check_action.py --test-policy` exits 1 on failure, for CI) |
 | `/guardrail undo [list]` | Restores the files backed up before the last confirmed deletion or overwrite (`list` shows the backups) |
 | `/guardrail allow <regex> [--for 30m\|2h\|session]` | Waives confirmations (never blocks) for matching commands in this session only; default 60 min, max 24 h. `allow list` / `allow clear` manage them |
 | `/guardrail init` | Detects the project stack (package.json, pyproject.toml, Cargo.toml, go.mod, Makefile, compose) and proposes narrow safe rules + policy tests; adopt them with `python guardrail_hook.py init --apply` in your own terminal |
+| `/guardrail mode [strict\|normal\|relaxed]` | Session mode. `strict`: anything that can change state asks, even whitelisted commands, and `/guardrail allow` is ignored. `relaxed`: waives the confirmations listed in `modes.relaxed_waive` (default: dependency installs) |
+| `/guardrail readonly [on\|off\|status]` | Refuses every action that changes something (file edits, deletions, output redirections, git/package/container changes) for this session |
 
 ---
 
@@ -1225,16 +1240,16 @@ We believe in complete transparency regarding security boundaries:
 Contributions are warmly welcome! The codebase includes **141 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, skill synchronization, and protocol handlers:
 
 ```bash
-# 1. Run engine & risk-scoring tests (114 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests):
+# 1. Run engine & risk-scoring tests (137 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests, modes, read-only detection, git pre-commit scan):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook & replay tests (82 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, skill sync):
+# 2. Run lifecycle hook & replay tests (94 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, temp allow, modes, read-only, skill sync):
 python tests/test_guardrail_hook.py
 
 # 3. Run MCP server protocol tests (21 tests):
 python tests/test_mcp_server.py
 
-# 4. Run all 217 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
+# 4. Run all 252 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
 python -m unittest discover -s tests -p "test_*.py"
 ```
 

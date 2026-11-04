@@ -6,6 +6,7 @@ Automatically intercepts prompts and tool calls in the background:
     guardrail_hook.py hook --host claude|codex
     guardrail_hook.py on|off|status|reload [--session ID] [--policy FILE]
     guardrail_hook.py check "<cmd>" | why | doctor | report [DAYS] | test | undo [list] | init [DIR] [--apply]
+    guardrail_hook.py scan-staged | git-hook install|remove [DIR]
 """
 
 from __future__ import annotations
@@ -152,6 +153,26 @@ class State:
             for h in (s.get("action_history") or [])
             if isinstance(h, dict) and now - float(h.get("ts", 0)) < ttl
         ]
+
+    # --- Session modes (/guardrail mode, /guardrail readonly): user-set, session-scoped ---
+
+    def get_mode(self, sid: str) -> str:
+        import check_action as ca
+        mode = str(self.session(sid).get("mode") or os.environ.get("GUARDRAIL_MODE", "") or "normal").strip().lower()
+        return mode if mode in ca.MODES else "normal"
+
+    def set_mode(self, sid: str, mode: str) -> None:
+        self.session(sid)["mode"] = mode
+        self.session(sid)["ts"] = time.time()
+        self.dirty = True
+
+    def is_readonly(self, sid: str) -> bool:
+        return bool(self.session(sid).get("readonly"))
+
+    def set_readonly(self, sid: str, on: bool) -> None:
+        self.session(sid)["readonly"] = bool(on)
+        self.session(sid)["ts"] = time.time()
+        self.dirty = True
 
     # --- Temporary allow rules (/guardrail allow): user-granted, session-scoped, expiring ---
 
@@ -333,7 +354,7 @@ def verify_audit_log(log_path: Path | None = None) -> tuple[bool, str, int]:
 # --- Commands & Prompts ---
 
 _EXPLICIT_CMD_RE = re.compile(
-    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload|why|doctor|check|report|test|undo|allow|init)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?(?:\s+(?P<rest>.*))?$",
+    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload|why|doctor|check|report|test|undo|allow|init|mode|readonly)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?(?:\s+(?P<rest>.*))?$",
     re.IGNORECASE | re.DOTALL,
 )
 _PLAIN_CMD_RE = re.compile(
@@ -355,9 +376,11 @@ _ARG_MAP = {
     "undo": "undo", "restore": "undo",
     "allow": "allow",
     "init": "init", "suggest": "init",
+    "mode": "mode",
+    "readonly": "readonly", "read-only": "readonly", "ro": "readonly",
 }
 # Commands that only report or restore: they never change the active state of the session
-_INFO_CMDS = ("reload", "check", "why", "doctor", "report", "test", "undo", "allow", "init")
+_INFO_CMDS = ("reload", "check", "why", "doctor", "report", "test", "undo", "allow", "init", "mode", "readonly")
 _CONFIRM_RE = re.compile(
     r"\b(?:yes|y|ok|okay|confirm|confirmed|approve|approved|proceed|go|continue|done)\b",
     re.IGNORECASE,
@@ -597,6 +620,79 @@ def format_allow(state: State, sid: str, arg: str) -> str:
             f"({minutes:g} min) in this session. Blocks still apply, and every link of a chained command must be covered.")
 
 
+_MODE_HELP = {
+    "strict": "anything that can change state (files, git, packages, system, code, network) asks for confirmation, "
+              "even whitelisted commands; /guardrail allow is ignored.",
+    "normal": "default rules.",
+}
+
+
+def format_mode(state: State, sid: str, arg: str) -> str:
+    """`/guardrail mode [strict|normal|relaxed]`: stricter or looser handling for this session."""
+    import check_action as ca
+    wanted = (arg or "").strip().lower()
+    current = state.get_mode(sid)
+    relaxed_help = (
+        "confirmations for " + (", ".join(ca.get_mode_config().get("relaxed_waive") or []) or "nothing")
+        + " are waived (never secrets, outbound network or system actions, never blocks)."
+    )
+    helps = {**_MODE_HELP, "relaxed": relaxed_help}
+    if wanted in ("", "status"):
+        return (f"{ICON} Mode: {current} — {helps[current]}\n"
+                "Change it with `/guardrail mode strict|normal|relaxed` (this session only).")
+    if wanted not in ca.MODES:
+        return f"{ICON} Unknown mode `{wanted}`. Use `/guardrail mode strict|normal|relaxed`."
+    state.set_mode(sid, wanted)
+    log({"event": "mode_changed", "session": sid, "mode": wanted})
+    return f"{ICON} Mode set to {wanted} for this session — {helps[wanted]}"
+
+
+def format_readonly(state: State, sid: str, arg: str) -> str:
+    """`/guardrail readonly [on|off|status]`: refuse every action that changes something."""
+    wanted = (arg or "").strip().lower()
+    if wanted == "status":
+        return f"{ICON} Read-only mode is {'ON' if state.is_readonly(sid) else 'OFF'} for this session."
+    if wanted in ("", "on", "enable", "true", "1"):
+        state.set_readonly(sid, True)
+        log({"event": "readonly_changed", "session": sid, "readonly": True})
+        return (f"{ICON} Read-only mode ON: file edits, deletions, git/package/container changes and output "
+                "redirections are refused for this session. It is best-effort (a script you run can still write). "
+                "Turn it off with `/guardrail readonly off`.")
+    if wanted in ("off", "disable", "false", "0"):
+        state.set_readonly(sid, False)
+        log({"event": "readonly_changed", "session": sid, "readonly": False})
+        return f"{ICON} Read-only mode OFF."
+    return f"{ICON} Usage: `/guardrail readonly [on|off|status]`."
+
+
+def format_session_flags(state: State, sid: str) -> str:
+    lines = [f"  • Mode: {state.get_mode(sid)}", f"  • Read-only: {'ON' if state.is_readonly(sid) else 'off'}"]
+    n = len(state.temp_allow_entries(sid))
+    if n:
+        lines.append(f"  • Temporary allow rules: {n} (`/guardrail allow list`)")
+    return "Session settings:\n" + "\n".join(lines)
+
+
+def readonly_tool_violations(event: dict) -> list[str]:
+    """Why a tool call changes something (empty when it looks read-only)."""
+    import readonly_mode
+    name, inp = _tool_call(event)
+    low = name.lower()
+    if low in EDIT_TOOLS or low in DELETE_TOOLS or low == "apply_patch":
+        return [f"{name} (file modification)"]
+    if low in SHELL_TOOLS:
+        return readonly_mode.readonly_violations(_shell_command(inp))
+    return []
+
+
+def _report_args(arg: str, sid: str) -> tuple[float, str | None]:
+    """`/guardrail report [days] [session]` -> (days, session id or None for all sessions)."""
+    words = str(arg or "").split()
+    here = ("session", "this", "now")
+    session = (sid or "_default") if any(w.lower() in here for w in words) else None
+    return _parse_days(next((w for w in words if w.lower() not in here), "")), session
+
+
 def format_init(root: str = "") -> str:
     import policy_init
     return f"{ICON} " + policy_init.format_init_report(root or os.getcwd())
@@ -632,7 +728,7 @@ def _entry_rules(entry: dict) -> list[str]:
     return re.findall(r"'([^']+)'", m.group(1)) if m else []
 
 
-def format_report(days: float = 7, log_path: Path | None = None) -> str:
+def format_report(days: float = 7, log_path: Path | None = None, session: str | None = None) -> str:
     """Summarize the audit log: decisions, most frequent rules, actions that keep asking for confirmation."""
     from collections import Counter
     cutoff = time.time() - days * 86400
@@ -648,6 +744,8 @@ def format_report(days: float = 7, log_path: Path | None = None) -> str:
             continue
         if ts < cutoff:
             continue
+        if session is not None and str(e.get("session") or "") != session:
+            continue
         events[str(e.get("event") or "")] += 1
         if e.get("session"):
             sessions.add(str(e["session"]))
@@ -660,7 +758,7 @@ def format_report(days: float = 7, log_path: Path | None = None) -> str:
                 asked[str(e["text"]).splitlines()[0][:100]] += 1
 
     total = sum(decisions.values())
-    period = f"last {days:g} day{'s' if days != 1 else ''}"
+    period = f"last {days:g} day{'s' if days != 1 else ''}" + (", this session only" if session is not None else "")
     if not total:
         return f"{ICON} Agent Guardrail Report ({period}): no evaluated actions in the audit log."
     lines = [
@@ -907,7 +1005,7 @@ def _patch_actions(patch: str) -> list[str]:
 
 # Names unique to the guardrail and the agents' hook settings: protected wherever they appear
 _GUARDRAIL_CONTROL_FILES = (
-    "check_action.py", "guardrail_hook.py", "daemon_manager.py", "claude_hook.py", "policy_init.py", ".guardrail",
+    "check_action.py", "guardrail_hook.py", "daemon_manager.py", "claude_hook.py", "policy_init.py", "readonly_mode.py", "git_hooks.py", ".git/hooks/", ".guardrail",
     ".claude/settings.json", ".claude/settings.local.json",
     ".codex/hooks.json", ".agents/hooks.json", ".cursorrules", ".cursor/rules/guardrail.mdc",
 )
@@ -1153,7 +1251,7 @@ def on_prompt_submit(event: dict, host: str, state: State):
         elif cmd == "doctor":
             daemon_msg = format_doctor_report()
         elif cmd == "report":
-            daemon_msg = format_report(_parse_days(cmd_arg))
+            daemon_msg = format_report(*_report_args(cmd_arg, sid))
         elif cmd == "test":
             daemon_msg = format_policy_tests()
         elif cmd == "undo":
@@ -1162,15 +1260,20 @@ def on_prompt_submit(event: dict, host: str, state: State):
             daemon_msg = format_allow(state, sid, cmd_arg)
         elif cmd == "init":
             daemon_msg = format_init(cmd_arg)
+        elif cmd == "mode":
+            daemon_msg = format_mode(state, sid, cmd_arg)
+        elif cmd == "readonly":
+            daemon_msg = format_readonly(state, sid, cmd_arg)
 
         active = is_active(state, sid, host) if cmd in ("status", *_INFO_CMDS) else (cmd in ("on", "start"))
         log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
 
         status_rep = ""
         if cmd == "status":
+            status_rep = "\n" + format_session_flags(state, sid)
             try:
                 import daemon_manager
-                status_rep = "\n\n" + daemon_manager.format_status_report()
+                status_rep += "\n\n" + daemon_manager.format_status_report()
             except Exception:
                 pass
 
@@ -1343,7 +1446,8 @@ def on_prompt_expansion(event: dict, host: str, state: State):
     active = is_active(state, sid, host) if cmd in ("status", *_INFO_CMDS) else (cmd == "on")
     log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
     if cmd in ("off", "status"):
-        return {"decision": "block", "reason": status_text(active)}, 0
+        extra = "\n" + format_session_flags(state, sid) if cmd == "status" else ""
+        return {"decision": "block", "reason": status_text(active) + extra}, 0
     if cmd == "reload":
         import check_action as ca
         reload_info = ca.reload_policy()
@@ -1365,7 +1469,7 @@ def on_prompt_expansion(event: dict, host: str, state: State):
     if cmd == "doctor":
         return {"decision": "block", "reason": format_doctor_report()}, 0
     if cmd == "report":
-        return {"decision": "block", "reason": format_report(_parse_days(rest_arg))}, 0
+        return {"decision": "block", "reason": format_report(*_report_args(rest_arg, sid))}, 0
     if cmd == "test":
         return {"decision": "block", "reason": format_policy_tests()}, 0
     if cmd == "undo":
@@ -1374,6 +1478,10 @@ def on_prompt_expansion(event: dict, host: str, state: State):
         return {"decision": "block", "reason": format_allow(state, sid, rest_arg)}, 0
     if cmd == "init":
         return {"decision": "block", "reason": format_init(rest_arg)}, 0
+    if cmd == "mode":
+        return {"decision": "block", "reason": format_mode(state, sid, rest_arg)}, 0
+    if cmd == "readonly":
+        return {"decision": "block", "reason": format_readonly(state, sid, rest_arg)}, 0
     return {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptExpansion",
@@ -1413,6 +1521,21 @@ def on_pre_tool(event: dict, host: str, state: State):
     tool_ident = event.get("tool_name") or (event.get("toolCall", {}).get("name") if isinstance(event.get("toolCall"), dict) else "")
     forced = None  # decision fixed by tool semantics rather than by the rules engine
 
+    if desc is not None and state.is_readonly(sid):
+        violations = readonly_tool_violations(event)
+        if violations:
+            short_ro = desc.splitlines()[0][:160]
+            log({
+                "host": host, "event": "tool", "session": sid, "tool": tool_ident, "text": desc[:300],
+                "decision": "block", "risk_score": 0.9, "matched_rules": ["block:readonly mode"],
+                "why": "readonly mode: " + ", ".join(violations[:5]),
+            })
+            return pre_tool_output(
+                host, "deny",
+                f"{ICON} GUARDRAIL: read-only mode is ON, action refused ({', '.join(violations[:4])}): {short_ro}. "
+                "Do not retry or look for a workaround: tell the user, who can run `/guardrail readonly off`.",
+            ), 0
+
     if desc is None:
         # Read/Grep/Glob are silent, except on secret files (.env, id_rsa, *.pem...): those need confirmation
         secret_targets = [t for t in _read_targets(event) if ca.is_secret_path(t)]
@@ -1445,6 +1568,11 @@ def on_pre_tool(event: dict, host: str, state: State):
             hosts = ", ".join(ca.egress_violations(desc)[:3])
             forced = ca.Decision(
                 "ask_user", "rules", ca.RuleResult("ask_user", [f"ask_user:egress to non-allowlisted host ({hosts})"]),
+                capabilities=net_caps, risk_score=0.55, risk_factors=["cap:net_outbound"],
+            )
+        elif state.get_mode(sid) == "strict":
+            forced = ca.Decision(
+                "ask_user", "rules", ca.RuleResult("ask_user", ["ask_user:strict mode outbound request"]),
                 capabilities=net_caps, risk_score=0.55, risk_factors=["cap:net_outbound"],
             )
         else:
@@ -1486,12 +1614,23 @@ def on_pre_tool(event: dict, host: str, state: State):
     result = forced or evaluate(desc, state, context=ctx)
     final = result.decision
     reason = _reason(result)
-    if forced is None and final == "ask_user" and result.rules.decision == "ask_user":
-        # The user waived this kind of confirmation from the chat (/guardrail allow): never a block
-        temp_patterns = state.temp_allow_patterns(sid)
-        if temp_patterns and ca.temp_allow_covers(desc, result.rules, temp_patterns):
-            final, reason = "proceed", "allowed by /guardrail allow"
-            log({"host": host, "event": "temp_allow_used", "session": sid, "tool": tool_ident, "text": desc[:300]})
+    mode = state.get_mode(sid)
+    waived = False
+    if forced is None:
+        if mode == "strict":
+            final, why = ca.apply_mode("strict", final, result.rules, result.capabilities)
+            reason = why or reason
+        else:
+            if final == "ask_user" and result.rules.decision == "ask_user":
+                # The user waived this kind of confirmation from the chat (/guardrail allow): never a block
+                temp_patterns = state.temp_allow_patterns(sid)
+                if temp_patterns and ca.temp_allow_covers(desc, result.rules, temp_patterns):
+                    final, reason, waived = "proceed", "allowed by /guardrail allow", True
+                    log({"host": host, "event": "temp_allow_used", "session": sid, "tool": tool_ident, "text": desc[:300]})
+            if final == "ask_user" and mode == "relaxed":
+                final, why = ca.apply_mode("relaxed", final, result.rules, result.capabilities)
+                if why:
+                    reason, waived = why, True
     if outside and final == "proceed":
         final, reason = "ask_user", "file outside project directory: " + ", ".join(outside)
 
@@ -1503,7 +1642,7 @@ def on_pre_tool(event: dict, host: str, state: State):
         "host": host, "event": "tool", "session": sid, "tool": tool_ident,
         "text": desc[:300], "decision": final, "risk_score": result.risk_score,
         "capabilities": result.capabilities, "matched_rules": list(result.rules.matched),
-        "dry_run": preview, "why": result.explain(),
+        "dry_run": preview, "why": result.explain(), **({"mode": mode} if mode != "normal" else {}),
     })
 
     def _backup_before_confirmed_change() -> None:
@@ -1515,6 +1654,10 @@ def on_pre_tool(event: dict, host: str, state: State):
         snap = snapshot_files(_backup_candidates(event, paths, cwd), sid, str(tool_ident), desc)
         if snap is not None:
             log({"host": host, "event": "backup", "session": sid, "tool": tool_ident, "snapshot": snap.name})
+
+    if waived:
+        # No confirmation will happen, so keep a copy of what a deletion or overwrite would touch
+        _backup_before_confirmed_change()
 
     short = desc.splitlines()[0][:160]
     if final == "block":
@@ -1736,6 +1879,21 @@ def main(argv: list[str]) -> int:
         results = ca.run_policy_tests()
         print(ca.format_policy_test_report(results))
         return 0 if all(r["ok"] for r in results) else 1
+
+    if argv[0] == "scan-staged":
+        import git_hooks
+        code, report = git_hooks.scan_staged(os.getcwd())
+        if report:
+            print(report, file=sys.stderr if code else sys.stdout)
+        return code
+
+    if argv[0] == "git-hook":
+        import git_hooks
+        action = argv[1] if len(argv) > 1 else "install"
+        repo = next((a for a in argv[2:] if not a.startswith("-")), os.getcwd())
+        ok, msg = git_hooks.uninstall_pre_commit(repo) if action in ("remove", "uninstall") else git_hooks.install_pre_commit(repo)
+        print(msg)
+        return 0 if ok else 1
 
     if argv[0] in ("init", "suggest"):
         import policy_init
