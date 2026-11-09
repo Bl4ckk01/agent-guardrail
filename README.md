@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="tests/"><img src="https://img.shields.io/badge/tests-289%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/tests-306%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-~37.4ms%20(neural)-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
@@ -353,6 +353,17 @@ Evaluating a command string in isolation is insufficient because real-world inte
 20. **Log Rotation, Verification and Export**:
    - The audit log rotates when it passes `audit_logging.max_size_mb` (default 5), keeping `max_archives` copies (default 12). The new file starts with a `log_rotated` record carrying the previous hash, so the SHA-256 chain continues across files; `/guardrail doctor` and `python guardrail_hook.py verify` verify all of it and detect a modified or missing archive. `/guardrail report` reads the archives too.
    - `/guardrail export json|html|csv [days]` writes a self-contained report (summary, integrity status, one row per action that asked, was blocked, or matters). HTML escapes everything and CSV neutralizes spreadsheet formulas.
+
+21. **The Agent Cannot Disarm the Guardrail**:
+   - Driving the hook from a shell is blocked: piping a forged event into `guardrail_hook.py hook`, running its state-changing sub-commands (`on`, `off`, `undo`, `git-hook`...), `python -m guardrail_hook`, or importing `guardrail_hook`, `check_action`, `policy_trust` and the other guardrail modules from `python -c`, a heredoc or a script. Read-only sub-commands (`status`, `check`, `why`, `doctor`, `report`, `test`, `verify`, `export`) stay available.
+   - Through the Skill tool an agent may only read and tighten (`status`, `check`, `mode strict`, `readonly on`...). `off`, `allow`, `mode relaxed|normal`, `readonly off`, `alert clear`, `trust <hash>` and `undo` are refused: they are yours to type.
+
+22. **Scripts Checked in Full**:
+   - When a file-edit tool writes a script (`.sh`, `.py`, `.js`, `.ps1`, `Makefile`, `package.json`, files with a shebang...), every line is checked against the block rules, not only the first 2000 characters, and so are all the chunks of a MultiEdit. Prose files keep the short check, so a README may still quote dangerous commands.
+
+23. **What a Command Really Runs**:
+   - The guardrail remembers the files the agent wrote in the session (edit tools and `>` redirections). Running one of them (`bash x.sh`, `python x.py`, `./x.sh`, `source x`, `pwsh -File x.ps1`) scans it in full: a blocked command inside blocks the run, file-deletion or upload APIs ask first. Scripts that were already in the project ask (instead of passing) when they contain a blocked command.
+   - `make [target]` (with its prerequisites) and `npm|pnpm|yarn|bun run <script>` (with `pre`/`post` hooks) are evaluated like the commands they run, even on the fast path for read-only commands: `npm run clean` with `rm -rf dist` asks, or is blocked when the agent wrote that `package.json` itself. Noisy words such as `config` or `production` in a recipe do not trigger anything.
 ---
 
 ### Supported Backend Engines
@@ -1262,16 +1273,16 @@ We believe in complete transparency regarding security boundaries:
 Contributions are warmly welcome! The codebase includes **141 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, skill synchronization, and protocol handlers:
 
 ```bash
-# 1. Run engine & risk-scoring tests (151 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests, modes, read-only detection, git pre-commit scan, redirects, injection signals, trusted policy):
+# 1. Run engine & risk-scoring tests (159 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests, modes, read-only detection, git pre-commit scan, redirects, injection signals, trusted policy):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook & replay tests (117 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, temp allow, modes, read-only, escalation, diff preview, log rotation/export, skill sync):
+# 2. Run lifecycle hook & replay tests (126 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, temp allow, modes, read-only, escalation, diff preview, log rotation/export, skill sync):
 python tests/test_guardrail_hook.py
 
 # 3. Run MCP server protocol tests (21 tests):
 python tests/test_mcp_server.py
 
-# 4. Run all 289 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
+# 4. Run all 306 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
 python -m unittest discover -s tests -p "test_*.py"
 ```
 

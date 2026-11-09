@@ -47,6 +47,8 @@ MAX_ACTION_HISTORY = 20
 TEMP_ALLOW_DEFAULT_MINUTES = 60
 TEMP_ALLOW_MAX_MINUTES = 24 * 60
 TEMP_ALLOW_MAX = 10
+WRITTEN_TTL_SECS = 24 * 3600
+WRITTEN_MAX = 300
 _GENESIS_HASH = "0" * 64
 
 ICON = "\U0001F6E1\uFE0F"
@@ -191,6 +193,24 @@ class State:
             s["blocks"] = []
             return {"count": len(recent)}
         return None
+
+    # --- Files the agent wrote in this session: running them later gets their full content inspected ---
+
+    def record_written(self, sid: str, paths: list[str]) -> None:
+        if not paths:
+            return
+        now = time.time()
+        s = self.session(sid)
+        kept = [w for w in (s.get("written") or []) if isinstance(w, dict) and now - float(w.get("ts", 0)) < WRITTEN_TTL_SECS
+                and w.get("path") not in paths]
+        s["written"] = (kept + [{"path": p, "ts": now} for p in paths])[-WRITTEN_MAX:]
+        s["ts"] = now
+        self.dirty = True
+
+    def written_files(self, sid: str) -> set[str]:
+        now = time.time()
+        return {str(w["path"]) for w in (self.session(sid).get("written") or [])
+                if isinstance(w, dict) and w.get("path") and now - float(w.get("ts", 0)) < WRITTEN_TTL_SECS}
 
     # --- Prompt-injection alert: set by PostToolUse, makes the session strict for a while ---
 
@@ -1295,7 +1315,7 @@ def _patch_actions(patch: str) -> list[str]:
 
 # Names unique to the guardrail and the agents' hook settings: protected wherever they appear
 _GUARDRAIL_CONTROL_FILES = (
-    "check_action.py", "guardrail_hook.py", "daemon_manager.py", "claude_hook.py", "policy_init.py", "readonly_mode.py", "git_hooks.py", "policy_trust.py", "audit_export.py", "trusted_policies.json", ".git/hooks/", ".guardrail",
+    "check_action.py", "guardrail_hook.py", "daemon_manager.py", "claude_hook.py", "policy_init.py", "readonly_mode.py", "git_hooks.py", "policy_trust.py", "audit_export.py", "script_inspect.py", "trusted_policies.json", ".git/hooks/", ".guardrail",
     ".claude/settings.json", ".claude/settings.local.json",
     ".codex/hooks.json", ".agents/hooks.json", ".cursorrules", ".cursor/rules/guardrail.mdc",
 )
@@ -1351,6 +1371,53 @@ def action_fingerprint_source(event: dict) -> str:
     if name.lower() in SHELL_TOOLS:
         return _shell_command(inp)
     return json.dumps({k: v for k, v in inp.items() if k != "description"}, ensure_ascii=False, sort_keys=True)
+
+
+# What an agent may run through the Skill tool: reading and stricter settings. Anything that switches the
+# guardrail off, waives a confirmation, trusts a policy or restores files is the user's call.
+_AGENT_SAFE_COMMANDS = {"on", "start", "status", "reload", "check", "why", "doctor", "report", "test", "export", "init"}
+
+
+def agent_guardrail_command_refusal(event: dict) -> str:
+    """Refusal message when a tool call (the Skill tool) tries to run a user-only /guardrail command."""
+    name, inp = _tool_call(event)
+    if name.lower() != "skill":
+        return ""
+    skill = str(inp.get("skill") or inp.get("command") or inp.get("name") or "").strip().lstrip("/$").split(":")[-1].lower()
+    if skill.startswith(("agent-", "agent_")):
+        skill = skill[6:]
+    if skill != "guardrail":
+        return ""
+    words = str(inp.get("args") or inp.get("arguments") or "").split()
+    cmd = _ARG_MAP.get(words[0].lower() if words else "", "on")
+    rest = " ".join(words[1:]).lower()
+    safe = (
+        cmd in _AGENT_SAFE_COMMANDS
+        or (cmd in ("allow", "trust") and rest in ("", "list", "ls"))
+        or (cmd == "undo" and rest in ("list", "ls"))
+        or (cmd == "mode" and rest in ("", "status", "strict"))
+        or (cmd == "readonly" and rest in ("", "on", "status"))
+        or (cmd == "alert" and rest in ("", "status"))
+    )
+    if safe:
+        return ""
+    shown = " ".join(words) or cmd
+    return (f"{ICON} GUARDRAIL: `/guardrail {shown}` can only be typed by the user: it switches protection off, waives "
+            "confirmations, trusts a policy or restores files. Ask the user to run it if it is really needed.")
+
+
+def _written_paths(event: dict, paths: list[str], cwd: str) -> list[str]:
+    """Files a tool call writes: edit-tool targets and shell output redirections."""
+    import check_action as ca
+    import script_inspect
+    name, inp = _tool_call(event)
+    low = name.lower()
+    targets: list[str] = []
+    if low in EDIT_TOOLS or low == "apply_patch":
+        targets += [p for p in paths if p]
+    elif low in SHELL_TOOLS:
+        targets += [target for target, _ in ca.output_redirect_targets(_shell_command(inp))]
+    return [script_inspect.norm_path(p, cwd) for p in targets]
 
 
 def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
@@ -1410,15 +1477,25 @@ def describe_tool(event: dict) -> tuple[str | None, bool, list[str]]:
             for chunk in (inp.get(key) or []) if isinstance(chunk, dict)
             for k in ("new_string", "ReplacementContent")
         ]
-        secret_names = ca.find_secret_values("\n".join(written))
+        body = "\n".join(w for w in written if w.strip())
+        secret_names = ca.find_secret_values(body)
         if secret_names:
             if not ca.is_secret_path(path):
                 return f"write hardcoded secret ({', '.join(secret_names)}) into file {path}", False, [path]
             # .env & co. are where credentials belong: evaluate the write, without the value itself
-            content = ca.redact_secrets(content)
-        if content.strip():
-            content_snippet = content[:2000].replace("\r", "")
-            return f"{verb} {path}\n[content]:\n{content_snippet}", False, [path]
+            body = ca.redact_secrets(body)
+        if body.strip():
+            snippet = body[:2000].replace("\r", "")
+            further = ""
+            if len(body) > 2000:
+                import script_inspect
+                # Scripts are checked line by line past the first 2000 characters: a destructive command at
+                # line 300 of deploy.sh must not slip through. Prose (README, docs) keeps the short check.
+                if script_inspect.is_script_path(path, body):
+                    flagged = script_inspect.flag_block_lines(body[2000:])
+                    if flagged:
+                        further = "\n[further down]:\n" + "\n".join(flagged)
+            return f"{verb} {path}\n[content]:\n{snippet}{further}", False, [path]
         return f"{verb} {path}", False, [path]
 
     if low in NET_FETCH_TOOLS:
@@ -1823,6 +1900,12 @@ def on_pre_tool(event: dict, host: str, state: State):
     tool_ident = event.get("tool_name") or (event.get("toolCall", {}).get("name") if isinstance(event.get("toolCall"), dict) else "")
     forced = None  # decision fixed by tool semantics rather than by the rules engine
 
+    refusal = agent_guardrail_command_refusal(event)
+    if refusal:
+        log({"host": host, "event": "tool", "session": sid, "tool": tool_ident, "decision": "block",
+             "matched_rules": ["block:user-only guardrail command"], "text": json.dumps(_tool_call(event)[1])[:300]})
+        return pre_tool_output(host, "deny", refusal), 0
+
     if desc is not None and state.is_readonly(sid):
         violations = readonly_tool_violations(event)
         if violations:
@@ -1894,6 +1977,17 @@ def on_pre_tool(event: dict, host: str, state: State):
     rules = forced.rules if forced else ca.evaluate_rules(desc)
     cwd = _event_cwd(event)
     outside = [p for p in paths if _outside(p, cwd)]
+
+    if forced is None and str(tool_ident).lower() in SHELL_TOOLS and rules.decision != "block":
+        import script_inspect
+        verdict, why = script_inspect.inspect_execution(_shell_command(_tool_call(event)[1]), cwd, state.written_files(sid))
+        if verdict in ("block", "ask_user"):
+            forced = ca.Decision(
+                verdict, "rules", ca.RuleResult(verdict, [f"{verdict}:{w}" for w in why[:3]]),
+                capabilities=ca.classify_capabilities(desc), risk_score=0.95 if verdict == "block" else 0.6,
+                risk_factors=["context:script_content"],
+            )
+            rules = forced.rules
 
     ctx = ca.inspect_execution_context(
         cwd=cwd,
@@ -1977,6 +2071,9 @@ def on_pre_tool(event: dict, host: str, state: State):
         diff = edit_diff_preview(event, cwd)
         if diff:
             preview = f"{preview}\n{diff}" if preview else diff
+
+    if final != "block":
+        state.record_written(sid, _written_paths(event, paths, cwd))
 
     short = desc.splitlines()[0][:160]
     if final == "block":

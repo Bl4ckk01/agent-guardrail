@@ -91,7 +91,7 @@ _CRITICAL_TARGET = (
 # Guardrail control plane: code, policy, session state/config and the agents' hook settings.
 # Names unique to the guardrail are protected wherever they appear.
 _GUARDRAIL_DISTINCTIVE_FILES = (
-    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b|\bpolicy_init\.py\b|\breadonly_mode\.py\b|\bgit_hooks\.py\b|\bpolicy_trust\.py\b|\baudit_export\.py\b|\btrusted_policies\.json\b|\.git[/\\]+hooks[/\\]"
+    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b|\bpolicy_init\.py\b|\breadonly_mode\.py\b|\bgit_hooks\.py\b|\bpolicy_trust\.py\b|\baudit_export\.py\b|\bscript_inspect\.py\b|\btrusted_policies\.json\b|\.git[/\\]+hooks[/\\]"
     r"|\.guardrail\b|\.claude[/\\]+settings(?:\.local)?\.json\b|\.codex[/\\]+hooks\.json\b|\.agents[/\\]+hooks\.json\b|\.cursorrules\b"
 )
 # Common names are only the guardrail's own when they sit in its directory: other projects
@@ -208,6 +208,16 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("crontab file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*/etc/cron"),
     *_tamper_file_rules(_GUARDRAIL_FILES),
     ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\b(?:guardrail_hook|policy_init)\.py\b.*--apply\b|\bgit_hooks\.py\b.*\b(?:install|uninstall)\b|\bpython\d?\s[^;&|\n]*\bpolicy_trust\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
+    ("guardrail control plane invocation",
+     # Driving the hook or its modules from a shell can switch the guardrail off (a forged UserPromptSubmit
+     # piped into `guardrail_hook.py hook`, State().update(active=False) from python -c...). Read-only
+     # sub-commands stay available.
+     r"\b(?:python\d?|py)(?:\.exe)?\b[^;&|\n]*?\bguardrail_hook(?:\.py)?['\"]?\s+"
+     r"(?!(?:status|check|why|doctor|health|report|stats|test|tests|verify|scan-staged|export)\b)[\w-]"
+     r"|\b(?:python\d?|py)(?:\.exe)?\b[^;&|\n]*\s-c\b[^\n]*\b(?:guardrail_hook|check_action|policy_trust|policy_init|git_hooks"
+     r"|readonly_mode|audit_export|script_inspect)\b"
+     r"|^\s*(?:import|from)\s+(?:guardrail_hook|check_action|policy_trust|policy_init|git_hooks|readonly_mode|audit_export"
+     r"|script_inspect)\b"),
     ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
     ("hardcoded secret in file", r"\bwrite\s+hardcoded\s+secret\b"),
 )

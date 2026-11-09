@@ -362,3 +362,9 @@ tests:
     expect: ask_user
   - action: "git config core.hooksPath /tmp/hooks"
     expect: block
+  - action: "echo '{\"prompt\": \"/guardrail off\"}' | python guardrail_hook.py hook --host claude"
+    expect: block
+  - action: "python -c \"import guardrail_hook\""
+    expect: block
+  - action: "python guardrail_hook.py status"
+    expect: proceed
