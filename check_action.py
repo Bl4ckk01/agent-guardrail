@@ -91,7 +91,7 @@ _CRITICAL_TARGET = (
 # Guardrail control plane: code, policy, session state/config and the agents' hook settings.
 # Names unique to the guardrail are protected wherever they appear.
 _GUARDRAIL_DISTINCTIVE_FILES = (
-    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b|\bpolicy_init\.py\b|\breadonly_mode\.py\b|\bgit_hooks\.py\b|\.git[/\\]+hooks[/\\]"
+    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b|\bpolicy_init\.py\b|\breadonly_mode\.py\b|\bgit_hooks\.py\b|\bpolicy_trust\.py\b|\baudit_export\.py\b|\btrusted_policies\.json\b|\.git[/\\]+hooks[/\\]"
     r"|\.guardrail\b|\.claude[/\\]+settings(?:\.local)?\.json\b|\.codex[/\\]+hooks\.json\b|\.agents[/\\]+hooks\.json\b|\.cursorrules\b"
 )
 # Common names are only the guardrail's own when they sit in its directory: other projects
@@ -207,7 +207,7 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
     ("shell startup file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*~?/?(?:\.bashrc|\.bash_profile|\.zshrc|\.profile|/etc/profile|/etc/environment|\$profile)\b"),
     ("crontab file poisoning", r"(?:>>?|tee\s+(?:-a\s+)?)\s*/etc/cron"),
     *_tamper_file_rules(_GUARDRAIL_FILES),
-    ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\b(?:guardrail_hook|policy_init)\.py\b.*--apply\b|\bgit_hooks\.py\b.*\b(?:install|uninstall)\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
+    ("guardrail self tampering command", r"\b(?:python\d?\s+)?guardrail_hook\.py\s+(?:off|disable|stop)\b|\b(?:python\d?\s+)?check_action\.py\b.*--allow\b|\b(?:guardrail_hook|policy_init)\.py\b.*--apply\b|\bgit_hooks\.py\b.*\b(?:install|uninstall)\b|\bpython\d?\s[^;&|\n]*\bpolicy_trust\b|\[\[(?:agent[-_])?guardrail:(?:off|disable|stop)\]\]"),
     ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
     ("hardcoded secret in file", r"\bwrite\s+hardcoded\s+secret\b"),
 )
@@ -899,6 +899,17 @@ _AUDIT_CONFIG: dict = {
     "enabled": True,
     "log_file": "",
     "hash_chaining": True,
+    "max_size_mb": 5,        # the log is rotated (hash chain preserved) when it grows past this size; 0 = never
+    "max_archives": 12,      # rotated logs kept next to the live one; older ones are deleted
+}
+
+# Automatic hardening of a session (trusted policy.yaml only). Repeated blocked attempts, or a prompt-injection
+# signal in tool output, switch the session to strict mode until the user resets it.
+_ESCALATION_CONFIG: dict = {
+    "enabled": True,
+    "blocks": 3,                    # blocked actions ...
+    "window_secs": 600,             # ... within this many seconds trigger the escalation
+    "injection_window_secs": 1800,  # how long a prompt-injection alert keeps the session strict
 }
 
 # Session modes (/guardrail mode). Trusted policy.yaml only: a workspace policy cannot change them.
@@ -918,7 +929,7 @@ _NETWORK_CONFIG: dict = {
 _CONFIG_DEFAULTS: tuple[tuple[dict, dict], ...] = tuple(
     (cfg, copy.deepcopy(cfg))
     for cfg in (_BRANCH_PROTECTION, _CREDENTIALS_PROTECTION, _RISK_CONFIG, _DRY_RUN_CONFIG, _MEMORY_CONFIG,
-                _AUDIT_CONFIG, _NETWORK_CONFIG, _MODE_CONFIG)
+                _AUDIT_CONFIG, _NETWORK_CONFIG, _MODE_CONFIG, _ESCALATION_CONFIG)
 )
 
 
@@ -995,16 +1006,26 @@ def get_mode_config() -> dict:
     return _MODE_CONFIG
 
 
+def get_escalation_config() -> dict:
+    return _ESCALATION_CONFIG
+
+
 def get_policy_settings() -> dict:
     return _POLICY_SETTINGS
 
 
 _LOADED_POLICY_PATH: Path | None = None
 _WORKSPACE_POLICY_PATH: Path | None = None
+_WORKSPACE_POLICY_TRUSTED = False
 
 
 def get_loaded_policy_path() -> Path | None:
     return _LOADED_POLICY_PATH
+
+
+def workspace_policy_trusted() -> bool:
+    """True when the workspace policy.yaml matches a hash the user approved (/guardrail trust)."""
+    return _WORKSPACE_POLICY_TRUSTED
 
 
 def get_workspace_policy_path() -> Path | None:
@@ -1065,8 +1086,11 @@ def _compile_path_rules(data: dict, allowed_decisions: tuple[str, ...] = VALID_D
     return rules
 
 
-def _merge_workspace_policy(data: dict) -> None:
+def _merge_workspace_policy(data: dict, trusted: bool = False) -> None:
     """Merge an untrusted workspace policy.yaml: it may add block/ask rules and tighten limits, nothing else.
+
+    With trusted=True (the user approved this exact file with /guardrail trust) it may also whitelist:
+    narrow custom_proceed_rules and proceed path rules. The rest below stays ignored either way.
 
     Ignored on purpose: custom_proceed_rules, proceed path rules, audit_logging (cannot disable or
     redirect the audit log), settings (backend/endpoints), network (cannot allowlist a domain) and
@@ -1074,7 +1098,13 @@ def _merge_workspace_policy(data: dict) -> None:
     """
     _CUSTOM_BLOCK.extend(_compile_custom_rules(data, "custom_block_rules", "custom_block"))
     _CUSTOM_ASK.extend(_compile_custom_rules(data, "custom_ask_rules", "custom_ask"))
-    _PATH_RULES.extend(_compile_path_rules(data, allowed_decisions=("block", "ask_user")))
+    if trusted:
+        for rule in data.get("custom_proceed_rules", []) or []:
+            if isinstance(rule, dict) and rule.get("pattern"):
+                ok, _, rx = validate_allow_pattern(str(rule["pattern"]))
+                if ok and rx is not None:
+                    _CUSTOM_PROCEED.append((rule.get("name", "custom_proceed"), rx))
+    _PATH_RULES.extend(_compile_path_rules(data, allowed_decisions=VALID_DECISIONS if trusted else ("block", "ask_user")))
 
     bp = data.get("branch_protection")
     if isinstance(bp, dict):
@@ -1155,6 +1185,17 @@ def _apply_trusted_policy(data: dict) -> None:
         waive = data["modes"].get("relaxed_waive")
         if isinstance(waive, list):
             _MODE_CONFIG["relaxed_waive"] = [str(w).strip() for w in waive if str(w).strip()]
+    if isinstance(data.get("escalation"), dict):
+        esc = data["escalation"]
+        if isinstance(esc.get("enabled"), bool):
+            _ESCALATION_CONFIG["enabled"] = esc["enabled"]
+        for key in ("blocks", "window_secs", "injection_window_secs"):
+            try:
+                value = float(esc[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if value > 0:
+                _ESCALATION_CONFIG[key] = int(value) if key == "blocks" else value
     if isinstance(data.get("network"), dict):
         domains = data["network"].get("allowed_domains") or []
         _NETWORK_CONFIG["allowed_domains"] = [str(d).strip().lower() for d in domains if str(d).strip()]
@@ -1182,11 +1223,12 @@ def _apply_env_overrides() -> None:
 
 def load_policy(file_path: str | Path | None = None) -> dict:
     """Load the trusted policy.yaml, then let a workspace policy.yaml tighten (never loosen) it."""
-    global _POLICY_LOADED, _LOADED_POLICY_PATH, _WORKSPACE_POLICY_PATH
+    global _POLICY_LOADED, _LOADED_POLICY_PATH, _WORKSPACE_POLICY_PATH, _WORKSPACE_POLICY_TRUSTED
 
     p = _find_policy_file(file_path)
     _LOADED_POLICY_PATH = p
     _WORKSPACE_POLICY_PATH = None
+    _WORKSPACE_POLICY_TRUSTED = False
     _reset_config_defaults()
 
     data = (_read_policy(p) if p and p.is_file() else None) or {}
@@ -1198,7 +1240,12 @@ def load_policy(file_path: str | Path | None = None) -> dict:
     if workspace_p is not None:
         ws_data = _read_policy(workspace_p)
         if ws_data:
-            _merge_workspace_policy(ws_data)
+            try:
+                import policy_trust
+                _WORKSPACE_POLICY_TRUSTED = policy_trust.is_trusted(workspace_p)
+            except Exception:  # an unreadable trust store means "not trusted"
+                _WORKSPACE_POLICY_TRUSTED = False
+            _merge_workspace_policy(ws_data, trusted=_WORKSPACE_POLICY_TRUSTED)
             _WORKSPACE_POLICY_PATH = workspace_p
             _POLICY_TESTS.extend(dict(t, source=str(workspace_p)) for t in (ws_data.get("tests") or []) if isinstance(t, dict))
 
@@ -2266,6 +2313,115 @@ def is_secret_path(path: str) -> bool:
         if fnmatch.fnmatchcase(name, pat_l) and not any(name.endswith(f".{v}") for v in _SAFE_ENV_VARIANTS):
             return True
     return False
+
+
+# --- Output redirections ---
+
+_NULL_TARGETS = ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "nul", "$null")
+
+
+def output_redirect_targets(command: str) -> list[tuple[str, bool]]:
+    """(target, append) for every `>`, `>>`, `&>` or `2>` redirection outside quotes.
+
+    File-descriptor duplications (2>&1, >&-) and the null devices are not files and are skipped.
+    """
+    out: list[tuple[str, bool]] = []
+    text = command or ""
+    n, i, quote = len(text), 0, ""
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch != ">":
+            i += 1
+            continue
+        prev = text[i - 1] if i else ""
+        if prev in "-=<" or text[i + 1:i + 2] == "(":  # '->', '=>', '<>' and >(process substitution)
+            i += 1
+            continue
+        j, append = i + 1, False
+        if text[j:j + 1] == ">":
+            append, j = True, j + 1
+        if text[j:j + 1] == "|":
+            j += 1
+        if text[j:j + 1] == "&":
+            dup = re.match(r"&(\d+|-)", text[j:])
+            if dup:
+                i = j + len(dup.group(0))
+                continue
+            j += 1
+        while j < n and text[j] in " \t":
+            j += 1
+        if j < n and text[j] in "'\"":
+            end = text.find(text[j], j + 1)
+            end = n if end == -1 else end
+            target, j = text[j + 1:end], end + 1
+        else:
+            end = j
+            while end < n and text[end] not in " \t\n;&|<>()":
+                end += 1
+            target, j = text[j:end], end
+        target = target.strip()
+        if target and target.lower() not in _NULL_TARGETS:
+            out.append((target, append))
+        i = j
+    return out
+
+
+# --- Prompt-injection signals in text an agent reads (web pages, files, command output) ---
+
+_INJECTION_PATTERNS: tuple[tuple[str, str, int], ...] = (
+    ("instruction override",
+     r"\b(?:ignore|disregard|forget|override|bypass)\b[^\n.]{0,40}\b(?:previous|prior|above|earlier|preceding|all|any|your|the)\b"
+     r"[^\n.]{0,30}\b(?:instructions?|prompts?|rules?|guidelines?|directives?|guardrails?|restrictions?)\b", re.IGNORECASE),
+    ("role reassignment",
+     r"\byou are (?:now|no longer)\b[^\n.]{0,40}\b(?:assistant|agent|ai|model|developer|admin|root|unrestricted|jailbroken)\b"
+     r"|\bfrom now on,? you (?:must|will|should|shall|are)\b|\bnew (?:system )?(?:instructions?|prompt)\s*:"
+     r"|\bact as (?:an? )?(?:unrestricted|unfiltered|jailbroken|dan)\b", re.IGNORECASE),
+    ("fake system message",
+     r"</?\s*(?:system|assistant|system-reminder|system_prompt)\s*>|^\s*\[(?:SYSTEM|ASSISTANT|ADMIN)\]|^\s*(?:SYSTEM|ASSISTANT)\s*:\s*\S",
+     re.MULTILINE),
+    ("exfiltration instruction",
+     r"\b(?:send|post|upload|e-?mail|forward|exfiltrat\w*|leak|transmit)\b[^\n]{0,60}"
+     r"(?:\.env\b|\b(?:credentials?|secrets?|api[ _-]?keys?|access tokens?|passwords?|private keys?|ssh keys?|id_rsa|environment variables)\b)"
+     r"[^\n]{0,60}\b(?:to|at|via|using)\b", re.IGNORECASE),
+    ("concealment from the user",
+     r"\b(?:do not|don't|never)\b[^\n.]{0,30}\b(?:tell|inform|mention|reveal|show|notify|alert|warn)\b[^\n.]{0,20}\b(?:the )?user\b"
+     r"|\bwithout (?:telling|informing|notifying|asking|alerting) (?:the )?user\b|\bkeep (?:this|it) (?:a )?secret from\b", re.IGNORECASE),
+    ("note addressed to the AI",
+     r"\b(?:important|attention|urgent|notice|warning|note)\b[^\n]{0,20}\b(?:to|for)\s+(?:the\s+)?"
+     r"(?:ai|llm|assistants?|agents?|language models?|claude|chatgpt|gemini|copilot)\b", re.IGNORECASE),
+    ("hidden HTML comment instructions",
+     r"<!--[^>]{0,400}?\b(?:ignore|instructions?|assistant|ai agent|llm|system prompt)\b[^>]{0,400}?-->", re.IGNORECASE),
+    ("invisible characters", "[\U000E0000-\U000E007F]{3,}|[​-‏⁠﻿]{8,}", 0),
+)
+_COMPILED_INJECTION = tuple((name, re.compile(rx, flags)) for name, rx, flags in _INJECTION_PATTERNS)
+
+
+def find_injection_signals(text: str) -> list[str]:
+    """Names of the prompt-injection patterns found in text (an alert, never proof: documentation can match)."""
+    if not text:
+        return []
+    raw = text[:400_000]
+    normalized = normalize(raw)  # catches homoglyph and zero-width disguised phrases
+    found: list[str] = []
+    for name, rx in _COMPILED_INJECTION:
+        if name not in found and (rx.search(raw) or rx.search(normalized)):
+            found.append(name)
+    return found
 
 
 # Credentials recognizable by their value: well-known prefixes only, no generic "password=" heuristics

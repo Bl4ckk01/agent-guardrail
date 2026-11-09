@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="tests/"><img src="https://img.shields.io/badge/tests-252%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/tests-289%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-~37.4ms%20(neural)-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
@@ -334,6 +334,25 @@ Evaluating a command string in isolation is insufficient because real-world inte
 14. **Git Pre-Commit Credential Scan (`install.py --git-hook`)**:
    - `python install.py --git-hook [repo]` adds a `pre-commit` hook (existing hook content is kept; `--remove-git-hook` undoes it) that blocks commits adding credentials or secret files (`.env`, `*.pem`, `id_rsa`...). It covers commits made by hand or by any tool, not only by the agent. Findings show `file:line` and the kind, never the value.
    - A line that is not a real credential can carry `guardrail:ignore`; `git commit --no-verify` skips the hook, so an agent doing it (or editing `.git/hooks/`, or setting `core.hooksPath`) is asked or blocked.
+
+15. **Redirections Onto Existing Files**:
+   - A shell command whose output redirection (`>`) would overwrite a non-empty file, or write outside the project, asks for confirmation even when the command itself is whitelisted (`cat a > b`). Appends (`>>`) inside the project, new files, `/dev/null`, `2>&1` and the system temp directory pass. The file is backed up first, so `/guardrail undo` can restore it.
+
+16. **Prompt-Injection Alerts**:
+   - The `PostToolUse` hook also looks for text aimed at an AI agent in what tools return (web pages, files, command output): "ignore previous instructions", fake `<system>` messages, requests to send `.env` or secrets somewhere, "do not tell the user", hidden HTML comments, invisible characters. It tells the agent that the text is data, and for 30 minutes the session behaves as in strict mode: anything that changes state or leaves the machine asks first. `/guardrail alert` shows it, `/guardrail alert clear` dismisses it. Reads of the guardrail's own files, which quote these phrases, are skipped.
+
+17. **Automatic Escalation**:
+   - Three blocked actions within ten minutes switch the session to strict mode and show you a notice (`escalation:` in `policy.yaml`; `/guardrail mode normal` goes back). Repeated attempts at variations of the same blocked command are a signal worth acting on.
+
+18. **Hash-Pinned Project Policy (`/guardrail trust`)**:
+   - A `policy.yaml` in the project folder can only tighten the guardrail, because an agent could have written it. `/guardrail trust` shows what the file would be allowed to whitelist and its short hash; `/guardrail trust <hash>` approves that exact version. Trusted, it may add narrow `custom_proceed_rules` and `proceed` path rules for the project (patterns go through the same breadth checks as `--allow`); audit logging, backend settings, network allowlist, modes, thresholds and escalation stay off limits. Any edit of the file removes the approval until you approve it again.
+
+19. **Diff Preview in Confirmations**:
+   - When Write, Edit, MultiEdit or `apply_patch` asks for confirmation, the dialog shows the lines removed and added (or `new file, N lines`), capped at 24 lines, with credentials redacted and the content of secret files hidden.
+
+20. **Log Rotation, Verification and Export**:
+   - The audit log rotates when it passes `audit_logging.max_size_mb` (default 5), keeping `max_archives` copies (default 12). The new file starts with a `log_rotated` record carrying the previous hash, so the SHA-256 chain continues across files; `/guardrail doctor` and `python guardrail_hook.py verify` verify all of it and detect a modified or missing archive. `/guardrail report` reads the archives too.
+   - `/guardrail export json|html|csv [days]` writes a self-contained report (summary, integrity status, one row per action that asked, was blocked, or matters). HTML escapes everything and CSV neutralizes spreadsheet formulas.
 ---
 
 ### Supported Backend Engines
@@ -485,6 +504,9 @@ From that point forward:
 | `/guardrail init` | Detects the project stack (package.json, pyproject.toml, Cargo.toml, go.mod, Makefile, compose) and proposes narrow safe rules + policy tests; adopt them with `python guardrail_hook.py init --apply` in your own terminal |
 | `/guardrail mode [strict\|normal\|relaxed]` | Session mode. `strict`: anything that can change state asks, even whitelisted commands, and `/guardrail allow` is ignored. `relaxed`: waives the confirmations listed in `modes.relaxed_waive` (default: dependency installs) |
 | `/guardrail readonly [on\|off\|status]` | Refuses every action that changes something (file edits, deletions, output redirections, git/package/container changes) for this session |
+| `/guardrail alert [clear]` | Shows or clears the prompt-injection alert (see below). A session is also raised to strict automatically after repeated blocked actions; `/guardrail mode normal` resets it |
+| `/guardrail trust [<hash>\|list\|revoke]` | Lets this project's `policy.yaml` whitelist commands, pinned to the exact file you reviewed (see below) |
+| `/guardrail export [json\|html\|csv] [days]` | Writes an audit report to `~/.guardrail/reports/` for a review; `python guardrail_hook.py verify` checks the hash chain across rotated logs |
 
 ---
 
@@ -826,7 +848,7 @@ When evaluating actions or starting hooks, the policy engine loads the **trusted
 3. **Script Directory**: `policy.yaml` located alongside `check_action.py`.
 4. **Global User Home**: `~/.guardrail/policy.yaml` for system-wide defaults.
 
-A `./policy.yaml` in the current working directory is workspace content the agent could control, so it is merged on top of the trusted policy in **tighten-only** mode: it may add `custom_block_rules`, `custom_ask_rules`, block/ask `path_rules`, protected branches, sensitive keys/files, higher risk weights and lower thresholds. Its `custom_proceed_rules`, proceed path rules, `audit_logging` and `settings` sections are ignored, and it cannot loosen any threshold or switch off chained-exfiltration detection.
+A `./policy.yaml` in the current working directory is workspace content the agent could control, so it is merged on top of the trusted policy in **tighten-only** mode (unless you approve that exact file with `/guardrail trust`, see below): it may add `custom_block_rules`, `custom_ask_rules`, block/ask `path_rules`, protected branches, sensitive keys/files, higher risk weights and lower thresholds. Its `custom_proceed_rules`, proceed path rules, `audit_logging` and `settings` sections are ignored, and it cannot loosen any threshold or switch off chained-exfiltration detection.
 
 ---
 
@@ -1240,16 +1262,16 @@ We believe in complete transparency regarding security boundaries:
 Contributions are warmly welcome! The codebase includes **141 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, skill synchronization, and protocol handlers:
 
 ```bash
-# 1. Run engine & risk-scoring tests (137 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests, modes, read-only detection, git pre-commit scan):
+# 1. Run engine & risk-scoring tests (151 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests, modes, read-only detection, git pre-commit scan, redirects, injection signals, trusted policy):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook & replay tests (94 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, temp allow, modes, read-only, skill sync):
+# 2. Run lifecycle hook & replay tests (117 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, temp allow, modes, read-only, escalation, diff preview, log rotation/export, skill sync):
 python tests/test_guardrail_hook.py
 
 # 3. Run MCP server protocol tests (21 tests):
 python tests/test_mcp_server.py
 
-# 4. Run all 252 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
+# 4. Run all 289 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
 python -m unittest discover -s tests -p "test_*.py"
 ```
 

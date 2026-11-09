@@ -63,13 +63,16 @@ Once activated:
 - `/guardrail init`: Propose narrow safe rules + policy tests for the detected project stack (`python guardrail_hook.py init --apply` in a terminal adopts them).
 - `/guardrail mode strict|normal|relaxed`: Session mode (`strict` asks before anything that changes state, `relaxed` waives the `modes.relaxed_waive` confirmations).
 - `/guardrail readonly [on|off|status]`: Refuse every action that changes something for this session.
+- `/guardrail alert [clear]`: Show or clear the prompt-injection alert (a session also turns strict after repeated blocked actions).
+- `/guardrail trust [<hash>|list|revoke]`: Let this project's `policy.yaml` whitelist commands, pinned to the exact file you approved.
+- `/guardrail export [json|html|csv] [days]`: Write an audit report to `~/.guardrail/reports/` (`python guardrail_hook.py verify` checks the log chain).
 - `python install.py --git-hook [repo]`: Install the pre-commit credential scan (`--remove-git-hook` removes it).
 
 ---
 
 ## 4. Unit Tests
 
-Run the test suites (252 tests total):
+Run the test suites (289 tests total):
 ```bash
 python -B tests/test_check_action.py
 python -B tests/test_guardrail_hook.py

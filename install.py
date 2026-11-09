@@ -154,7 +154,7 @@ def install_claude(workspace: bool, is_global: bool) -> None:
                 # Scans the output of tools that can surface file or remote content for credential values
                 "PostToolUse": [
                     {
-                        "matcher": "Read|Bash|PowerShell|Grep|NotebookRead|WebFetch|mcp__.*",
+                        "matcher": "Read|Bash|PowerShell|Grep|NotebookRead|WebFetch|WebSearch|mcp__.*",
                         "hooks": [
                             {
                                 "type": "command",

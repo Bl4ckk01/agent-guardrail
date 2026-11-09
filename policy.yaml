@@ -204,6 +204,8 @@ audit_logging:
   enabled: true                 # Enable append-only audit logging
   log_file: ""                  # Custom log path (empty = ~/.guardrail/guardrail.log)
   hash_chaining: true           # Enable cryptographic SHA-256 hash chaining
+  max_size_mb: 5                # Rotate the log past this size (0 = never); the hash chain continues in the new file
+  max_archives: 12              # Rotated logs kept next to the live one (older ones are deleted)
 
 
 # ==============================================================================
@@ -236,6 +238,23 @@ network:
 modes:
   relaxed_waive:
     - "dependency install"
+
+
+# ==============================================================================
+# 10d. AUTOMATIC SESSION HARDENING
+# ==============================================================================
+# - Repeated blocked actions in one session switch it to strict mode (the user resets it with
+#   `/guardrail mode normal`); a prompt-injection signal in tool output keeps it strict for a while
+#   (`/guardrail alert` shows it, `/guardrail alert clear` dismisses it).
+# - blocks / window_secs: this many blocked actions within this many seconds trigger the escalation.
+# - injection_window_secs: how long a prompt-injection alert keeps the session strict.
+# A workspace policy.yaml cannot change this section.
+# ==============================================================================
+escalation:
+  enabled: true
+  blocks: 3
+  window_secs: 600
+  injection_window_secs: 1800
 
 
 # ==============================================================================

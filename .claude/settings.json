@@ -23,7 +23,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Read|Bash|PowerShell|Grep|NotebookRead|WebFetch|mcp__.*",
+        "matcher": "Read|Bash|PowerShell|Grep|NotebookRead|WebFetch|WebSearch|mcp__.*",
         "hooks": [
           {
             "type": "command",
