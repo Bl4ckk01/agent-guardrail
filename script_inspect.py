@@ -42,7 +42,7 @@ _SCRIPT_DANGER: tuple[tuple[str, re.Pattern], ...] = tuple((name, re.compile(rx)
 ))
 # Code that imports the guardrail itself can switch it off: never allowed from an agent-run script
 GUARDRAIL_IMPORT_RE = re.compile(
-    r"^\s*(?:import|from)\s+(?:guardrail_hook|check_action|policy_trust|policy_init|git_hooks|readonly_mode|audit_export"
+    r"^\s*(?:import|from)\s+(?:guardrail_hook|hook_launcher|claude_hook|check_action|policy_trust|policy_init|git_hooks|readonly_mode|audit_export"
     r"|script_inspect)\b|\b(?:__import__|import_module)\s*\(\s*['\"](?:guardrail_hook|check_action|policy_trust)\b",
     re.MULTILINE,
 )

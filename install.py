@@ -57,6 +57,11 @@ def check_d1(url: str = "http://localhost:8800") -> bool:
         return False
 
 
+def _is_guardrail_hook_entry(item) -> bool:
+    text = json.dumps(item)
+    return "guardrail_hook.py" in text or "hook_launcher.py" in text
+
+
 def merge_json_hooks(target_path: Path, new_hooks_cfg: dict) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     existing = {}
@@ -68,14 +73,11 @@ def merge_json_hooks(target_path: Path, new_hooks_cfg: dict) -> None:
 
     hooks = existing.setdefault("hooks", {})
     for event_name, event_list in new_hooks_cfg.get("hooks", {}).items():
-        curr_list = hooks.setdefault(event_name, [])
-        already_present = any(
-            json.dumps(item, sort_keys=True) == json.dumps(new_item, sort_keys=True)
-            for item in curr_list
-            for new_item in event_list
-        )
-        if not already_present:
-            curr_list.extend(event_list)
+        # Replace earlier guardrail entries (old command or matcher) instead of running the hook twice;
+        # hooks from other tools are kept as they are
+        curr_list = [item for item in hooks.get(event_name, []) if not _is_guardrail_hook_entry(item)]
+        curr_list.extend(event_list)
+        hooks[event_name] = curr_list
 
     target_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -135,7 +137,7 @@ def install_claude(workspace: bool, is_global: bool) -> None:
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": 'python "${CLAUDE_PROJECT_DIR}/guardrail_hook.py" hook --host claude',
+                                "command": 'python "${CLAUDE_PROJECT_DIR}/hook_launcher.py" --host claude',
                             }
                         ]
                     }
@@ -146,7 +148,7 @@ def install_claude(workspace: bool, is_global: bool) -> None:
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": 'python "${CLAUDE_PROJECT_DIR}/guardrail_hook.py" hook --host claude',
+                                "command": 'python "${CLAUDE_PROJECT_DIR}/hook_launcher.py" --host claude',
                             }
                         ]
                     }
@@ -158,7 +160,7 @@ def install_claude(workspace: bool, is_global: bool) -> None:
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": 'python "${CLAUDE_PROJECT_DIR}/guardrail_hook.py" hook --host claude',
+                                "command": 'python "${CLAUDE_PROJECT_DIR}/hook_launcher.py" --host claude',
                             }
                         ]
                     }
@@ -189,7 +191,7 @@ def install_codex(workspace: bool, is_global: bool) -> None:
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": 'python "${CODEX_PROJECT_DIR}/guardrail_hook.py" hook --host codex',
+                                "command": 'python "${CODEX_PROJECT_DIR}/hook_launcher.py" --host codex',
                             }
                         ]
                     }
@@ -200,7 +202,7 @@ def install_codex(workspace: bool, is_global: bool) -> None:
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": 'python "${CODEX_PROJECT_DIR}/guardrail_hook.py" hook --host codex',
+                                "command": 'python "${CODEX_PROJECT_DIR}/hook_launcher.py" --host codex',
                             }
                         ]
                     }
@@ -230,14 +232,14 @@ def install_codex(workspace: bool, is_global: bool) -> None:
                 "UserPromptSubmit": [{
                     "hooks": [{
                         "type": "command",
-                        "command": f'python "{HERE}/guardrail_hook.py" hook --host codex',
+                        "command": f'python "{HERE}/hook_launcher.py" --host codex',
                     }]
                 }],
                 "PreToolUse": [{
                     "matcher": ".*",
                     "hooks": [{
                         "type": "command",
-                        "command": f'python "{HERE}/guardrail_hook.py" hook --host codex',
+                        "command": f'python "{HERE}/hook_launcher.py" --host codex',
                     }]
                 }],
             }
@@ -271,7 +273,7 @@ def install_antigravity(workspace: bool, is_global: bool) -> None:
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": f'python "{HERE}/guardrail_hook.py" hook --host antigravity',
+                                "command": f'python "{HERE}/hook_launcher.py" --host antigravity',
                                 "timeout": 15,
                             }
                         ],

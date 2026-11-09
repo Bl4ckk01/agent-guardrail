@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/guardrail_hook.py\" hook --host claude"
+            "command": "python \"${CLAUDE_PROJECT_DIR}/hook_launcher.py\" --host claude"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/guardrail_hook.py\" hook --host claude"
+            "command": "python \"${CLAUDE_PROJECT_DIR}/hook_launcher.py\" --host claude"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/guardrail_hook.py\" hook --host claude"
+            "command": "python \"${CLAUDE_PROJECT_DIR}/hook_launcher.py\" --host claude"
           }
         ]
       }

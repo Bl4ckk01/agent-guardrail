@@ -91,7 +91,7 @@ _CRITICAL_TARGET = (
 # Guardrail control plane: code, policy, session state/config and the agents' hook settings.
 # Names unique to the guardrail are protected wherever they appear.
 _GUARDRAIL_DISTINCTIVE_FILES = (
-    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b|\bpolicy_init\.py\b|\breadonly_mode\.py\b|\bgit_hooks\.py\b|\bpolicy_trust\.py\b|\baudit_export\.py\b|\bscript_inspect\.py\b|\btrusted_policies\.json\b|\.git[/\\]+hooks[/\\]"
+    r"\bcheck_action\.py\b|\bguardrail_hook\.py\b|\bdaemon_manager\.py\b|\bclaude_hook\.py\b|\bpolicy_init\.py\b|\breadonly_mode\.py\b|\bgit_hooks\.py\b|\bpolicy_trust\.py\b|\baudit_export\.py\b|\bscript_inspect\.py\b|\bhook_launcher\.py\b|\btrusted_policies\.json\b|\.git[/\\]+hooks[/\\]"
     r"|\.guardrail\b|\.claude[/\\]+settings(?:\.local)?\.json\b|\.codex[/\\]+hooks\.json\b|\.agents[/\\]+hooks\.json\b|\.cursorrules\b"
 )
 # Common names are only the guardrail's own when they sit in its directory: other projects
@@ -214,9 +214,11 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
      # sub-commands stay available.
      r"\b(?:python\d?|py)(?:\.exe)?\b[^;&|\n]*?\bguardrail_hook(?:\.py)?['\"]?\s+"
      r"(?!(?:status|check|why|doctor|health|report|stats|test|tests|verify|scan-staged|export)\b)[\w-]"
-     r"|\b(?:python\d?|py)(?:\.exe)?\b[^;&|\n]*\s-c\b[^\n]*\b(?:guardrail_hook|check_action|policy_trust|policy_init|git_hooks"
+     # The hook entry points read a hook event from stdin: there is no read-only use for an agent
+     r"|\b(?:python\d?|py)(?:\.exe)?\b[^;&|\n]*?\b(?:hook_launcher|claude_hook)(?:\.py)?\b"
+     r"|\b(?:python\d?|py)(?:\.exe)?\b[^;&|\n]*\s-c\b[^\n]*\b(?:guardrail_hook|hook_launcher|claude_hook|check_action|policy_trust|policy_init|git_hooks"
      r"|readonly_mode|audit_export|script_inspect)\b"
-     r"|^\s*(?:import|from)\s+(?:guardrail_hook|check_action|policy_trust|policy_init|git_hooks|readonly_mode|audit_export"
+     r"|^\s*(?:import|from)\s+(?:guardrail_hook|hook_launcher|claude_hook|check_action|policy_trust|policy_init|git_hooks|readonly_mode|audit_export"
      r"|script_inspect)\b"),
     ("guardrail control plane tamper tool", r"\btamper\s+guardrail\s+control\s+plane\b"),
     ("hardcoded secret in file", r"\bwrite\s+hardcoded\s+secret\b"),
@@ -327,12 +329,47 @@ _COMPILED_PROCEED = tuple((name, re.compile(rx, re.IGNORECASE)) for name, rx in 
 _COMPILED_TAMPER_HERE = tuple((name, re.compile(rx, re.IGNORECASE)) for name, rx in _tamper_file_rules(_GUARDRAIL_FILES_HERE))
 
 
-def _cwd_is_guardrail_dir() -> bool:
+_EVAL_CWD = ""  # working directory of the action being judged (the hook sets it from the event)
+
+
+def set_evaluation_cwd(cwd: str) -> None:
+    """Judge path-dependent rules against the action's directory instead of this process's."""
+    global _EVAL_CWD
+    _EVAL_CWD = cwd or ""
+
+
+def _in_guardrail_dir(path: Path) -> bool:
     try:
-        cwd = Path.cwd().resolve()
+        resolved = path.resolve()
     except OSError:
         return False
-    return cwd == _GUARDRAIL_DIR or _GUARDRAIL_DIR in cwd.parents
+    return resolved == _GUARDRAIL_DIR or _GUARDRAIL_DIR in resolved.parents
+
+
+def _cwd_is_guardrail_dir() -> bool:
+    try:
+        return _in_guardrail_dir(Path(_EVAL_CWD) if _EVAL_CWD else Path.cwd())
+    except OSError:
+        return False
+
+
+_CD_RE = re.compile(
+    r"(?:^|[;&|(]|\s)(?:cd|pushd|chdir|set-location|sl)\s+(?:-\w+\s+)*(?:'([^']+)'|\"([^\"]+)\"|([^\s;&|)]+))",
+    re.IGNORECASE,
+)
+
+
+def _enters_guardrail_dir(text: str) -> bool:
+    """True when a command changes directory into the guardrail's own folder (cd .../agent-guardrail && rm policy.yaml)."""
+    base = Path(_EVAL_CWD) if _EVAL_CWD else Path.cwd()
+    for m in _CD_RE.finditer(text or ""):
+        target = next((g for g in m.groups() if g), "")
+        if not target or target.startswith("$"):
+            continue
+        path = Path(os.path.expanduser(target))
+        if _in_guardrail_dir(path if path.is_absolute() else base / path):
+            return True
+    return False
 
 
 # Zero-width & invisible characters to strip unconditionally
@@ -1050,9 +1087,19 @@ def _read_policy(p: Path) -> dict | None:
             data = yaml.safe_load(f) or {}
         return data if isinstance(data, dict) else {}
     except Exception as exc:
+        # The guardrail keeps running on its built-in rules; doctor and status report the problem
+        _POLICY_ERRORS.append(f"{p}: {type(exc).__name__}: {str(exc).splitlines()[0] if str(exc) else ''}")
         if _debug_enabled():
             _log(f"[guardrail:policy] Error reading {p}: {exc}")
         return None
+
+
+_POLICY_ERRORS: list[str] = []
+
+
+def get_policy_errors() -> list[str]:
+    """Policy files that could not be read at the last load (invalid YAML, PyYAML missing...)."""
+    return list(_POLICY_ERRORS)
 
 
 def _compile_custom_rules(data: dict, key: str, default_name: str) -> list[tuple[str, re.Pattern]]:
@@ -1239,6 +1286,7 @@ def load_policy(file_path: str | Path | None = None) -> dict:
     _LOADED_POLICY_PATH = p
     _WORKSPACE_POLICY_PATH = None
     _WORKSPACE_POLICY_TRUSTED = False
+    _POLICY_ERRORS.clear()
     _reset_config_defaults()
 
     data = (_read_policy(p) if p and p.is_file() else None) or {}
@@ -1526,7 +1574,7 @@ def _evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     # 5. Evaluate all layers: most severe takes absolute priority
     # Check block rules first across ALL layers
     all_blocks = list(_COMPILED_BLOCK) + _CUSTOM_BLOCK
-    if _cwd_is_guardrail_dir():
+    if _cwd_is_guardrail_dir() or _enters_guardrail_dir(description):
         all_blocks += list(_COMPILED_TAMPER_HERE)
     # A live credential spelled out in a command, file content or message leaks it (logs, history, commits)
     blocked_matches: list[str] = [
@@ -2391,6 +2439,63 @@ def output_redirect_targets(command: str) -> list[tuple[str, bool]]:
     return out
 
 
+_WRITE_WRAPPERS = {"sudo", "doas", "env", "nohup", "time", "command", "nice", "stdbuf"}
+
+
+def write_targets(command: str) -> list[tuple[str, bool]]:
+    """(target, append) for every file a command line writes: redirections, tee, cp / Copy-Item destinations,
+    Set-Content / Add-Content / Out-File, dd of=."""
+    out = list(output_redirect_targets(command))
+    links = split_command_chain(command or "")
+    for link in list(links):
+        links += [e for e in embedded_commands(link) if e not in links]
+    for link in links:
+        toks = [t.strip("'\"") for t in _split_tokens(link)]
+        while toks and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]) or os.path.basename(toks[0]).lower() in _WRITE_WRAPPERS):
+            toks = toks[1:]
+            while toks and toks[0].startswith("-"):
+                toks = toks[1:]
+        if not toks:
+            continue
+        name = os.path.basename(toks[0].replace("\\", "/")).lower()
+        name = name[:-4] if name.endswith(".exe") else name
+        args = toks[1:]
+        low = [a.lower() for a in args]
+        plain = [a for a in args if not a.startswith("-")]
+
+        def flag_value(*flags: str) -> str | None:
+            for i, a in enumerate(low):
+                if a in flags and i + 1 < len(args):
+                    return args[i + 1]
+            return None
+
+        if name == "tee":
+            append = "-a" in low or "--append" in low
+            out += [(a, append) for a in plain]
+        elif name in ("cp", "copy", "install", "copy-item", "cpi"):
+            dest = flag_value("-destination", "-dest")
+            if dest is None and not ({"-t", "--target-directory"} & set(low)):
+                positional = [a for i, a in enumerate(args)
+                              if not a.startswith("-") and not (i and low[i - 1] in ("-path", "-literalpath", "-filter"))]
+                dest = positional[-1] if len(positional) >= 2 else None
+            if dest:
+                out.append((dest, False))
+        elif name in ("set-content", "sc", "add-content", "ac", "out-file"):
+            target = flag_value("-path", "-literalpath", "-filepath")
+            if target is None:
+                positional = [a for i, a in enumerate(args) if not a.startswith("-") and not (i and low[i - 1].startswith("-"))]
+                target = positional[0] if positional else None
+            if target:
+                out.append((target, name in ("add-content", "ac") or "-append" in low))
+        elif name == "dd":
+            out += [(a[3:], False) for a in args if a.startswith("of=") and a[3:]]
+    seen: list[tuple[str, bool]] = []
+    for item in out:
+        if item not in seen and item[0].lower() not in _NULL_TARGETS:
+            seen.append(item)
+    return seen
+
+
 # --- Prompt-injection signals in text an agent reads (web pages, files, command output) ---
 
 _INJECTION_PATTERNS: tuple[tuple[str, str, int], ...] = (
@@ -2445,16 +2550,39 @@ SECRET_VALUE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("google api key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
     ("npm token", r"\bnpm_[A-Za-z0-9]{36}\b"),
     ("private key block", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----"),
+    ("jwt", r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    # Patterns with a (?P<v>...) group: only that value is checked against placeholders and complexity
+    ("credentials in URL", r"\b[a-z][a-z0-9+.-]{1,15}://[^\s:/@'\"]{1,64}:(?P<v>[^\s:/@'\"]{6,128})@[\w.-]+"),
+    ("password assignment",
+     r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9_]*?(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token|"
+     r"client[_-]?secret|token)['\"]?\s*[:=]\s*['\"](?P<v>[^'\"\s]{8,128})['\"]"),
 )
 _COMPILED_SECRET_VALUES = tuple((name, re.compile(rx)) for name, rx in SECRET_VALUE_PATTERNS)
 # Documentation keys and fixtures (AKIAIOSFODNN7EXAMPLE, sk-xxxx...) are not credentials
 _PLACEHOLDER_SECRET_RE = re.compile(r"example|dummy|fake|sample|placeholder|xxxx|your[_-]|test", re.IGNORECASE)
 
 
+# Values that are references, templates or documentation rather than a credential
+_PLACEHOLDER_VALUE_RE = re.compile(
+    r"example|dummy|fake|sample|placeholder|xxx|your[_-]|test|changeme|change[_-]me|redacted|password|secret|"
+    r"\*{3,}|\.\.\.|[<>${}%]|^(?:null|none|undefined|true|false)$", re.IGNORECASE)
+
+
+def _looks_like_credential(value: str) -> bool:
+    """A generic value counts only if it is not a placeholder and mixes at least two character classes."""
+    if _PLACEHOLDER_VALUE_RE.search(value):
+        return False
+    classes = sum(bool(re.search(rx, value)) for rx in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
+    return classes >= 2
+
+
 def _secret_value_matches(text: str):
     for name, rx in _COMPILED_SECRET_VALUES:
         for m in rx.finditer(text or ""):
-            if name == "private key block" or not _PLACEHOLDER_SECRET_RE.search(m.group(0)):
+            if "v" in rx.groupindex:
+                if _looks_like_credential(m.group("v")):
+                    yield name, m
+            elif name == "private key block" or not _PLACEHOLDER_SECRET_RE.search(m.group(0)):
                 yield name, m
 
 

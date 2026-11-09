@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="tests/"><img src="https://img.shields.io/badge/tests-306%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/tests-323%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-~37.4ms%20(neural)-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
@@ -364,6 +364,21 @@ Evaluating a command string in isolation is insufficient because real-world inte
 23. **What a Command Really Runs**:
    - The guardrail remembers the files the agent wrote in the session (edit tools and `>` redirections). Running one of them (`bash x.sh`, `python x.py`, `./x.sh`, `source x`, `pwsh -File x.ps1`) scans it in full: a blocked command inside blocks the run, file-deletion or upload APIs ask first. Scripts that were already in the project ask (instead of passing) when they contain a blocked command.
    - `make [target]` (with its prerequisites) and `npm|pnpm|yarn|bun run <script>` (with `pre`/`post` hooks) are evaluated like the commands they run, even on the fast path for read-only commands: `npm run clean` with `rm -rf dist` asks, or is blocked when the agent wrote that `package.json` itself. Noisy words such as `config` or `production` in a recipe do not trigger anything.
+
+24. **Fail-Closed Hooks**:
+   - Agents treat a crashing hook as a non-blocking error and run the tool call anyway. The hooks therefore go through `hook_launcher.py`, which uses only the standard library: if `guardrail_hook.py` cannot be loaded or fails, a tool call asks for confirmation (Claude Code, Antigravity) or is denied (Codex) with the reason, and unreadable input stops the agent. `python install.py` points existing installations at the launcher and replaces the old hook entries instead of adding duplicates; `/guardrail doctor` warns about any configuration that still calls `guardrail_hook.py` directly, and about a `policy.yaml` that could not be read (the guardrail then runs on its built-in rules).
+
+25. **Every File Write Counts**:
+   - The overwrite confirmation covers `cp`/`Copy-Item` destinations, `tee`, `Set-Content`, `Add-Content`, `Out-File` and `dd of=` as well as `>`; appends (`tee -a`, `Add-Content`, `-Append`) inside the project pass. The same targets count as files written in the session.
+
+26. **Rules Follow the Agent's Directory**:
+   - Rules about the guardrail's own `policy.yaml` / `install.py` use the directory of the action (the agent's current directory), and a command that `cd`s into the guardrail folder (`cd agent-guardrail && rm policy.yaml`) is treated as running there.
+
+27. **Generic Credentials**:
+   - Besides well-known key formats, the guardrail recognizes JWTs, credentials inside URLs (`postgres://user:pass@host`) and quoted assignments to `password`, `secret`, `api_key`, `token`... (`DB_PASSWORD="..."`). Placeholders and references (`changeme`, `${VAR}`, `<your token>`, `********`, single-class values such as `postgres`) are ignored.
+
+28. **Continuous Integration**:
+   - `.github/workflows/tests.yml` runs the three suites and `check_action.py --test-policy` on Ubuntu and Windows with Python 3.10 and 3.12, on every push and pull request.
 ---
 
 ### Supported Backend Engines
@@ -619,7 +634,7 @@ Claude Code integrates seamlessly via native lifecycle hooks configured in [`.cl
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/guardrail_hook.py\" hook --host claude"
+            "command": "python \"${CLAUDE_PROJECT_DIR}/hook_launcher.py\" --host claude"
           }
         ]
       }
@@ -630,7 +645,7 @@ Claude Code integrates seamlessly via native lifecycle hooks configured in [`.cl
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/guardrail_hook.py\" hook --host claude"
+            "command": "python \"${CLAUDE_PROJECT_DIR}/hook_launcher.py\" --host claude"
           }
         ]
       }
@@ -658,7 +673,7 @@ Codex CLI and ChatGPT Agents integrate via lifecycle hooks in [`.codex/hooks.jso
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CODEX_PROJECT_DIR}/guardrail_hook.py\" hook --host codex"
+            "command": "python \"${CODEX_PROJECT_DIR}/hook_launcher.py\" --host codex"
           }
         ]
       }
@@ -669,7 +684,7 @@ Codex CLI and ChatGPT Agents integrate via lifecycle hooks in [`.codex/hooks.jso
         "hooks": [
           {
             "type": "command",
-            "command": "python \"${CODEX_PROJECT_DIR}/guardrail_hook.py\" hook --host codex"
+            "command": "python \"${CODEX_PROJECT_DIR}/hook_launcher.py\" --host codex"
           }
         ]
       }
@@ -714,7 +729,7 @@ Google Antigravity integrates directly through its **native lifecycle hook syste
         "hooks": [
           {
             "type": "command",
-            "command": "python guardrail_hook.py hook --host antigravity",
+            "command": "python hook_launcher.py --host antigravity",
             "timeout": 15
           }
         ]
@@ -1273,16 +1288,16 @@ We believe in complete transparency regarding security boundaries:
 Contributions are warmly welcome! The codebase includes **141 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, skill synchronization, and protocol handlers:
 
 ```bash
-# 1. Run engine & risk-scoring tests (159 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests, modes, read-only detection, git pre-commit scan, redirects, injection signals, trusted policy):
+# 1. Run engine & risk-scoring tests (167 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests, modes, read-only detection, git pre-commit scan, redirects, injection signals, trusted policy):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook & replay tests (126 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, temp allow, modes, read-only, escalation, diff preview, log rotation/export, skill sync):
+# 2. Run lifecycle hook & replay tests (135 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, temp allow, modes, read-only, escalation, diff preview, log rotation/export, skill sync):
 python tests/test_guardrail_hook.py
 
 # 3. Run MCP server protocol tests (21 tests):
 python tests/test_mcp_server.py
 
-# 4. Run all 306 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
+# 4. Run all 323 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
 python -m unittest discover -s tests -p "test_*.py"
 ```
 

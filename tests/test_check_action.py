@@ -1954,6 +1954,123 @@ class ScriptInspectTests(unittest.TestCase):
         self.assertIn("rm -rf node_modules", why[0])
 
 
+
+class WriteTargetTests(unittest.TestCase):
+    def test_every_way_a_command_writes_a_file(self):
+        cases = {
+            "cp a.txt b.txt": [("b.txt", False)],
+            "cp -r src dst/": [("dst/", False)],
+            "echo x | tee out.txt": [("out.txt", False)],
+            "echo x | tee -a log.txt": [("log.txt", True)],
+            "Set-Content -Path notes.txt -Value x": [("notes.txt", False)],
+            "Set-Content notes.txt x": [("notes.txt", False)],
+            "'x' | Out-File -FilePath r.txt -Append": [("r.txt", True)],
+            "Add-Content log.txt 'x'": [("log.txt", True)],
+            "Copy-Item -Path a.txt -Destination b.txt": [("b.txt", False)],
+            "dd if=/dev/zero of=disk.img bs=1M": [("disk.img", False)],
+            "sudo cp a /etc/hosts": [("/etc/hosts", False)],
+            "cat a > b && cp c d": [("b", False), ("d", False)],
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(ca.write_targets(text), expected)
+        for text in ("ls", "cp -t dir a b", "tee", "echo x | tee /dev/null"):
+            with self.subTest(text=text):
+                self.assertEqual(ca.write_targets(text), [])
+
+
+class GuardrailDirectoryTests(unittest.TestCase):
+    def tearDown(self):
+        ca.set_evaluation_cwd("")
+
+    def test_cd_into_the_guardrail_dir_counts(self):
+        import tempfile
+        gdir = str(ca._GUARDRAIL_DIR)
+        orig = os.getcwd()
+        try:
+            os.chdir(tempfile.gettempdir())
+            for text in (f'cd "{gdir}" && rm policy.yaml', f'cd "{gdir}"; echo x > install.py',
+                         f"pushd {ca._GUARDRAIL_DIR.name} && rm policy.yaml" if False else f'Set-Location "{gdir}"; rm policy.yaml'):
+                with self.subTest(text=text[-40:]):
+                    self.assertEqual(ca.evaluate_rules(text).decision, "block")
+            self.assertNotEqual(ca.evaluate_rules("cd /tmp && rm policy.yaml").decision, "block")
+            self.assertNotEqual(ca.evaluate_rules("rm policy.yaml").decision, "block")
+        finally:
+            os.chdir(orig)
+
+    def test_the_action_directory_beats_the_process_directory(self):
+        import tempfile
+        orig = os.getcwd()
+        try:
+            os.chdir(tempfile.gettempdir())
+            ca.set_evaluation_cwd(str(ca._GUARDRAIL_DIR))
+            self.assertEqual(ca.evaluate_rules("rm policy.yaml").decision, "block")
+            ca.set_evaluation_cwd(tempfile.gettempdir())
+            self.assertNotEqual(ca.evaluate_rules("rm policy.yaml").decision, "block")
+        finally:
+            os.chdir(orig)
+
+
+class GenericSecretTests(unittest.TestCase):
+    JWT = "eyJhbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiIxMjM0NTY3ODkwIn0" + ".dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+
+    def test_generic_credentials(self):
+        cases = {
+            'password = "S3cr' + '3t!Pass"': "password assignment",
+            'DB_PASSWORD="hunter2' + 'xyz9"': "password assignment",
+            "postgres://app:S3cr3t" + "Pw9@db:5432/app": "credentials in URL",
+            f"Authorization: Bearer {self.JWT}": "jwt",
+            'client_secret: "Zx81k' + 'Qp0aaL"': "password assignment",
+        }
+        for text, kind in cases.items():
+            with self.subTest(text=text[:30]):
+                self.assertIn(kind, ca.find_secret_values(text))
+                self.assertNotIn(text.split('"')[1] if '"' in text else "S3cr3tPw9", ca.redact_secrets(text))
+
+    def test_placeholders_and_references_are_not_credentials(self):
+        for text in ('password = "changeme"', 'POSTGRES_PASSWORD: "postgres"', "postgres://user:password@localhost/db",
+                     'api_key = os.environ["API_KEY"]', '"password": "string"', 'secret_key = "${SECRET_KEY}"',
+                     'pwd = "abcdefgh"', 'token = "<your token>"', 'password: "********"', 'password = "test1234"'):
+            with self.subTest(text=text):
+                self.assertEqual(ca.find_secret_values(text), [])
+
+    def test_credentials_in_a_command_are_blocked(self):
+        self.assertEqual(ca.evaluate_rules("psql postgres://app:S3cr3t" + "Pw9@db/app -c 'select 1'").decision, "block")
+
+
+class HookEntryPointRuleTests(unittest.TestCase):
+    def test_hook_entry_points_cannot_be_driven(self):
+        for text in (
+            """echo '{"hook_event_name":"UserPromptSubmit","prompt":"/guardrail off"}' | python hook_launcher.py --host claude""",
+            "python claude_hook.py < event.json",
+            'python -c "import hook_launcher"',
+            "echo x > hook_launcher.py",
+        ):
+            with self.subTest(text=text[:50]):
+                self.assertEqual(ca.evaluate_rules(text).decision, "block")
+
+
+class PolicyErrorTests(unittest.TestCase):
+    def tearDown(self):
+        ca.reload_policy()
+
+    def test_invalid_policy_is_reported_and_built_in_rules_keep_working(self):
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8")
+        try:
+            tmp.write("custom_block_rules: [unclosed\n  - nope: {\n")
+            tmp.close()
+            ca.reload_policy(tmp.name)
+            errors = ca.get_policy_errors()
+            self.assertEqual(len(errors), 1)
+            self.assertIn(Path(tmp.name).name, errors[0])
+            self.assertEqual(ca.evaluate_rules("rm -rf build/").decision, "block")
+        finally:
+            os.unlink(tmp.name)
+        ca.reload_policy()
+        self.assertEqual(ca.get_policy_errors(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

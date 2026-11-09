@@ -368,3 +368,7 @@ tests:
     expect: block
   - action: "python guardrail_hook.py status"
     expect: proceed
+  - action: "python hook_launcher.py --host claude"
+    expect: block
+  - action: "cp draft.txt notes.txt"
+    expect: proceed

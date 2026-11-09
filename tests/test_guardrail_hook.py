@@ -1680,6 +1680,152 @@ class AgentCannotDisarmTests(unittest.TestCase):
         self.assertEqual(self._bash("rm -rf build/"), "deny")
 
 
+class FailClosedAndWritesTests(unittest.TestCase):
+    PRE = json.dumps({"hook_event_name": "PreToolUse", "session_id": "fc", "tool_name": "Bash",
+                      "tool_input": {"command": "ls"}})
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.work = Path(self.tmpdir) / "work"
+        self.work.mkdir()
+        self.st = gh.State(Path(self.tmpdir) / "state.json")
+        self.st.update("fc-sess", active=True)
+
+    def tearDown(self):
+        ca.set_evaluation_cwd("")
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _event(self, tool, tool_input, cwd=None):
+        return {"hook_event_name": "PreToolUse", "session_id": "fc-sess", "cwd": cwd or str(self.work),
+                "tool_name": tool, "tool_input": tool_input}
+
+    def _decision(self, tool, tool_input, cwd=None):
+        out, _ = gh.handle(self._event(tool, tool_input, cwd), "claude", self.st)
+        return None if out is None else out["hookSpecificOutput"]["permissionDecision"]
+
+    # --- S4: fail closed ---
+
+    def test_fail_closed_outputs(self):
+        import hook_launcher as hl
+        out, code = hl.fail_closed(self.PRE, "claude", "boom")
+        self.assertEqual((out["hookSpecificOutput"]["permissionDecision"], code), ("ask", 0))
+        self.assertIn("boom", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(hl.fail_closed(self.PRE, "codex", "boom")[0]["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(hl.fail_closed(self.PRE, "antigravity", "boom")[0]["decision"], "ask")
+        self.assertEqual(hl.fail_closed("not json", "claude", "boom"), (None, 2))
+        prompt = json.dumps({"hook_event_name": "UserPromptSubmit", "prompt": "hi"})
+        self.assertIn("systemMessage", hl.fail_closed(prompt, "claude", "boom")[0])
+        post = json.dumps({"hook_event_name": "PostToolUse", "tool_name": "Read"})
+        self.assertEqual(hl.fail_closed(post, "claude", "boom"), (None, 0))
+
+    def _launch(self, launcher, payload, host="claude"):
+        import subprocess
+        env = dict(os.environ, GUARDRAIL_AUTO_ACTIVATE="1", PYTHONIOENCODING="utf-8")
+        proc = subprocess.run([sys.executable, "-B", str(launcher), "--host", host], input=payload.encode("utf-8"),
+                              capture_output=True, env=env, timeout=60)
+        return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
+
+    def test_launcher_runs_the_guardrail(self):
+        ask = json.dumps({"hook_event_name": "PreToolUse", "session_id": "fc", "tool_name": "Bash",
+                          "tool_input": {"command": "pip install requests"}})
+        code, out, _ = self._launch(gh.HERE / "hook_launcher.py", ask)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "ask")
+        code, out, _ = self._launch(gh.HERE / "hook_launcher.py", self.PRE)
+        self.assertEqual((code, out), (0, ""))
+        code, _, err = self._launch(gh.HERE / "hook_launcher.py", "{broken")
+        self.assertEqual(code, 2)
+        self.assertIn("could not check", err)
+
+    def test_a_broken_install_asks_instead_of_passing(self):
+        broken = Path(self.tmpdir) / "broken"
+        broken.mkdir()
+        shutil.copy2(gh.HERE / "hook_launcher.py", broken / "hook_launcher.py")
+        (broken / "guardrail_hook.py").write_text("def broken(:\n", encoding="utf-8")
+        code, out, _ = self._launch(broken / "hook_launcher.py", self.PRE)
+        self.assertEqual(code, 0)
+        hso = json.loads(out)["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "ask")
+        self.assertIn("SyntaxError", hso["permissionDecisionReason"])
+        code, out, _ = self._launch(broken / "hook_launcher.py", self.PRE, host="codex")
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_run_hook_rejects_unreadable_input(self):
+        import io
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            self.assertEqual(gh.run_hook("{not json", "claude"), 2)
+
+    def test_doctor_reports_policy_errors_and_direct_hook_commands(self):
+        direct = Path(self.tmpdir) / "settings.json"
+        direct.write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"type": "command",
+                          "command": 'python "x/guardrail_hook.py" hook --host claude'}]}]}}), encoding="utf-8")
+        ok, msg = gh._hook_commands_status([direct])
+        self.assertFalse(ok)
+        self.assertIn("re-run `python install.py`", msg)
+        launcher = Path(self.tmpdir) / "settings2.json"
+        launcher.write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [{"type": "command",
+                            "command": 'python "x/hook_launcher.py" --host claude'}]}]}}), encoding="utf-8")
+        self.assertTrue(gh._hook_commands_status([launcher])[0])
+        report = gh.format_doctor_report(log_path=Path(self.tmpdir) / "audit.log")
+        self.assertIn("Policy Errors: ✔ none", report)
+        self.assertIn("Hook Commands:", report)
+        repo_files = [gh.HERE / ".claude" / "settings.json", gh.HERE / ".codex" / "hooks.json"]
+        self.assertTrue(gh._hook_commands_status(repo_files)[0], gh._hook_commands_status(repo_files)[1])
+
+    def test_reinstalling_replaces_old_guardrail_hooks(self):
+        import install
+        target = Path(self.tmpdir) / "settings.json"
+        target.write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": ".*", "hooks": [{"type": "command", "command": 'python "p/guardrail_hook.py" hook --host claude'}]},
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "other-tool --check"}]},
+        ]}}), encoding="utf-8")
+        new_cfg = {"hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [{"type": "command",
+                                                                         "command": 'python "p/hook_launcher.py" --host claude'}]}]}}
+        install.merge_json_hooks(target, new_cfg)
+        install.merge_json_hooks(target, new_cfg)
+        entries = json.loads(target.read_text(encoding="utf-8"))["hooks"]["PreToolUse"]
+        text = json.dumps(entries)
+        self.assertNotIn("guardrail_hook.py", text)
+        self.assertEqual(text.count("hook_launcher.py"), 1)
+        self.assertIn("other-tool --check", text)
+
+    # --- S5: cp / tee / Set-Content onto existing files ---
+
+    def test_other_writers_onto_existing_files_ask(self):
+        (self.work / "notes.txt").write_text("precious", encoding="utf-8")
+        for tool, command in (("Bash", "cp draft.txt notes.txt"), ("Bash", "echo x | tee notes.txt"),
+                              ("PowerShell", "Set-Content -Path notes.txt -Value x")):
+            with self.subTest(command=command):
+                out, _ = gh.handle(self._event(tool, {"command": command}), "claude", self.st)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+                self.assertIn("overwrites an existing file", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertIsNone(self._decision("Bash", {"command": "echo x | tee -a notes.txt"}))
+        self.assertIsNone(self._decision("Bash", {"command": "cp notes.txt backup.txt"}))
+
+    # --- S6: the action's directory ---
+
+    def test_rules_follow_the_agents_directory(self):
+        out, _ = gh.handle(self._event("Bash", {"command": "rm policy.yaml"}, cwd=str(gh.HERE)), "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        out, _ = gh.handle(self._event("Bash", {"command": "rm policy.yaml"}), "claude", self.st)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    # --- S7: generic credentials ---
+
+    def test_generic_credentials_in_files_and_output(self):
+        self.assertEqual(self._decision("Write", {"file_path": str(self.work / "settings.py"),
+                                                  "content": 'DB_PASSWORD = "hunter2' + 'xyz9"\n'}), "deny")
+        # an environment lookup is not a hardcoded credential (the older "secret exposure" rule may still object
+        # to the word "password" near "write file", which is a separate, pre-existing behaviour)
+        desc, _, _ = gh.describe_tool(self._event("Write", {"file_path": str(self.work / "settings.py"),
+                                                           "content": 'DB_PASSWORD = os.environ["DB_PASSWORD"]\n'}))
+        self.assertNotIn("hardcoded secret", desc)
+        jwt = "eyJhbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiIxMjM0NTY3ODkwIn0" + ".dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
+        out, _ = gh.handle({"hook_event_name": "PostToolUse", "session_id": "fc-sess", "tool_name": "Bash",
+                            "tool_input": {"command": "cat token.txt"}, "tool_response": jwt}, "claude", self.st)
+        self.assertIn("contains a credential (jwt)", out["hookSpecificOutput"]["additionalContext"])
+
+
 class HookReloadAndDynamicConfigTests(unittest.TestCase):
     def setUp(self):
         self.st = gh.State()

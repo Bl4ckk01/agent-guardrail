@@ -682,6 +682,29 @@ def format_why_report(log_path: Path | None = None) -> str:
     return "\n".join(lines)
 
 
+def _hook_commands_status(settings_files: list[Path] | None = None) -> tuple[bool, str]:
+    """Whether the installed hook commands go through the fail-closed launcher."""
+    files = settings_files if settings_files is not None else [
+        HERE / ".claude" / "settings.json", HERE / ".codex" / "hooks.json", HERE / ".agents" / "hooks.json",
+        Path.home() / ".claude" / "settings.json", Path.home() / ".codex" / "hooks.json",
+    ]
+    direct: list[str] = []
+    found = 0
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8") if f.is_file() else ""
+        except OSError:
+            continue
+        if "hook_launcher.py" in text or "guardrail_hook.py" in text:
+            found += 1
+        if re.search(r"guardrail_hook\.py\\?\"?\s+hook\b", text):
+            direct.append(str(f))
+    if direct:
+        return False, ("these hooks call guardrail_hook.py directly and pass every action if it fails to load: "
+                       + ", ".join(direct) + " — re-run `python install.py`")
+    return True, f"{found} hook configuration(s) use the fail-closed launcher" if found else "no hook configuration found"
+
+
 def format_doctor_report(log_path: Path | None = None) -> str:
     """Generate a unified health & diagnostic report for policy, audit log, skills, and daemons."""
     import check_action as ca
@@ -711,6 +734,11 @@ def format_doctor_report(log_path: Path | None = None) -> str:
         f"  • Audit Log Integrity: {'✔ ' if ok_log else '❌ '}{log_msg}",
         f"  • Workspace Skills Synced: {synced}/{len(skill_Targets)} platforms synchronized with root `SKILL.md`",
     ]
+    errors = ca.get_policy_errors()
+    lines.append("  • Policy Errors: " + ("❌ " + "; ".join(errors) + " — running on the built-in rules only"
+                                       if errors else "✔ none"))
+    hooks_ok, hooks_msg = _hook_commands_status()
+    lines.append(f"  • Hook Commands: {'✔ ' if hooks_ok else '❌ '}{hooks_msg}")
     try:
         import daemon_manager
         lines.append("\n" + daemon_manager.format_status_report())
@@ -880,6 +908,12 @@ def format_session_flags(state: State, sid: str) -> str:
         n = state.session(sid).get("escalated_blocks", "several")
         mode_line += f" (raised automatically at {time.strftime('%H:%M', time.localtime(float(esc)))} after {n} blocked actions)"
     lines = [mode_line, f"  • Read-only: {'ON' if state.is_readonly(sid) else 'off'}"]
+    try:
+        import check_action as ca
+        for err in ca.get_policy_errors():
+            lines.append(f"  • Policy error: {err} (built-in rules only; see /guardrail doctor)")
+    except Exception:
+        pass
     if state.injection_alert(sid):
         lines.append("  • Prompt-injection alert: ACTIVE (`/guardrail alert`)")
     try:
@@ -964,7 +998,7 @@ def redirect_risks(command: str, cwd: str) -> list[str]:
     base = cwd or os.getcwd()
     temp_root = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
     risks: list[str] = []
-    for target, append in ca.output_redirect_targets(command):
+    for target, append in ca.write_targets(command):
         try:
             path = Path(os.path.expanduser(target))
             if not path.is_absolute():
@@ -1101,7 +1135,7 @@ def _backup_candidates(event: dict, paths: list[str], cwd: str) -> list[Path]:
     if name.lower() in SHELL_TOOLS:
         command = _shell_command(inp)
         cands += [t for t in ca._split_tokens(command) if t and not t.startswith("-")]
-        cands += [target for target, _ in ca.output_redirect_targets(command)]
+        cands += [target for target, _ in ca.write_targets(command)]
     files: list[Path] = []
     for c in cands:
         try:
@@ -1315,7 +1349,7 @@ def _patch_actions(patch: str) -> list[str]:
 
 # Names unique to the guardrail and the agents' hook settings: protected wherever they appear
 _GUARDRAIL_CONTROL_FILES = (
-    "check_action.py", "guardrail_hook.py", "daemon_manager.py", "claude_hook.py", "policy_init.py", "readonly_mode.py", "git_hooks.py", "policy_trust.py", "audit_export.py", "script_inspect.py", "trusted_policies.json", ".git/hooks/", ".guardrail",
+    "check_action.py", "guardrail_hook.py", "daemon_manager.py", "claude_hook.py", "policy_init.py", "readonly_mode.py", "git_hooks.py", "policy_trust.py", "audit_export.py", "script_inspect.py", "hook_launcher.py", "trusted_policies.json", ".git/hooks/", ".guardrail",
     ".claude/settings.json", ".claude/settings.local.json",
     ".codex/hooks.json", ".agents/hooks.json", ".cursorrules", ".cursor/rules/guardrail.mdc",
 )
@@ -1416,7 +1450,7 @@ def _written_paths(event: dict, paths: list[str], cwd: str) -> list[str]:
     if low in EDIT_TOOLS or low == "apply_patch":
         targets += [p for p in paths if p]
     elif low in SHELL_TOOLS:
-        targets += [target for target, _ in ca.output_redirect_targets(_shell_command(inp))]
+        targets += [target for target, _ in ca.write_targets(_shell_command(inp))]
     return [script_inspect.norm_path(p, cwd) for p in targets]
 
 
@@ -1896,6 +1930,7 @@ def on_pre_tool(event: dict, host: str, state: State):
 
     import check_action as ca
 
+    ca.set_evaluation_cwd(_event_cwd(event))  # path-dependent rules follow the agent's directory
     desc, safe_shell, paths = describe_tool(event)
     tool_ident = event.get("tool_name") or (event.get("toolCall", {}).get("name") if isinstance(event.get("toolCall"), dict) else "")
     forced = None  # decision fixed by tool semantics rather than by the rules engine
@@ -2040,7 +2075,7 @@ def on_pre_tool(event: dict, host: str, state: State):
     if final == "proceed" and forced is None and str(tool_ident).lower() in SHELL_TOOLS:
         redirects = redirect_risks(_shell_command(_tool_call(event)[1]), cwd)
         if redirects:
-            final, reason = "ask_user", "output redirection: " + "; ".join(redirects[:3])
+            final, reason = "ask_user", "file write: " + "; ".join(redirects[:3])
 
     preview = result.dry_run_preview or ca.generate_dry_run_preview(
         desc, cwd=cwd, paths=paths, capabilities=result.capabilities,
@@ -2276,6 +2311,26 @@ def _write_stdout(obj: dict) -> None:
     sys.stdout.buffer.flush()
 
 
+def run_hook(raw: str, host: str) -> int:
+    """Evaluate one hook event (JSON text). Anything the guardrail cannot evaluate fails closed."""
+    import hook_launcher
+    try:
+        event = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        event = None
+    if not isinstance(event, dict):
+        out, code = hook_launcher.fail_closed(raw, host, "unreadable hook input")
+    else:
+        try:
+            out, code = handle(event, host)
+        except Exception as exc:  # noqa: BLE001
+            log({"host": host, "event": "error", "error": f"{type(exc).__name__}: {exc}"})
+            out, code = hook_launcher.fail_closed(raw, host, f"internal error: {type(exc).__name__}: {exc}")
+    if out is not None:
+        _write_stdout(out)
+    return code
+
+
 def main(argv: list[str]) -> int:
     load_config()
     if not argv:
@@ -2286,22 +2341,7 @@ def main(argv: list[str]) -> int:
         host = "codex"
         if "--host" in argv:
             host = argv[argv.index("--host") + 1].lower()
-        raw = sys.stdin.buffer.read().decode("utf-8", errors="replace")
-        try:
-            event = json.loads(raw) if raw.strip() else {}
-        except ValueError:
-            return 0
-        try:
-            out, code = handle(event, host)
-        except Exception as exc:  # noqa: BLE001
-            log({"host": host, "event": "error", "error": f"{type(exc).__name__}: {exc}"})
-            if event.get("hook_event_name") == "PreToolUse" or "toolCall" in event:
-                d = "ask" if host in ("claude", "antigravity", "agy", "gemini") else "deny"
-                _write_stdout(pre_tool_output(host, d, f"{ICON} Guardrail: internal error ({exc}), confirmation required"))
-            return 0
-        if out is not None:
-            _write_stdout(out)
-        return code
+        return run_hook(sys.stdin.buffer.read().decode("utf-8-sig", errors="replace"), host)
 
     if argv[0] in ("on", "off", "status"):
         sid = argv[argv.index("--session") + 1] if "--session" in argv else "_default"
