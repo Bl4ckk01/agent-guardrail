@@ -40,13 +40,14 @@ Users activate protection simply by typing:
 Once activated:
 1. Lifecycle hooks (`UserPromptSubmit`, `PreToolUse`, run through the fail-closed `hook_launcher.py`) intercept every user request and tool call (`Bash`, `PowerShell`, `Write`, `Edit`, `write_to_file`, `replace_file_content`); `PostToolUse` scans tool output for credentials.
 2. Safe read-only actions (`ls`, `git status`, test runners) pass silently with zero delay.
-3. Sensitive actions (`ask_user`) prompt for human approval (native interactive dialog on Claude Code and Antigravity, confirmation in chat on Codex, Cursor, Grok).
+3. Sensitive actions (`ask_user`) prompt for human approval (with a ready-to-copy `/guardrail allow` line when it can help; native interactive dialog on Claude Code and Antigravity, confirmation in chat on Codex, Cursor, Grok).
 4. Prohibited actions (`block`) are halted immediately. Never attempt to bypass a block by rephrasing, splitting, or obfuscating the command.
 
 ---
 
 ## 3. Slash & Skill Commands
 
+- `/guardrail help [topic]`: Commands grouped by situation.
 - `/guardrail` or `/guardrail on`: Enable protection for the current session.
 - `/guardrail start`: Launch background daemon and enable protection.
 - `/guardrail off`: Temporarily disable protection for manual maintenance.
@@ -72,7 +73,7 @@ Once activated:
 
 ## 4. Unit Tests
 
-Run the test suites (323 tests total):
+Run the test suites (337 tests total):
 ```bash
 python -B tests/test_check_action.py
 python -B tests/test_guardrail_hook.py

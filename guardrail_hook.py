@@ -6,7 +6,7 @@ Automatically intercepts prompts and tool calls in the background:
     guardrail_hook.py hook --host claude|codex
     guardrail_hook.py on|off|status|reload [--session ID] [--policy FILE]
     guardrail_hook.py check "<cmd>" | why | doctor | report [DAYS] | test | undo [list] | init [DIR] [--apply]
-    guardrail_hook.py scan-staged | git-hook install|remove [DIR] | export [json|html|csv] [DAYS] | verify
+    guardrail_hook.py scan-staged | git-hook install|remove [DIR] | export [json|html|csv] [DAYS] | verify | statusline | help
 """
 
 from __future__ import annotations
@@ -517,7 +517,7 @@ def verify_audit_chain(log_path: Path | None = None) -> tuple[bool, str, int]:
 # --- Commands & Prompts ---
 
 _EXPLICIT_CMD_RE = re.compile(
-    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload|why|doctor|check|report|test|undo|allow|init|mode|readonly|alert|trust|export)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?(?:\s+(?P<rest>.*))?$",
+    r"^\s*(?:\[\[(?:agent[-_])?guardrail:(?P<marker>on|off|status|reload|why|doctor|check|report|test|undo|allow|init|mode|readonly|alert|trust|export|help)\]\]|[/$](?:prompts:)?(?:agent[-_])?guardrail(?:\b|$))\s*(?P<arg>\S+)?(?:\s+(?P<rest>.*))?$",
     re.IGNORECASE | re.DOTALL,
 )
 _PLAIN_CMD_RE = re.compile(
@@ -544,9 +544,10 @@ _ARG_MAP = {
     "alert": "alert", "alerts": "alert",
     "trust": "trust",
     "export": "export",
+    "help": "help", "?": "help", "commands": "help",
 }
 # Commands that only report or restore: they never change the active state of the session
-_INFO_CMDS = ("reload", "check", "why", "doctor", "report", "test", "undo", "allow", "init", "mode", "readonly", "alert", "trust", "export")
+_INFO_CMDS = ("reload", "check", "why", "doctor", "report", "test", "undo", "allow", "init", "mode", "readonly", "alert", "trust", "export", "help")
 _CONFIRM_RE = re.compile(
     r"\b(?:yes|y|ok|okay|confirm|confirmed|approve|approved|proceed|go|continue|done)\b",
     re.IGNORECASE,
@@ -874,6 +875,103 @@ def format_alert(state: State, sid: str, arg: str) -> str:
             "Clear it with `/guardrail alert clear` once you have checked the source.")
 
 
+_HELP_TOPICS: tuple[tuple[str, str, list[str]], ...] = (
+    ("basics", "Turning it on and checking it", [
+        "/guardrail (or /guardrail on) — protect this session; /guardrail off to pause it",
+        "/guardrail status — on/off, mode, read-only, alerts, project policy",
+        "/guardrail check <command> — what would happen, without running anything",
+    ]),
+    ("confirmations", "A safe command keeps asking for confirmation", [
+        "the confirmation itself shows a ready-to-copy `/guardrail allow ...` line: type it to stop asking for an hour",
+        "/guardrail allow list | clear — see or drop those temporary rules",
+        "/guardrail report — the commands that ask most, with narrow rules you can adopt",
+        "/guardrail init — safe rules proposed for your project's own test/lint/build commands",
+        "/guardrail mode relaxed — skip routine confirmations such as dependency installs",
+    ]),
+    ("blocked", "Something was blocked", [
+        "/guardrail why — which rule blocked the last action, and how to allow it if it is really safe",
+        "blocks never go away with /guardrail allow: run the command yourself in a terminal if you are sure",
+    ]),
+    ("safety", "Working on code you do not fully trust", [
+        "/guardrail readonly — nothing can be changed this session",
+        "/guardrail mode strict — every change asks first, even whitelisted commands",
+        "/guardrail alert — see a prompt-injection warning raised by a web page or file",
+        "/guardrail undo — restore the files saved before the last confirmed deletion or overwrite",
+    ]),
+    ("project", "Setting up a project", [
+        "/guardrail init — propose rules for this project, then `python guardrail_hook.py init --apply` in a terminal",
+        "/guardrail trust — let this project's policy.yaml whitelist commands, pinned to the version you read",
+        "/guardrail test — check that policy.yaml still gives the expected decisions",
+        "python install.py --git-hook — block commits that add credentials",
+    ]),
+    ("audit", "Looking back", [
+        "/guardrail report [days] [session] — what was asked, blocked, allowed",
+        "/guardrail export html|json|csv — a report file for a review",
+        "/guardrail doctor — health check: policy, hooks, audit log integrity",
+    ]),
+)
+
+
+def format_help(arg: str = "") -> str:
+    """`/guardrail help [topic]`: the commands, grouped by the situation you are in."""
+    wanted = (arg or "").strip().lower()
+    topics = [tp for tp in _HELP_TOPICS if not wanted or wanted in (tp[0], tp[1].lower()) or wanted in tp[0]]
+    if not topics:
+        names = ", ".join(tp[0] for tp in _HELP_TOPICS)
+        return f"{ICON} No help topic `{wanted}`. Topics: {names}. Or just `/guardrail help`."
+    lines = [f"{ICON} Agent Guardrail — what to type when:"]
+    for _key, title, items in topics:
+        lines.append(f"  {title}:")
+        lines += [f"    • {item}" for item in items]
+    if not wanted:
+        lines.append("  `/guardrail help <topic>` shows one group: " + ", ".join(tp[0] for tp in _HELP_TOPICS) + ".")
+    return "\n".join(lines)
+
+
+_WELCOME = (
+    "First time here? Three things to know:\n"
+    "  • safe commands run silently, risky ones ask you first, destructive ones are blocked;\n"
+    "  • if a safe command keeps asking, the confirmation shows a ready-to-copy `/guardrail allow ...` line;\n"
+    "  • `/guardrail why` explains a block, `/guardrail help` lists everything else."
+)
+
+
+def _welcome_once(state: State) -> str:
+    """The short guide, shown the first time protection is switched on on this machine."""
+    if state.data.get("welcomed"):
+        return ""
+    state.data["welcomed"] = True
+    state.dirty = True
+    return _WELCOME
+
+
+def format_statusline(event: dict, state: State) -> str:
+    """One line for the Claude Code status bar: on/off, mode, read-only, alerts."""
+    sid = str(event.get("session_id") or "_default")
+    if not is_active(state, sid, "claude"):
+        return f"{ICON} guardrail off"
+    parts = [f"{ICON} guardrail on"]
+    mode = state.get_mode(sid)
+    if mode != "normal":
+        parts.append(mode + (" (auto)" if state.session(sid).get("escalated_at") else ""))
+    if state.is_readonly(sid):
+        parts.append("read-only")
+    if state.injection_alert(sid):
+        parts.append("⚠ injection alert")
+    allows = len(state.temp_allow_entries(sid))
+    if allows:
+        parts.append(f"{allows} allow rule{'s' if allows != 1 else ''}")
+    try:
+        import check_action as ca
+        if not ca._POLICY_LOADED:
+            ca.load_policy()
+        if ca.get_policy_errors():
+            parts.append("⚠ policy error")
+    except Exception:
+        pass
+    return " · ".join(parts)
+
+
 def format_trust(arg: str) -> str:
     """`/guardrail trust [<hash>|list|revoke]`: let this project's policy.yaml whitelist commands, pinned to a hash."""
     import policy_trust
@@ -1117,6 +1215,14 @@ def format_report(days: float = 7, log_path: Path | None = None, session: str | 
     if repeated:
         lines.append("  • Actions that keep asking for confirmation (candidates for a narrow custom_proceed_rules entry):")
         lines += [f"      {n}× `{t}`" for t, n in repeated]
+        import check_action as ca
+        suggestions = [(t, p) for t, _ in repeated if (p := ca.suggest_allow_pattern(t))]
+        if suggestions:
+            lines.append("  • Narrow rules that would stop those confirmations (review them before adopting one):")
+            for text, pattern in suggestions:
+                lines.append(f"      `{text[:60]}`")
+                lines.append(f"        this session: /guardrail allow {pattern} --for 1h")
+                lines.append(f"        permanently (your terminal): python check_action.py --allow '{pattern}'")
     return "\n".join(lines)
 
 
@@ -1409,7 +1515,7 @@ def action_fingerprint_source(event: dict) -> str:
 
 # What an agent may run through the Skill tool: reading and stricter settings. Anything that switches the
 # guardrail off, waives a confirmation, trusts a policy or restores files is the user's call.
-_AGENT_SAFE_COMMANDS = {"on", "start", "status", "reload", "check", "why", "doctor", "report", "test", "export", "init"}
+_AGENT_SAFE_COMMANDS = {"on", "start", "status", "reload", "check", "why", "doctor", "report", "test", "export", "init", "help"}
 
 
 def agent_guardrail_command_refusal(event: dict) -> str:
@@ -1623,6 +1729,9 @@ def on_prompt_submit(event: dict, host: str, state: State):
                     daemon_msg = f"Daemon starter note: {exc}"
             state.update(sid, active=True, pending=None, approved_turn=None, approval_grant=None)
             state.update("_default", active=True, pending=None, approved_turn=None, approval_grant=None)
+            welcome = _welcome_once(state)
+            if welcome:
+                daemon_msg = f"{daemon_msg}\n\n{welcome}".strip()
         elif cmd in ("off", "stop"):
             if cmd == "stop":
                 try:
@@ -1671,6 +1780,8 @@ def on_prompt_submit(event: dict, host: str, state: State):
             daemon_msg = format_trust(cmd_arg)
         elif cmd == "export":
             daemon_msg = format_export(cmd_arg)
+        elif cmd == "help":
+            daemon_msg = format_help(cmd_arg)
 
         active = is_active(state, sid, host) if cmd in ("status", *_INFO_CMDS) else (cmd in ("on", "start"))
         log({"host": host, "event": "command", "session": sid, "cmd": cmd, "active": active})
@@ -1716,7 +1827,8 @@ def on_prompt_submit(event: dict, host: str, state: State):
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
                     "additionalContext": (
-                        f"{combined_msg}{status_text(True)}\nInform the user that the guardrail is active. "
+                        f"{combined_msg}{status_text(True)}\nInform the user that the guardrail is active"
+                        f"{' and show them the short guide above, as written' if 'First time here?' in combined_msg else ''}. "
                         "Do not run manual Python checking scripts before commands: "
                         "proceed normally and checks will run automatically in the background via hooks."
                     ),
@@ -1895,11 +2007,15 @@ def on_prompt_expansion(event: dict, host: str, state: State):
         return {"decision": "block", "reason": format_trust(rest_arg)}, 0
     if cmd == "export":
         return {"decision": "block", "reason": format_export(rest_arg)}, 0
+    if cmd == "help":
+        return {"decision": "block", "reason": format_help(rest_arg)}, 0
+    welcome = _welcome_once(state) if cmd == "on" else ""
     return {
         "hookSpecificOutput": {
             "hookEventName": "UserPromptExpansion",
             "additionalContext": (
-                f"{status_text(True)}\nInform the user that the guardrail is active. "
+                f"{status_text(True)}\n{welcome + chr(10) if welcome else ''}Inform the user that the guardrail is active"
+                f"{' and show them the short guide above, as written' if welcome else ''}. "
                 "Do not run manual Python scripts: the guardrail operates in the background via hooks."
             ),
         }
@@ -2130,6 +2246,13 @@ def on_pre_tool(event: dict, host: str, state: State):
 
     if final == "ask_user":
         preview_suffix = f" [Dry-Run Preview: {preview}]" if preview else ""
+        if (forced is None and mode != "strict" and result.rules.decision == "ask_user"
+                and str(tool_ident).lower() in SHELL_TOOLS):
+            pattern = ca.suggest_allow_pattern(_shell_command(_tool_call(event)[1]))
+            if pattern:
+                # Only the user can type it (the Skill tool refuses `allow`): ready to copy, already narrow
+                preview_suffix += (f" To stop asking for this for an hour, the user (not the agent) can type: "
+                                   f"/guardrail allow {pattern} --for 1h")
         if host in ("claude", "antigravity", "agy", "gemini"):
             # The native dialog decides after this hook returns: back up now, a copy is harmless if denied
             _backup_before_confirmed_change()
@@ -2376,6 +2499,20 @@ def main(argv: list[str]) -> int:
 
     if argv[0] == "export":
         print(format_export(" ".join(argv[1:])))
+        return 0
+
+    if argv[0] == "statusline":
+        # Claude Code status bar: never fail, never print more than one line
+        try:
+            raw = sys.stdin.buffer.read().decode("utf-8-sig", errors="replace") if not sys.stdin.isatty() else ""
+            event = json.loads(raw) if raw.strip() else {}
+            print(format_statusline(event if isinstance(event, dict) else {}, State()))
+        except Exception:
+            print(f"{ICON} guardrail ?")
+        return 0
+
+    if argv[0] in ("help", "?"):
+        print(format_help(" ".join(argv[1:])))
         return 0
 
     if argv[0] == "verify":

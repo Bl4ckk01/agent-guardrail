@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-3776ab?style=for-the-badge&logo=python&logoColor=white" alt="Python Versions" />
-  <a href="tests/"><img src="https://img.shields.io/badge/tests-323%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/tests-337%20passed-3fb950?style=for-the-badge&logo=pytest&logoColor=white" alt="Tests" /></a>
   <a href="charts_comparison/comp_1_speed_and_latency.png"><img src="https://img.shields.io/badge/avg%20latency-~37.4ms%20(neural)-58a6ff?style=for-the-badge&logo=speedtest&logoColor=white" alt="Latency" /></a>
   <a href="charts_comparison/comp_2_prompt_injection_defense.png"><img src="https://img.shields.io/badge/destructive%20defense-100%25-3fb950?style=for-the-badge&logo=shield&logoColor=white" alt="Security" /></a>
   <a href="charts_comparison/comp_4_cost_and_token_usage.png"><img src="https://img.shields.io/badge/token%20cost-%240.00%20(Local)-bc8cff?style=for-the-badge&logo=cpu&logoColor=white" alt="Cost" /></a>
@@ -379,6 +379,21 @@ Evaluating a command string in isolation is insufficient because real-world inte
 
 28. **Continuous Integration**:
    - `.github/workflows/tests.yml` runs the three suites and `check_action.py --test-policy` on Ubuntu and Windows with Python 3.10 and 3.12, on every push and pull request.
+
+29. **Ready-to-Copy Allow Lines**:
+   - When a shell command asks for confirmation, the message ends with a line such as `/guardrail allow \bpip\s+(?:-\S+\s+)*install\s+(?:\S+\s+)*?requests\b --for 1h`: a narrow pattern built from the command, sub-command and target of the one part that asks, already checked against the breadth rules. Typing it stops that confirmation for an hour, and only for that command (another package still asks). No line is offered when it could not help: blocks, strict mode, chains where several parts ask.
+
+30. **Suggested Rules in the Report**:
+   - `/guardrail report` turns the commands that keep asking into the same narrow patterns, with both forms: `/guardrail allow ... --for 1h` for the session and `python check_action.py --allow '...'` for the trusted policy.
+
+31. **Help and First-Run Guide**:
+   - `/guardrail help [topic]` lists the commands by situation (a safe command keeps asking, something was blocked, code you do not trust, project setup, looking back). The first time protection is switched on, a three-line guide is shown.
+
+32. **Status Line**:
+   - `python install.py --claude` adds a Claude Code status line (`python guardrail_hook.py statusline`) showing `🛡️ guardrail on · strict · read-only · ⚠ injection alert · 1 allow rule`, unless you already have a status line of your own, which is never replaced.
+
+33. **File Content Is Not a Command**:
+   - Writing code that mentions credentials (`print("Enter your password")`, `DB_PASSWORD = os.environ[...]`) is no longer blocked by the rule meant for commands that print or send a secret, and writing a `.env` asks instead of being blocked. Credential values, destructive content and secret file paths are still caught, and a script that echoes a secret is judged when it runs.
 ---
 
 ### Supported Backend Engines
@@ -514,7 +529,8 @@ From that point forward:
 
 | Command | Action |
 | :--- | :--- |
-| `/guardrail` or `/guardrail on` | Enables guardrail protection for the current session |
+| `/guardrail help [topic]` | What to type when: commands grouped by situation (basics, confirmations, blocked, safety, project, audit) |
+| `/guardrail` or `/guardrail on` | Enables guardrail protection for the current session (the first time, a three-line guide is shown) |
 | `/guardrail off` | Temporarily disables the guardrail for manual maintenance |
 | `/guardrail status` | Displays active status, session ID, and current backend engine |
 | `/guardrail start` | Automatically launches background daemons for D1 or CLM |
@@ -1288,16 +1304,16 @@ We believe in complete transparency regarding security boundaries:
 Contributions are warmly welcome! The codebase includes **141 offline unit & replay tests** ensuring zero regressions across evasion, risk scoring, memory boundaries, skill synchronization, and protocol handlers:
 
 ```bash
-# 1. Run engine & risk-scoring tests (167 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests, modes, read-only detection, git pre-commit scan, redirects, injection signals, trusted policy):
+# 1. Run engine & risk-scoring tests (172 tests: rules, chains, unwrapping, GTFOBins, context, dry-run, risk score, credentials, egress allowlist, policy tests, modes, read-only detection, git pre-commit scan, redirects, injection signals, trusted policy):
 python tests/test_check_action.py
 
-# 2. Run lifecycle hook & replay tests (135 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, temp allow, modes, read-only, escalation, diff preview, log rotation/export, skill sync):
+# 2. Run lifecycle hook & replay tests (144 tests: claude/codex/antigravity hooks, TOCTOU swap, stale permissions, audit hash chain, secrets, backups/undo, report, temp allow, modes, read-only, escalation, diff preview, log rotation/export, skill sync):
 python tests/test_guardrail_hook.py
 
 # 3. Run MCP server protocol tests (21 tests):
 python tests/test_mcp_server.py
 
-# 4. Run all 323 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
+# 4. Run all 337 tests via unittest (they use a throw-away GUARDRAIL_HOME, so your real audit log is never touched):
 python -m unittest discover -s tests -p "test_*.py"
 ```
 

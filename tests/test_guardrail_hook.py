@@ -1826,6 +1826,127 @@ class FailClosedAndWritesTests(unittest.TestCase):
         self.assertIn("contains a credential (jwt)", out["hookSpecificOutput"]["additionalContext"])
 
 
+class UsabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.st = gh.State(Path(self.tmpdir) / "state.json")
+        self.st.update("ux-sess", active=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _event(self, tool, tool_input):
+        return {"hook_event_name": "PreToolUse", "session_id": "ux-sess", "cwd": self.tmpdir,
+                "tool_name": tool, "tool_input": tool_input}
+
+    def _reason(self, command, host="claude"):
+        out, _ = gh.handle(self._event("Bash", {"command": command}), host, self.st)
+        return None if out is None else out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def _say(self, prompt, host="claude", sid="ux-sess"):
+        out, _ = gh.on_prompt_submit({"prompt": prompt, "session_id": sid}, host, self.st)
+        return out["hookSpecificOutput"]["additionalContext"] if host == "claude" else out["stopReason"]
+
+    # --- 1: the confirmation carries a ready-to-copy allow line ---
+
+    def test_confirmation_shows_a_narrow_allow_line_that_works(self):
+        reason = self._reason("pip install requests")
+        self.assertIn("the user (not the agent) can type: /guardrail allow ", reason)
+        line = reason.split("can type: ", 1)[1].strip()
+        self.assertTrue(line.endswith("--for 1h"))
+        self.assertIn("waived", self._say(line))
+        self.assertIsNone(self._reason("pip install requests"))
+        self.assertIsNotNone(self._reason("pip install other-package"))
+
+    def test_codex_pause_message_carries_it_too(self):
+        self.assertIn("/guardrail allow ", self._reason("docker restart web", host="codex"))
+
+    def test_no_allow_line_when_allow_cannot_help(self):
+        self.st.set_mode("ux-sess", "strict")
+        self.assertNotIn("/guardrail allow", self._reason("git commit -m x"))
+        self.st.set_mode("ux-sess", "normal")
+        self.assertNotIn("/guardrail allow", self._reason("rm -rf build/"))
+        self.assertNotIn("/guardrail allow", self._reason("npm install left-pad && pip install requests"))
+
+    # --- 5: the report proposes rules ---
+
+    def test_report_proposes_rules_for_repeated_confirmations(self):
+        log_file = Path(self.tmpdir) / "audit.log"
+        for _ in range(3):
+            gh.log({"event": "tool", "session": "s", "text": "docker restart web", "decision": "ask_user",
+                    "matched_rules": ["ask_user:docker run/exec/compose"]}, log_path=log_file)
+        report = gh.format_report(7, log_path=log_file)
+        self.assertIn("Narrow rules that would stop those confirmations", report)
+        self.assertIn("this session: /guardrail allow \\bdocker", report)
+        self.assertIn("permanently (your terminal): python check_action.py --allow '\\bdocker", report)
+
+    # --- 2: help and the first-run welcome ---
+
+    def test_help(self):
+        full = self._say("/guardrail help")
+        for title in ("Turning it on", "keeps asking", "Something was blocked", "do not fully trust", "Setting up", "Looking back"):
+            self.assertIn(title, full)
+        one = self._say("/guardrail help blocked")
+        self.assertIn("/guardrail why", one)
+        self.assertNotIn("Setting up", one)
+        self.assertIn("No help topic", self._say("/guardrail help nonsense"))
+        self.assertIn("what to type when", self._say("/guardrail ?", host="codex"))
+        self.assertIsNone(gh.handle(self._event("Skill", {"skill": "guardrail", "args": "help"}), "claude", self.st)[0])
+
+    def test_welcome_is_shown_once(self):
+        first = self._say("/guardrail on", sid="new-sess")
+        self.assertIn("First time here?", first)
+        self.assertIn("show them the short guide", first)
+        second = self._say("/guardrail on", sid="other-sess")
+        self.assertNotIn("First time here?", second)
+        fresh = gh.State(Path(self.tmpdir) / "fresh.json")
+        out, _ = gh.on_prompt_expansion({"command_name": "guardrail", "command_args": "", "session_id": "e"}, "claude", fresh)
+        self.assertIn("First time here?", out["hookSpecificOutput"]["additionalContext"])
+
+    # --- 3: status line ---
+
+    def test_status_line(self):
+        self.assertEqual(gh.format_statusline({"session_id": "ux-sess"}, self.st), f"{gh.ICON} guardrail on")
+        off = gh.State(Path(self.tmpdir) / "off.json")
+        self.assertEqual(gh.format_statusline({"session_id": "nobody"}, off), f"{gh.ICON} guardrail off")
+        self.st.set_mode("ux-sess", "strict")
+        self.st.set_readonly("ux-sess", True)
+        self.st.mark_injection("ux-sess", ["instruction override"], "WebFetch")
+        self.st.add_temp_allow("ux-sess", r"\bpip\s+install\s+requests\b", 30)
+        line = gh.format_statusline({"session_id": "ux-sess"}, self.st)
+        for part in ("strict", "read-only", "injection alert", "1 allow rule"):
+            self.assertIn(part, line)
+        self.assertNotIn("\n", line)
+
+    def test_status_line_command_never_fails(self):
+        import subprocess
+        script = gh.HERE / "guardrail_hook.py"
+        for payload in (b'{"session_id": "x"}', b"not json", b""):
+            proc = subprocess.run([sys.executable, "-B", str(script), "statusline"], input=payload,
+                                  capture_output=True, timeout=60, env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("guardrail", proc.stdout.decode("utf-8", "replace"))
+            self.assertEqual(len(proc.stdout.decode("utf-8", "replace").strip().splitlines()), 1)
+
+    def test_installer_never_replaces_a_users_status_line(self):
+        import install
+        target = Path(self.tmpdir) / "settings.json"
+        with mock.patch.object(install, "HOME", Path(self.tmpdir) / "home"):
+            self.assertTrue(install.add_status_line(target, 'python "a/guardrail_hook.py" statusline'))
+            self.assertTrue(install.add_status_line(target, 'python "b/guardrail_hook.py" statusline'))  # ours: updated
+            self.assertIn("b/guardrail_hook.py", json.loads(target.read_text(encoding="utf-8"))["statusLine"]["command"])
+            mine = Path(self.tmpdir) / "mine.json"
+            mine.write_text(json.dumps({"statusLine": {"type": "command", "command": "my-own-bar"}}), encoding="utf-8")
+            self.assertFalse(install.add_status_line(mine, "python guardrail_hook.py statusline"))
+            self.assertEqual(json.loads(mine.read_text(encoding="utf-8"))["statusLine"]["command"], "my-own-bar")
+            home_settings = Path(self.tmpdir) / "home" / ".claude" / "settings.json"
+            home_settings.parent.mkdir(parents=True)
+            home_settings.write_text(json.dumps({"statusLine": {"type": "command", "command": "global-bar"}}), encoding="utf-8")
+            self.assertFalse(install.add_status_line(Path(self.tmpdir) / "new.json", "python guardrail_hook.py statusline"))
+        self.assertNotEqual(ca.evaluate_rules("python guardrail_hook.py statusline").decision, "block")
+        self.assertNotEqual(ca.evaluate_rules("python guardrail_hook.py help").decision, "block")
+
+
 class HookReloadAndDynamicConfigTests(unittest.TestCase):
     def setUp(self):
         self.st = gh.State()

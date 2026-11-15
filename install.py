@@ -82,6 +82,25 @@ def merge_json_hooks(target_path: Path, new_hooks_cfg: dict) -> None:
     target_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def add_status_line(target_path: Path, command: str) -> bool:
+    """Add the guardrail status line unless the user already has one (here or in ~/.claude/settings.json)."""
+    def _has_status_line(path: Path) -> bool:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        except Exception:
+            return True  # unreadable: do not touch it
+        current = data.get("statusLine")
+        return bool(current) and "guardrail_hook.py" not in json.dumps(current)
+
+    if _has_status_line(target_path) or _has_status_line(HOME / ".claude" / "settings.json"):
+        return False
+    data = json.loads(target_path.read_text(encoding="utf-8")) if target_path.is_file() else {}
+    data["statusLine"] = {"type": "command", "command": command}
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
 def sync_skill_copy(src: Path, target_dir: Path, skill_name: str) -> None:
     """Copy root SKILL.md into target_dir, adjusting frontmatter name for alias directories."""
     if not src.exists():
@@ -169,6 +188,10 @@ def install_claude(workspace: bool, is_global: bool) -> None:
         }
         merge_json_hooks(claude_settings, claude_hooks_cfg)
         print("  ✔ .claude/settings.json configured with lifecycle hooks")
+        if add_status_line(claude_settings, 'python "${CLAUDE_PROJECT_DIR}/guardrail_hook.py" statusline'):
+            print("  ✔ status line shows the guardrail state (on/off, mode, read-only, alerts)")
+        else:
+            print("  • status line left as it is: one is already configured")
 
         for sname in ("agent-guardrail", "guardrail"):
             sync_skill_copy(HERE / "SKILL.md", HERE / ".claude" / "skills" / sname, sname)

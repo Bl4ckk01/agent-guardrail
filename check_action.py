@@ -213,7 +213,7 @@ BLOCK_RULES: tuple[tuple[str, str], ...] = (
      # piped into `guardrail_hook.py hook`, State().update(active=False) from python -c...). Read-only
      # sub-commands stay available.
      r"\b(?:python\d?|py)(?:\.exe)?\b[^;&|\n]*?\bguardrail_hook(?:\.py)?['\"]?\s+"
-     r"(?!(?:status|check|why|doctor|health|report|stats|test|tests|verify|scan-staged|export)\b)[\w-]"
+     r"(?!(?:status|check|why|doctor|health|report|stats|test|tests|verify|scan-staged|export|help|statusline)\b)[\w-]"
      # The hook entry points read a hook event from stdin: there is no read-only use for an agent
      r"|\b(?:python\d?|py)(?:\.exe)?\b[^;&|\n]*?\b(?:hook_launcher|claude_hook)(?:\.py)?\b"
      r"|\b(?:python\d?|py)(?:\.exe)?\b[^;&|\n]*\s-c\b[^\n]*\b(?:guardrail_hook|hook_launcher|claude_hook|check_action|policy_trust|policy_init|git_hooks"
@@ -1422,6 +1422,42 @@ def apply_mode(mode: str, decision: str, rules: RuleResult, capabilities: list[s
     return decision, ""
 
 
+def suggest_allow_pattern(command: str) -> str | None:
+    """A narrow regex for `/guardrail allow` that covers exactly what asks in this command, or None.
+
+    Built from the command words of the one link that asks (flags in between are tolerated), then checked
+    with the same rules as any user pattern: not too broad, and it really waives this confirmation.
+    """
+    text = (command or "").strip().splitlines()[0] if (command or "").strip() else ""
+    if not text:
+        return None
+    rules = evaluate_rules(text)
+    if rules.decision != "ask_user":
+        return None
+    links, hidden = chain_segments(text)
+    asking = [link for link in (links + hidden or [text]) if evaluate_rules(link).decision == "ask_user"]
+    if len(asking) != 1:
+        return None
+    toks = [t.strip("'\"") for t in _split_tokens(asking[0])]
+    while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+        toks = toks[1:]
+    plain = [t for t in toks if t and not t.startswith("-") and len(t) <= 60]
+    if not plain:
+        return None
+    # Command and sub-command, then the target (usually the last argument: package, image, file, branch)
+    words = plain[:2] if len(plain) <= 2 else plain[:2] + [plain[-1]]
+    pattern = r"\b" + re.escape(words[0])
+    if len(words) > 1:
+        pattern += r"\s+(?:-\S+\s+)*" + re.escape(words[1])
+    if len(words) > 2:
+        pattern += r"\s+(?:\S+\s+)*?" + re.escape(words[2])
+    pattern += r"\b" if re.match(r"\w", words[-1][-1]) else r"(?=\s|$)"
+    ok, _, _ = validate_allow_pattern(pattern)
+    if not ok or not temp_allow_covers(text, rules, [pattern]):
+        return None
+    return pattern
+
+
 def temp_allow_covers(description: str, result: RuleResult, patterns: list[str]) -> bool:
     """True when the user's temporary allow patterns cover EVERY link that currently asks for confirmation.
 
@@ -1540,9 +1576,47 @@ def evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     return _apply_egress_policy(description, result) if _chain_depth == 0 else result
 
 
+# File-edit descriptions built by the hook: "write file <path>\n[content]:\n<what is written>"
+_EDIT_DESC_RE = re.compile(r"^(?:(?:write|modify|create|delete) file|move file to)[^\n]*\n\[(?:patch-)?content\]:\n")
+# Rules about *saying* a secret out loud (echo/print/write + "password") or about account words fit commands and
+# requests, not code: `print("Enter password")` or `DB_PASSWORD = os.environ[...]` in a file is not an exposure.
+# Hardcoded credential values are still caught by value, and a script that echoes a secret is judged when it runs.
+_CONTENT_EXEMPT_RULES = frozenset({"secret exposure", "secrets / accounts"})
+_SUPPRESSED_RULES: set[str] = set()
+
+
+def _evaluate_edit_description(description: str, match: re.Match, depth: int) -> RuleResult:
+    header = description[:match.end()].split("\n", 1)[0]
+    content = description[match.end():]
+    # "write file .env" is the hook's own wording, not someone saying a secret: the path still asks via the
+    # account/secret rule, it is just not an "exposure"
+    _SUPPRESSED_RULES.add("secret exposure")
+    try:
+        head = _evaluate_rules(header, depth)
+    finally:
+        _SUPPRESSED_RULES.discard("secret exposure")
+    _SUPPRESSED_RULES.update(_CONTENT_EXEMPT_RULES)
+    try:
+        body = _evaluate_rules(content, depth) if content.strip() else RuleResult("proceed", [])
+    finally:
+        _SUPPRESSED_RULES.difference_update(_CONTENT_EXEMPT_RULES)
+    decision = most_severe(head.decision, body.decision)
+    if decision == "proceed":
+        # What the file contains never whitelists the write itself
+        return RuleResult("proceed", list(head.matched) if head.decision == "proceed" else [])
+    tags: list[str] = []
+    for r in (head, body):
+        if r.decision == decision:
+            tags.extend(t for t in r.matched if t not in tags)
+    return RuleResult(decision, tags)
+
+
 def _evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     if not _POLICY_LOADED:
         load_policy()
+    edit =_EDIT_DESC_RE.match(description or "") if not _SUPPRESSED_RULES else None
+    if edit:
+        return _evaluate_edit_description(description, edit, _chain_depth)
 
     # 1. Base normalization (homoglyphs, invisible chars, quotes, lower)
     base_text = normalize(description)
@@ -1583,6 +1657,8 @@ def _evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     ]
     for layer in unwrapped_layers:
         for name, rx in all_blocks:
+            if name in _SUPPRESSED_RULES:
+                continue
             match_found = rx.search(description) if name == "git branch force delete" else rx.search(layer)
             if match_found:
                 tag = f"block:{name}"
@@ -1661,6 +1737,8 @@ def _evaluate_rules(description: str, _chain_depth: int = 0) -> RuleResult:
     asked_matches: list[str] = []
     for layer in unwrapped_layers:
         for name, rx in all_asks:
+            if name in _SUPPRESSED_RULES:
+                continue
             if rx.search(layer):
                 tag = f"ask_user:{name}"
                 if tag not in asked_matches:
